@@ -20,6 +20,17 @@ Metrics are extracted dynamically with company-native labels and stored in Mongo
 - Ollama running locally
 - MongoDB running locally (or update URI in env)
 
+uv run earnings --ticker MSFT --dry-run
+uv run earnings --ticker AAPL MSFT GOOGL --dry-run
+
+uv run earnings --ticker AAPL MSFT GOOGL NVDA          # 4 parallel workers (default)
+uv run earnings --ticker AAPL MSFT GOOGL --max-workers 2
+
+--max-workers N (default 4): bounds the ThreadPoolExecutor
+Single-company runs skip the thread pool entirely (zero overhead)
+Each worker buffers its own output; output is printed in submission order after all workers finish — no interleaved lines
+Both live runs and --dry-run runs are parallelized the same way
+
 ## Environment
 
 Create or update `.env` with:

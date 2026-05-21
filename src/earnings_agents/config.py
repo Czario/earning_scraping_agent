@@ -31,3 +31,8 @@ EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "40000"))
 # Chunk size and overlap for splitting raw text before LLM extraction
 CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "6000"))
 CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "300"))
+
+# Maximum concurrent Ollama requests across all parallel company workers.
+# Local Ollama is single-threaded, so >1 here only helps when using a
+# remote / multi-GPU Ollama instance. Default: 1 (serialize LLM calls).
+OLLAMA_CONCURRENCY: int = int(os.getenv("OLLAMA_CONCURRENCY", "1"))

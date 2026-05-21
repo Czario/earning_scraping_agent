@@ -30,20 +30,78 @@ Source flag behaviour:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import logging
 import sys
 
+import requests
+from rich.logging import RichHandler
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-from earnings_agents.config import COMPANIES  # noqa: E402
+from earnings_agents.config import (  # noqa: E402
+    COMPANIES,
+    MONGODB_COLLECTION,
+    MONGODB_DB,
+    MONGODB_URI,
+    OLLAMA_BASE_URL,
+    OLLAMA_MODEL,
+)
+from earnings_agents.nodes.detect_document_type import detect_document_type_node  # noqa: E402
 from earnings_agents.workflow import build_graph  # noqa: E402
 from earnings_agents.company_registry import lookup_by_cik, lookup_by_ticker  # noqa: E402
 from earnings_agents.tools.edgar_client import get_latest_earnings_url  # noqa: E402
+from earnings_agents.hooks import set_node_callback  # noqa: E402
 
 SEP = "=" * 64
+
+# Human-readable stage names for the rich progress description
+_NODE_LABELS: dict[str, str] = {
+    "discover_earnings_release_node": "discover",
+    "detect_document_type_node": "detect type",
+    "extract_html_text_node": "fetch text",
+    "extract_pdf_text_node": "fetch pdf",
+    "extract_financial_metrics_node": "extract metrics",
+    "reflect_metrics_node": "reflect",
+    "mongodb_save_node": "save",
+}
+
+
+def _check_ollama() -> tuple[bool, str]:
+    """Return (ok, detail) for Ollama reachability and model availability."""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        if resp.status_code != 200:
+            return False, f"Ollama responded {resp.status_code}"
+        available = [m["name"] for m in resp.json().get("models", [])]
+        base_name = OLLAMA_MODEL.split(":")[0]
+        if not any(m.startswith(base_name) for m in available):
+            return False, f"Model '{OLLAMA_MODEL}' not pulled (available: {available or 'none'})"
+        return True, f"Ollama OK — model '{OLLAMA_MODEL}' available"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Ollama unreachable: {exc}"
+
+
+def _check_mongodb() -> tuple[bool, str]:
+    """Return (ok, detail) for MongoDB reachability."""
+    try:
+        from pymongo import MongoClient  # local import — only needed in dry-run path
+
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=3000)
+        client.admin.command("ping")
+        return True, f"MongoDB OK — {MONGODB_DB}.{MONGODB_COLLECTION}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"MongoDB unreachable: {exc}"
 
 
 def _resolve_companies(ciks: list[str], tickers: list[str]) -> list[dict]:
@@ -67,7 +125,7 @@ def _resolve_companies(ciks: list[str], tickers: list[str]) -> list[dict]:
     return companies
 
 
-def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str = "") -> dict:
+def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str = "", printer=print) -> dict:
     """Build the LangGraph initial state for one company.
 
     source="sec"  → query SEC EDGAR for the latest 8-K Exhibit 99.1 and
@@ -105,7 +163,7 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
                     "Provide --ir-url or add the ticker to COMPANIES in config.py."
                 ),
             }
-        print(f"  [IR]     {company_name} ({ticker or cik}) → {ir_url}")
+        printer(f"  [IR]     {company_name} ({ticker or cik}) → {ir_url}")
         return {
             **_base,
             "ir_url": ir_url,
@@ -114,7 +172,7 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
         }
 
     # source == "sec" (default)
-    print(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
+    printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
     filing_url = get_latest_earnings_url(cik)
     if not filing_url:
         return {
@@ -133,42 +191,170 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
     }
 
 
-def _run_company(graph, info: dict, source: str = "sec", ir_url_override: str = "") -> dict:
+def _run_company(graph, info: dict, source: str = "sec", ir_url_override: str = "", printer=print) -> dict:
     label = f"{info['company_name']} ({info.get('ticker') or info['cik']})"
-    print(f"\n{SEP}")
-    print(f"  Company : {label}")
-    print(f"  CIK     : {info['cik']}")
-    print(f"  Source  : {source.upper()}")
+    printer(f"\n{SEP}")
+    printer(f"  Company : {label}")
+    printer(f"  CIK     : {info['cik']}")
+    printer(f"  Source  : {source.upper()}")
 
-    state = _build_initial_state(info, source=source, ir_url_override=ir_url_override)
+    state = _build_initial_state(info, source=source, ir_url_override=ir_url_override, printer=printer)
 
     if state["status"] == "failed":
-        print(f"  [SKIP]  {state['error']}")
-        print(SEP)
+        printer(f"  [SKIP]  {state['error']}")
+        printer(SEP)
         return state
 
     if state["status"] != "failed":
         if state.get("discovered_file_url"):
-            print(f"  Filing  : {state['discovered_file_url']}")
+            printer(f"  Filing  : {state['discovered_file_url']}")
         else:
-            print(f"  IR URL  : {state['ir_url']}")
-    print(SEP)
+            printer(f"  IR URL  : {state['ir_url']}")
+    printer(SEP)
 
     final = graph.invoke(state)
 
-    print(f"\n  Status  : {final.get('status')}")
-    print(f"  File URL: {final.get('discovered_file_url')}")
-    print(f"  Type    : {final.get('file_type')}")
+    printer(f"\n  Status  : {final.get('status')}")
+    printer(f"  File URL: {final.get('discovered_file_url')}")
+    printer(f"  Type    : {final.get('file_type')}")
     if final.get("metrics"):
         m = final["metrics"]
-        print(f"  Metrics ({len(m)} fields):")
-        for label, value in m.items():
-            print(f"    {label:<40} {value}")
+        printer(f"  Metrics ({len(m)} fields):")
+        for lbl, value in m.items():
+            printer(f"    {lbl:<40} {value}")
     if final.get("error"):
-        print(f"  Error   : {final.get('error')}")
-    print(SEP)
+        printer(f"  Error   : {final.get('error')}")
+    printer(SEP)
 
     return final
+
+
+def _dry_run_company(
+    info: dict,
+    source: str = "sec",
+    ir_url_override: str = "",
+    printer=print,
+) -> dict:
+    """Resolve URLs and check service connectivity without running the LLM or saving.
+
+    Returns the initial state augmented with a ``_dry_run_verdict`` key:
+    ``"ready"`` | ``"warning"`` | ``"blocked"``.
+    """
+    label = f"{info['company_name']} ({info.get('ticker') or info['cik']})"
+    printer(f"\n{SEP}")
+    printer(f"  DRY-RUN : {label}")
+    printer(f"  CIK     : {info['cik']}")
+    printer(f"  Source  : {source.upper()}")
+
+    state = _build_initial_state(info, source=source, ir_url_override=ir_url_override, printer=printer)
+
+    ollama_ok, ollama_detail = _check_ollama()
+    mongo_ok, mongo_detail = _check_mongodb()
+
+    file_type: str | None = None
+    url_blocked = state.get("status") == "failed"
+    if not url_blocked and state.get("discovered_file_url"):
+        dt = detect_document_type_node(state)
+        file_type = dt.get("file_type")
+
+    if url_blocked:
+        verdict = "blocked"
+    elif not ollama_ok or not mongo_ok:
+        verdict = "warning"
+    else:
+        verdict = "ready"
+
+    url_display = state.get("discovered_file_url") or state.get("ir_url") or "(none)"
+    printer(SEP)
+    printer(f"  URL     : {url_display}")
+    if file_type:
+        printer(f"  DocType : {file_type}")
+    printer(f"  Ollama  : {'OK  ' if ollama_ok else 'FAIL'} — {ollama_detail}")
+    printer(f"  MongoDB : {'OK  ' if mongo_ok else 'FAIL'} — {mongo_detail}")
+    printer(f"  Verdict : {verdict.upper()}")
+    if verdict == "blocked":
+        printer(f"  Reason  : {state.get('error', 'URL resolution failed')}")
+    elif verdict == "warning":
+        if not ollama_ok:
+            printer("  Action  : Start Ollama and pull the required model (see OLLAMA_MODEL in .env)")
+        if not mongo_ok:
+            printer("  Action  : Start MongoDB or check MONGODB_URI in .env")
+    else:
+        printer("  Action  : Run without --dry-run to execute the full pipeline")
+    printer(SEP)
+
+    return {**state, "_dry_run_verdict": verdict}
+
+
+# ── Thread-pool workers ──────────────────────────────────────────────────────
+
+def _is_already_saved(ticker: str) -> bool:
+    """Return True if an earnings document for *ticker* already exists in MongoDB for the current year."""
+    from datetime import datetime, timezone
+    from earnings_agents.tools.mongodb_client import get_collection
+    year = datetime.now(timezone.utc).year
+    doc_id = f"{ticker}_{year}_latest"
+    try:
+        return get_collection().count_documents({"_id": doc_id}, limit=1) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _run_company_parallel(args: tuple) -> dict:
+    """Thread worker: run one company and update the shared rich Progress."""
+    graph, info, source, ir_url_override, skip_existing, progress, overall_task = args
+    ticker = info.get("ticker", "")
+    name = ticker or info.get("company_name", "?")
+    label = f"[cyan]{name}[/]"
+
+    if skip_existing and ticker and _is_already_saved(ticker):
+        progress.update(overall_task, advance=1)
+        return {"status": "skipped", "ticker": ticker}
+
+    company_task = progress.add_task(f"{label}  resolving\u2026", total=None)
+
+    def _node_cb(node_name: str, event: str, _ticker: str) -> None:
+        if event == "start":
+            stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
+            progress.update(company_task, description=f"{label}  {stage}")
+
+    set_node_callback(_node_cb)
+    result = _run_company(graph, info, source=source, ir_url_override=ir_url_override,
+                          printer=lambda _: None)
+    set_node_callback(None)
+
+    status = result.get("status", "?")
+    if status == "saved":
+        desc = f"[green]{name}[/]  saved \u2713"
+    elif status == "failed":
+        desc = f"[red]{name}[/]  failed \u2717"
+    else:
+        desc = f"[yellow]{name}[/]  {status}"
+    progress.update(company_task, total=1, completed=1, description=desc)
+    progress.update(overall_task, advance=1)
+    return result
+
+
+def _dry_run_company_parallel(args: tuple) -> dict:
+    """Thread worker: dry-run one company and update the shared rich Progress."""
+    info, source, ir_url_override, skip_existing, progress, overall_task = args
+    ticker = info.get("ticker", "")
+    name = ticker or info.get("company_name", "?")
+    label = f"[cyan]{name}[/]"
+
+    if skip_existing and ticker and _is_already_saved(ticker):
+        progress.update(overall_task, advance=1)
+        return {"_dry_run_verdict": "ready", "status": "skipped", "ticker": ticker}
+
+    company_task = progress.add_task(f"{label}  checking\u2026", total=None)
+    result = _dry_run_company(info, source=source, ir_url_override=ir_url_override,
+                              printer=lambda _: None)
+    verdict = result.get("_dry_run_verdict", "?")
+    color = {"ready": "green", "warning": "yellow", "blocked": "red"}.get(verdict, "white")
+    progress.update(company_task, total=1, completed=1,
+                    description=f"[{color}]{name}[/]  {verdict}")
+    progress.update(overall_task, advance=1)
+    return result
 
 
 def main() -> None:
@@ -208,6 +394,28 @@ def main() -> None:
         default="",
         help="IR website URL to use when --source ir is set (overrides COMPANIES config for all companies in this run).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help=(
+            "Preview mode: resolve URLs and check service connectivity without running LLM "
+            "extraction or saving to MongoDB. Prints a ready/warning/blocked verdict per company."
+        ),
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Maximum parallel workers when processing multiple companies (default: 8).",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        default=False,
+        help="Skip companies that already have a saved document in MongoDB for the current year.",
+    )
     args = parser.parse_args()
 
     if not args.cik and not args.ticker:
@@ -221,11 +429,81 @@ def main() -> None:
         print("No valid companies resolved. Exiting.")
         sys.exit(1)
 
-    graph = build_graph()
-    results = [_run_company(graph, c, source=args.source, ir_url_override=args.ir_url) for c in companies]
+    _progress = Progress(
+        SpinnerColumn(finished_text="[green]\u2713[/]"),
+        TextColumn("{task.description}", justify="left"),
+        BarColumn(bar_width=36),
+        TimeElapsedColumn(),
+    )
 
-    failed = [r for r in results if r.get("status") != "saved"]
-    print(f"\nDone: {len(results) - len(failed)}/{len(results)} succeeded.")
+    # Route all logging through rich's console so warnings print above the
+    # live progress display instead of writing raw bytes to stderr and
+    # breaking the ANSI cursor control.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=_progress.console, show_path=False, rich_tracebacks=False)],
+        force=True,
+    )
+
+    if args.dry_run:
+        total = len(companies)
+        with _progress as progress:
+            overall_task = progress.add_task("[bold]Dry-run[/]", total=total)
+            worker_args = [
+                (c, args.source, args.ir_url, args.skip_existing, progress, overall_task)
+                for c in companies
+            ]
+            results = []
+            if total == 1:
+                results.append(_dry_run_company_parallel(worker_args[0]))
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as pool:
+                    for future in concurrent.futures.as_completed(
+                        pool.submit(_dry_run_company_parallel, wa) for wa in worker_args
+                    ):
+                        results.append(future.result())
+
+        blocked = sum(1 for r in results if r.get("_dry_run_verdict") == "blocked")
+        warnings = sum(1 for r in results if r.get("_dry_run_verdict") == "warning")
+        ready = total - blocked - warnings
+        print(f"Dry-run: {total} companies \u2014 {ready} ready, {warnings} warning, {blocked} blocked.")
+        sys.exit(1 if blocked else 0)
+
+    # Live run
+    graph = build_graph()
+    total = len(companies)
+    with _progress as progress:
+        overall_task = progress.add_task("[bold]Companies[/]", total=total)
+        worker_args = [
+            (graph, c, args.source, args.ir_url, args.skip_existing, progress, overall_task)
+            for c in companies
+        ]
+        results = []
+        if total == 1:
+            results.append(_run_company_parallel(worker_args[0]))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as pool:
+                for future in concurrent.futures.as_completed(
+                    pool.submit(_run_company_parallel, wa) for wa in worker_args
+                ):
+                    results.append(future.result())
+
+    saved = [r for r in results if r.get("status") == "saved"]
+    skipped = [r for r in results if r.get("status") == "skipped"]
+    failed = [r for r in results if r.get("status") not in ("saved", "skipped")]
+    summary = f"Done: {len(saved)}/{total} saved"
+    if skipped:
+        summary += f", {len(skipped)} skipped"
+    if failed:
+        summary += f", {len(failed)} failed"
+    print(summary + ".")
+    if failed:
+        print("Failed: " + ", ".join(r.get("ticker", "?") for r in failed))
+        for r in failed:
+            if r.get("error"):
+                print(f"  {r.get('ticker', '?')}: {r['error']}")
     sys.exit(1 if failed else 0)
 
 

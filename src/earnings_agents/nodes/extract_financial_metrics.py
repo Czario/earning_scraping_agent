@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -14,6 +15,7 @@ from earnings_agents.config import (
     CHUNK_SIZE,
     EXTRACTION_MAX_CHARS,
     OLLAMA_BASE_URL,
+    OLLAMA_CONCURRENCY,
     OLLAMA_MODEL,
     OLLAMA_NUM_CTX,
 )
@@ -26,6 +28,11 @@ _CHUNK_SIZE = CHUNK_SIZE
 _CHUNK_OVERLAP = CHUNK_OVERLAP
 _OLLAMA_REQUEST_TIMEOUT = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "75"))
 _CHUNK_MAX_RETRIES = int(os.getenv("CHUNK_MAX_RETRIES", "1"))
+
+# Semaphore that limits the number of concurrent Ollama calls across ALL
+# company threads. Prevents timeout storms when running many tickers in
+# parallel against a single-threaded local Ollama instance.
+_OLLAMA_SEMAPHORE = threading.Semaphore(OLLAMA_CONCURRENCY)
 
 _PROMPT_TEMPLATE = """\
 You are a financial data extraction assistant.
@@ -139,6 +146,24 @@ _TABLE_RAW_MAX = 10_000_000  # 10 M raw → $10T if ×1M — implausible, so ski
 # have to be considered plausible (filters out residual unscaled cells).
 _MIN_DOLLAR_FRACTION = 0.001   # 0.1 % of revenue
 
+# Major financial metrics that should always represent a significant share of
+# revenue.  When their post-scale value falls below _MIN_DOLLAR_FRACTION we
+# attempt a ×1 000 scale correction (one tier up: millions → billions, etc.)
+# before discarding.  Non-major metrics (specific investing / financing line
+# items) can be legitimately tiny and are kept as-is.
+_MAJOR_METRIC_RX = re.compile(
+    r"\brevenue\b|\bnet sales\b|\bsales\b"
+    r"|\bgross profit\b|\bgross margin\b"
+    r"|\boperating income\b|\boperating profit\b|\boperating loss\b"
+    r"|\bebit\b|\bebitda\b"
+    r"|\bnet income\b|\bnet earnings\b|\bnet loss\b"
+    r"|\boperating cash flow\b|\bcash (?:from|provided by) operations\b",
+    re.IGNORECASE,
+)
+# A ×1 000 rescaled value is accepted only when it stays below this multiple
+# of revenue — guards against inflating genuinely-tiny items.
+_RESCALE_UPPER_MULTIPLE = 3.0
+
 # Pre-scan patterns applied to the full document text BEFORE chunking.
 # Detected scale/period are injected as confirmed ground truth into every
 # chunk prompt, eliminating wrong-scale errors that occur when the
@@ -206,7 +231,8 @@ def _invoke_chunk_with_retry(
             chunk_num, total_chunks, attempt + 1, ticker,
         )
         try:
-            response: str = llm.invoke(prefix + prompt)
+            with _OLLAMA_SEMAPHORE:
+                response: str = llm.invoke(prefix + prompt)
             logger.debug(
                 "Chunk %d/%d attempt %d raw response for %s: %r",
                 chunk_num, total_chunks, attempt + 1, ticker, response[:300],
@@ -361,19 +387,38 @@ def _merge_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
 
     if revenue_ref:
         threshold = revenue_ref * _MIN_DOLLAR_FRACTION
+        rescale_upper = revenue_ref * _RESCALE_UPPER_MULTIPLE
         for key in list(merged.keys()):
             val = merged[key]
             if (
-                val is not None
-                and isinstance(val, (int, float))
-                and not _PCT_OR_PER_SHARE_PATTERNS.search(key)
-                and abs(val) < threshold   # abs() handles negative cash-flow items
+                val is None
+                or not isinstance(val, (int, float))
+                or _PCT_OR_PER_SHARE_PATTERNS.search(key)
+                or abs(val) >= threshold
             ):
-                logger.warning(
-                    "Discarding implausible %r=%s (< %.1f%% of revenue ref %s)",
-                    key, val, _MIN_DOLLAR_FRACTION * 100, revenue_ref,
-                )
-                merged[key] = None
+                continue  # value is fine as-is
+
+            # Value is below the plausibility threshold.
+            if _MAJOR_METRIC_RX.search(key):
+                # Major metrics must be large.  Try a ×1 000 scale correction
+                # (one tier up, e.g. the LLM returned 74.9 in a billions table
+                # instead of 74 900 in a millions table).
+                rescaled = val * 1_000
+                if threshold <= abs(rescaled) <= rescale_upper:
+                    logger.debug(
+                        "Scale-correcting major metric %r: %s → %s",
+                        key, val, rescaled,
+                    )
+                    merged[key] = rescaled
+                else:
+                    logger.warning(
+                        "Discarding implausible major metric %r=%s "
+                        "(< %.1f%% of revenue ref %s; ×1000 rescale also fails)",
+                        key, val, _MIN_DOLLAR_FRACTION * 100, revenue_ref,
+                    )
+                    merged[key] = None
+            # Non-major metrics below threshold are kept as-is — they can be
+            # legitimately small (e.g. $26 M investing item for an $80 B company).
 
     # Drop keys where the final value is None to keep the stored document clean.
     return {k: v for k, v in merged.items() if v is not None}

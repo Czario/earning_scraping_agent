@@ -14,6 +14,7 @@ from earnings_agents.nodes.extract_pdf_text import extract_pdf_text_node
 from earnings_agents.nodes.reflect_metrics import reflect_metrics_node, MAX_EXTRACTION_ATTEMPTS
 from earnings_agents.workflow_state import EarningsAgentState
 from earnings_agents.tools.mongodb_client import upsert_earnings
+from earnings_agents.hooks import with_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +88,13 @@ def build_graph():
     """Compile and return the LangGraph earnings scraping workflow."""
     graph = StateGraph(EarningsAgentState)
 
-    graph.add_node("discover_earnings_release", discover_earnings_release_node)
-    graph.add_node("detect_document_type", detect_document_type_node)
-    graph.add_node("extract_pdf_text", extract_pdf_text_node)
-    graph.add_node("extract_html_text", extract_html_text_node)
-    graph.add_node("extract_financial_metrics", extract_financial_metrics_node)
-    graph.add_node("reflect_metrics", reflect_metrics_node)
-    graph.add_node("mongodb_save", mongodb_save_node)
+    graph.add_node("discover_earnings_release", with_hooks(discover_earnings_release_node))
+    graph.add_node("detect_document_type", with_hooks(detect_document_type_node))
+    graph.add_node("extract_pdf_text", with_hooks(extract_pdf_text_node))
+    graph.add_node("extract_html_text", with_hooks(extract_html_text_node))
+    graph.add_node("extract_financial_metrics", with_hooks(extract_financial_metrics_node))
+    graph.add_node("reflect_metrics", with_hooks(reflect_metrics_node))
+    graph.add_node("mongodb_save", with_hooks(mongodb_save_node))
 
     graph.set_entry_point("discover_earnings_release")
 

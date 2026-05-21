@@ -9,6 +9,9 @@ EDGAR rate-limit guideline: ≤10 requests/second.
 from __future__ import annotations
 
 import logging
+import os
+import threading as _th
+import time as _time
 from typing import Optional
 
 import requests
@@ -31,16 +34,47 @@ _HEADERS = {
 _EX99_TYPES = frozenset({"EX-99.1", "EX-99", "EX99.1", "EX-99.01"})
 
 
-def normalize_cik(cik: str) -> str:
-    """Return a zero-padded 10-digit CIK string."""
-    return str(int(cik)).zfill(10)
+class _TokenBucket:
+    """Thread-safe token-bucket rate limiter."""
+
+    __slots__ = ("_rate", "_tokens", "_last", "_lock")
+
+    def __init__(self, rate: float) -> None:
+        self._rate = rate
+        self._tokens = rate
+        self._last = _time.monotonic()
+        self._lock = _th.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = _time.monotonic()
+                self._tokens = min(
+                    self._rate,
+                    self._tokens + (now - self._last) * self._rate,
+                )
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+            _time.sleep(1.0 / self._rate)
+
+
+# ≤ 8 req/s against sec.gov (SEC guideline: ≤ 10 req/s per user-agent)
+_EDGAR_RATE_LIMITER = _TokenBucket(rate=float(os.getenv("EDGAR_RATE_LIMIT", "8")))
+
+
+def _edgar_get(url: str, **kwargs) -> requests.Response:
+    """Rate-limited GET wrapper for all sec.gov requests."""
+    _EDGAR_RATE_LIMITER.acquire()
+    return requests.get(url, headers=_HEADERS, **kwargs)
 
 
 def _find_exhibit_99_in_index(cik_int: str, acc: str, acc_nodash: str) -> Optional[str]:
     """Parse the EDGAR HTML filing index to find the Exhibit 99.1 document URL."""
     index_url = _EDGAR_INDEX_HTML.format(cik_int=cik_int, acc_nodash=acc_nodash, acc=acc)
     try:
-        resp = requests.get(index_url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
+        resp = _edgar_get(index_url, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("EDGAR HTML index fetch failed for %s: %s", index_url, exc)
@@ -68,77 +102,6 @@ def _find_exhibit_99_in_index(cik_int: str, acc: str, acc_nodash: str) -> Option
     return None
 
 
-def get_latest_earnings_url(cik: str) -> Optional[str]:
-    """Return the URL of the most recent earnings press release (Exhibit 99.1)
-    from an 8-K Item 2.02 filing for the given CIK.
-
-    Falls back to the most recent 8-K primary document if no Exhibit 99.1 is found.
-    Returns ``None`` if no 8-K filing is available.
-    """
-    cik_padded = normalize_cik(cik)
-    cik_int = str(int(cik_padded))  # no leading zeros for archive paths
-
-    # ── 1. Fetch submissions ─────────────────────────────────────────────────
-    sub_url = _EDGAR_SUBMISSIONS.format(cik=cik_padded)
-    try:
-        resp = requests.get(sub_url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
-        logger.error("EDGAR submissions fetch failed for CIK %s: %s", cik_padded, exc)
-        return None
-
-    recent = data.get("filings", {}).get("recent", {})
-    forms: list[str] = recent.get("form", [])
-    items_list: list[str] = recent.get("items", [])
-    accessions: list[str] = recent.get("accessionNumber", [])
-    primary_docs: list[str] = recent.get("primaryDocument", [])
-
-    # ── 2. Find latest 8-K with Item 2.02 (earnings results) ─────────────────
-    target_idx: Optional[int] = None
-    for i, form in enumerate(forms):
-        if form != "8-K":
-            continue
-        item_str = items_list[i] if i < len(items_list) else ""
-        if "2.02" in item_str:
-            target_idx = i
-            break
-
-    # Fallback: use first available 8-K of any item type
-    if target_idx is None:
-        for i, form in enumerate(forms):
-            if form == "8-K":
-                target_idx = i
-                logger.info(
-                    "No Item 2.02 8-K found for CIK %s — using first available 8-K",
-                    cik_padded,
-                )
-                break
-
-    if target_idx is None:
-        logger.warning("No 8-K filings found for CIK %s", cik_padded)
-        return None
-
-    acc = accessions[target_idx]       # e.g. "0000320193-26-000011"
-    acc_nodash = acc.replace("-", "")  # e.g. "000032019326000011"
-
-    # ── 3. Parse HTML filing index to find Exhibit 99.1 ──────────────────────
-    ex99_url = _find_exhibit_99_in_index(cik_int, acc, acc_nodash)
-    if ex99_url:
-        return ex99_url
-
-    # ── 4. Last resort: primary document from submissions metadata ────────────
-    primary_doc = primary_docs[target_idx] if target_idx < len(primary_docs) else ""
-    if primary_doc:
-        url = f"{_EDGAR_ARCHIVES_BASE.format(cik_int=cik_int, acc_nodash=acc_nodash)}/{primary_doc}"
-        logger.info("EDGAR primary doc fallback for CIK %s: %s", cik_padded, url)
-        return url
-
-    logger.warning("Could not resolve document URL for CIK %s accession %s", cik_padded, acc)
-    return None
-
-
-
 def normalize_cik(cik: str) -> str:
     """Return a zero-padded 10-digit CIK string."""
     return str(int(cik)).zfill(10)
@@ -157,7 +120,7 @@ def get_latest_earnings_url(cik: str) -> Optional[str]:
     # ── 1. Fetch submissions ─────────────────────────────────────────────────
     sub_url = _EDGAR_SUBMISSIONS.format(cik=cik_padded)
     try:
-        resp = requests.get(sub_url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
+        resp = _edgar_get(sub_url, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as exc:
