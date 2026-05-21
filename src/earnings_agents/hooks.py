@@ -45,6 +45,11 @@ def set_detail_callback(callback) -> None:
     _thread_local.detail_callback = callback
 
 
+def get_detail_callback():
+    """Return the current thread's detail callback, if one is registered."""
+    return getattr(_thread_local, "detail_callback", None)
+
+
 def report_detail(detail: str) -> None:
     """Fire the thread-local detail callback if one is registered."""
     cb = getattr(_thread_local, "detail_callback", None)

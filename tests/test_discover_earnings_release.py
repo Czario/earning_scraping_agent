@@ -25,7 +25,7 @@ def _base_state(**overrides):
 
 @patch("earnings_agents.nodes.discover_earnings_release.fetch_page_js")
 @patch("earnings_agents.nodes.discover_earnings_release.fetch_page")
-@patch("earnings_agents.nodes.discover_earnings_release.OllamaLLM")
+@patch("earnings_agents.nodes.discover_earnings_release.build_llm")
 def test_discovery_succeeds_on_static_fetch(mock_llm_cls, mock_fetch, mock_fetch_js):
     """Happy path: static fetch returns HTML with links; LLM returns a valid URL."""
     # HTML is padded to exceed the 500-char threshold so Playwright is not triggered.
@@ -55,7 +55,7 @@ def test_discovery_succeeds_on_static_fetch(mock_llm_cls, mock_fetch, mock_fetch
 
 @patch("earnings_agents.nodes.discover_earnings_release.fetch_page_js")
 @patch("earnings_agents.nodes.discover_earnings_release.fetch_page")
-@patch("earnings_agents.nodes.discover_earnings_release.OllamaLLM")
+@patch("earnings_agents.nodes.discover_earnings_release.build_llm")
 def test_discovery_falls_back_to_playwright(mock_llm_cls, mock_fetch, mock_fetch_js):
     """When static fetch returns too little content, Playwright is used."""
     mock_fetch.return_value = ("<html></html>", True)  # too short → Playwright
@@ -95,7 +95,7 @@ def test_discovery_fails_when_page_unreachable(mock_fetch):
 
 @patch("earnings_agents.nodes.discover_earnings_release.fetch_page_js")
 @patch("earnings_agents.nodes.discover_earnings_release.fetch_page")
-@patch("earnings_agents.nodes.discover_earnings_release.OllamaLLM")
+@patch("earnings_agents.nodes.discover_earnings_release.build_llm")
 def test_discovery_fails_on_bad_llm_json(mock_llm_cls, mock_fetch, mock_fetch_js):
     """Node transitions to failed when the LLM returns malformed JSON."""
     padding = " " * 500

@@ -9,6 +9,20 @@ load_dotenv()
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+
+# LLM provider selector: "ollama" (default), "openai", or "groq".
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+
+# OpenAI-only settings (read when LLM_PROVIDER="openai").
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_REQUEST_TIMEOUT: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT", "60"))
+
+# Groq-only settings (read when LLM_PROVIDER="groq").
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_REQUEST_TIMEOUT: float = float(os.getenv("GROQ_REQUEST_TIMEOUT", "60"))
 MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")

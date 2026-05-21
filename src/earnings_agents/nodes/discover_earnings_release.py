@@ -11,6 +11,7 @@ from earnings_agents.config import (
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
 )
+from earnings_agents.llm_factory import build_llm
 from earnings_agents.workflow_state import EarningsAgentState
 from earnings_agents.tools.playwright_scraper import fetch_page_js
 from earnings_agents.tools.static_scraper import extract_links, fetch_page
@@ -93,7 +94,7 @@ def discover_earnings_release_node(state: EarningsAgentState) -> EarningsAgentSt
     )
 
     # ── 4. Ask LLM ───────────────────────────────────────────────────────────
-    llm = OllamaLLM(base_url=OLLAMA_BASE_URL, model=OLLAMA_MODEL, temperature=0)
+    llm = build_llm(format_json=True)
     try:
         response: str = llm.invoke(prompt)
         # Strip accidental markdown code fences

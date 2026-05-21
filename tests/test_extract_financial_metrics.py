@@ -28,7 +28,7 @@ def _base_state(**overrides):
     }
 
 
-@patch("earnings_agents.nodes.extract_financial_metrics.OllamaLLM")
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
 def test_extraction_returns_company_labels(mock_llm_cls):
     """LLM response using company-specific labels is stored as-is."""
     mock_llm = MagicMock()
@@ -50,7 +50,7 @@ def test_extraction_returns_company_labels(mock_llm_cls):
     assert result["error"] is None
 
 
-@patch("earnings_agents.nodes.extract_financial_metrics.OllamaLLM")
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
 def test_extraction_drops_null_fields(mock_llm_cls):
     """Null values are stripped from the final metrics dict."""
     mock_llm = MagicMock()
@@ -67,7 +67,7 @@ def test_extraction_drops_null_fields(mock_llm_cls):
     assert "Net Income" not in result["metrics"]
 
 
-@patch("earnings_agents.nodes.extract_financial_metrics.OllamaLLM")
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
 def test_extraction_fails_on_bad_json(mock_llm_cls):
     """Node transitions to failed when the LLM returns non-JSON output."""
     mock_llm = MagicMock()
@@ -80,7 +80,7 @@ def test_extraction_fails_on_bad_json(mock_llm_cls):
     assert "chunk" in result["error"].lower()
 
 
-@patch("earnings_agents.nodes.extract_financial_metrics.OllamaLLM")
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
 def test_extraction_strips_markdown_fences(mock_llm_cls):
     """Markdown code fences around the JSON response are handled gracefully."""
     mock_llm = MagicMock()
@@ -170,7 +170,7 @@ def _base_state(**overrides):
     }
 
 
-@patch("earnings_agents.nodes.extract_financial_metrics.OllamaLLM")
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
 def test_extraction_parses_all_fields(mock_llm_cls):
     """All metrics fields are correctly parsed; __scale__:as-is passes full-USD values through."""
     mock_llm = MagicMock()
@@ -203,7 +203,7 @@ def test_extraction_parses_all_fields(mock_llm_cls):
     assert result["error"] is None
 
 
-@patch("earnings_agents.nodes.extract_financial_metrics.OllamaLLM")
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
 def test_extraction_handles_null_fields(mock_llm_cls):
     """Null-valued fields are stripped; only the non-null value is kept."""
     mock_llm = MagicMock()
@@ -221,7 +221,7 @@ def test_extraction_handles_null_fields(mock_llm_cls):
     assert "Net Income" not in result["metrics"]
 
 
-@patch("earnings_agents.nodes.extract_financial_metrics.OllamaLLM")
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
 def test_extraction_fails_on_bad_json(mock_llm_cls):
     """Node transitions to failed when the LLM returns non-JSON output."""
     mock_llm = MagicMock()
@@ -234,7 +234,7 @@ def test_extraction_fails_on_bad_json(mock_llm_cls):
     assert "chunk" in result["error"].lower()
 
 
-@patch("earnings_agents.nodes.extract_financial_metrics.OllamaLLM")
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
 def test_extraction_strips_markdown_fences(mock_llm_cls):
     """Markdown code fences around the JSON response are handled gracefully."""
     mock_llm = MagicMock()

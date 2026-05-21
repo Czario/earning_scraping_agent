@@ -19,7 +19,8 @@ from earnings_agents.config import (
     OLLAMA_MODEL,
     OLLAMA_NUM_CTX,
 )
-from earnings_agents.hooks import report_detail
+from earnings_agents.hooks import get_detail_callback, report_detail, set_detail_callback
+from earnings_agents.llm_factory import build_llm
 from earnings_agents.workflow_state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
@@ -203,21 +204,23 @@ def _invoke_chunk_with_retry(
     ticker: str,
     shares_multiplier: int = 1,
     max_retries: int = _CHUNK_MAX_RETRIES,
+    detail_callback=None,
+    report_chunk=None,
 ) -> "dict[str, Any] | None":
     """Invoke the LLM for one chunk, retrying with a stricter prefix on parse failure.
 
-    Each worker creates its own Ollama client instance; sharing one instance
+    Each worker creates its own LLM client instance; sharing one instance
     across threads can block intermittently under parallel load.
     """
-    llm = OllamaLLM(
-        base_url=OLLAMA_BASE_URL,
-        model=OLLAMA_MODEL,
-        temperature=0,
-        num_ctx=OLLAMA_NUM_CTX,
-        format="json",
-        client_kwargs={"timeout": _OLLAMA_REQUEST_TIMEOUT},
-    )
+    if detail_callback is not None:
+        set_detail_callback(detail_callback)
+
+    llm = build_llm(format_json=True, request_timeout=_OLLAMA_REQUEST_TIMEOUT)
     for attempt in range(max_retries + 1):
+        if report_chunk is not None:
+            report_chunk(chunk_num - 1, "running", attempt + 1)
+        else:
+            report_detail(f"chunk {chunk_num}/{total_chunks} attempt {attempt + 1}")
         prefix = (
             ""
             if attempt == 0
@@ -240,6 +243,8 @@ def _invoke_chunk_with_retry(
             )
             parsed = _parse_llm_response(response, shares_multiplier)
             if parsed is not None:
+                if report_chunk is not None:
+                    report_chunk(chunk_num - 1, "done", attempt + 1)
                 return parsed
             logger.warning(
                 "Chunk %d/%d attempt %d returned unparseable response for %s",
@@ -250,6 +255,8 @@ def _invoke_chunk_with_retry(
                 "Chunk %d/%d attempt %d failed for %s: %s",
                 chunk_num, total_chunks, attempt + 1, ticker, exc,
             )
+    if report_chunk is not None:
+        report_chunk(chunk_num - 1, "failed", max_retries + 1)
     return None
 
 
@@ -543,6 +550,31 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     chunks = _chunk_text(raw_text)
     total = len(chunks)
     logger.info("Extracting metrics for %s across %d chunk(s)", ticker, total)
+    detail_callback = get_detail_callback()
+
+    # Shared per-chunk status tracker so the progress bar can show every
+    # chunk's state (·=pending, ⟳=running, ✓=done, ✗=failed), not just the
+    # most recent one. Updated under a lock from worker threads.
+    _chunk_status: list[str] = ["·"] * total
+    _chunk_attempts: list[int] = [0] * total
+    _status_lock = threading.Lock()
+    _glyph = {"pending": "·", "running": "⟳", "done": "✓", "failed": "✗"}
+
+    def _render_chunks() -> str:
+        parts = []
+        for idx, st in enumerate(_chunk_status, start=1):
+            attempt = _chunk_attempts[idx - 1]
+            suffix = f"⋅{attempt}" if attempt > 1 and st == "⟳" else ""
+            parts.append(f"{idx}{st}{suffix}")
+        done = sum(1 for s in _chunk_status if s == "✓")
+        return f"chunks {' '.join(parts)} ({done}/{total})"
+
+    def _report_chunk(idx: int, status: str, attempt: int) -> None:
+        with _status_lock:
+            _chunk_status[idx] = _glyph[status]
+            _chunk_attempts[idx] = attempt
+            summary = _render_chunks()
+        report_detail(summary)
 
     # Build all chunk prompts up front
     prompts = [
@@ -568,7 +600,17 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     if num_parallel > 1:
         with ThreadPoolExecutor(max_workers=num_parallel) as executor:
             future_to_idx = {
-                executor.submit(_invoke_chunk_with_retry, prompt, i + 1, total, ticker, shares_multiplier): i
+                executor.submit(
+                    _invoke_chunk_with_retry,
+                    prompt,
+                    i + 1,
+                    total,
+                    ticker,
+                    shares_multiplier,
+                    _CHUNK_MAX_RETRIES,
+                    detail_callback,
+                    _report_chunk,
+                ): i
                 for i, prompt in enumerate(prompts)
             }
             completed = 0
@@ -576,7 +618,6 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
                 idx = future_to_idx[future]
                 ordered[idx] = future.result()
                 completed += 1
-                report_detail(f"chunk {completed}/{total}")
                 logger.info(
                     "Parallel progress for %s: %d/%d chunk task(s) completed",
                     ticker,
@@ -585,8 +626,16 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
                 )
     else:
         for i, prompt in enumerate(prompts):
-            report_detail(f"chunk {i + 1}/{total}")
-            ordered[i] = _invoke_chunk_with_retry(prompt, i + 1, total, ticker, shares_multiplier)
+            ordered[i] = _invoke_chunk_with_retry(
+                prompt,
+                i + 1,
+                total,
+                ticker,
+                shares_multiplier,
+                _CHUNK_MAX_RETRIES,
+                detail_callback,
+                _report_chunk,
+            )
 
     chunk_results: list[dict[str, Any]] = []
     for i, result in enumerate(ordered, start=1):

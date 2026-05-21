@@ -51,11 +51,16 @@ logging.basicConfig(
 
 from earnings_agents.config import (  # noqa: E402
     COMPANIES,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    LLM_PROVIDER,
     MONGODB_COLLECTION,
     MONGODB_DB,
     MONGODB_URI,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
 )
 from earnings_agents.nodes.detect_document_type import detect_document_type_node  # noqa: E402
 from earnings_agents.workflow import build_graph  # noqa: E402
@@ -90,6 +95,19 @@ def _check_ollama() -> tuple[bool, str]:
         return True, f"Ollama OK — model '{OLLAMA_MODEL}' available"
     except Exception as exc:  # noqa: BLE001
         return False, f"Ollama unreachable: {exc}"
+
+
+def _check_llm() -> tuple[bool, str]:
+    """Return (ok, detail) for the selected LLM provider configuration."""
+    if LLM_PROVIDER == "openai":
+        if not OPENAI_API_KEY:
+            return False, "OpenAI API key missing (set OPENAI_API_KEY in .env)"
+        return True, f"OpenAI configured — model '{OPENAI_MODEL}'"
+    if LLM_PROVIDER == "groq":
+        if not GROQ_API_KEY:
+            return False, "Groq API key missing (set GROQ_API_KEY in .env)"
+        return True, f"Groq configured — model '{GROQ_MODEL}'"
+    return _check_ollama()
 
 
 def _check_mongodb() -> tuple[bool, str]:
@@ -248,7 +266,7 @@ def _dry_run_company(
 
     state = _build_initial_state(info, source=source, ir_url_override=ir_url_override, printer=printer)
 
-    ollama_ok, ollama_detail = _check_ollama()
+    llm_ok, llm_detail = _check_llm()
     mongo_ok, mongo_detail = _check_mongodb()
 
     file_type: str | None = None
@@ -259,7 +277,7 @@ def _dry_run_company(
 
     if url_blocked:
         verdict = "blocked"
-    elif not ollama_ok or not mongo_ok:
+    elif not llm_ok or not mongo_ok:
         verdict = "warning"
     else:
         verdict = "ready"
@@ -269,14 +287,21 @@ def _dry_run_company(
     printer(f"  URL     : {url_display}")
     if file_type:
         printer(f"  DocType : {file_type}")
-    printer(f"  Ollama  : {'OK  ' if ollama_ok else 'FAIL'} — {ollama_detail}")
+    printer(f"  LLM     : {'OK  ' if llm_ok else 'FAIL'} — {llm_detail}")
     printer(f"  MongoDB : {'OK  ' if mongo_ok else 'FAIL'} — {mongo_detail}")
     printer(f"  Verdict : {verdict.upper()}")
     if verdict == "blocked":
         printer(f"  Reason  : {state.get('error', 'URL resolution failed')}")
     elif verdict == "warning":
-        if not ollama_ok:
-            printer("  Action  : Start Ollama and pull the required model (see OLLAMA_MODEL in .env)")
+        if not llm_ok:
+            if LLM_PROVIDER == "ollama":
+                printer(
+                    "  Action  : Start Ollama and pull the required model (see OLLAMA_MODEL in .env)"
+                )
+            elif LLM_PROVIDER == "openai":
+                printer("  Action  : Set OPENAI_API_KEY (and optionally OPENAI_MODEL) in .env")
+            else:
+                printer("  Action  : Set GROQ_API_KEY (and optionally GROQ_MODEL) in .env")
         if not mongo_ok:
             printer("  Action  : Start MongoDB or check MONGODB_URI in .env")
     else:
@@ -313,16 +338,32 @@ def _run_company_parallel(args: tuple) -> dict:
 
     company_task = progress.add_task(f"{label}  resolving\u2026", total=None)
 
+    _completed: list[str] = []
     _current_stage: list[str] = ["resolving\u2026"]
+    _current_detail: list[str] = [""]
+
+    def _render() -> str:
+        parts = [f"[green]{s} \u2713[/]" for s in _completed]
+        active = f"[bold]{_current_stage[0]}[/]"
+        if _current_detail[0]:
+            active = f"{active} [dim]{_current_detail[0]}[/]"
+        parts.append(active)
+        return f"{label}  " + "  \u2192  ".join(parts)
 
     def _node_cb(node_name: str, event: str, _ticker: str) -> None:
+        stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
         if event == "start":
-            stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
             _current_stage[0] = stage
-            progress.update(company_task, description=f"{label}  {stage}")
+            _current_detail[0] = ""
+            progress.update(company_task, description=_render())
+        elif event == "end":
+            if stage not in _completed:
+                _completed.append(stage)
+            progress.update(company_task, description=_render())
 
     def _detail_cb(detail: str) -> None:
-        progress.update(company_task, description=f"{label}  {_current_stage[0]}  [dim]{detail}[/]")
+        _current_detail[0] = detail
+        progress.update(company_task, description=_render())
 
     set_node_callback(_node_cb)
     set_detail_callback(_detail_cb)
@@ -454,6 +495,14 @@ def main() -> None:
         handlers=[RichHandler(console=_progress.console, show_path=False, rich_tracebacks=False)],
         force=True,
     )
+
+    if LLM_PROVIDER == "openai":
+        llm_label = f"openai:{OPENAI_MODEL}"
+    elif LLM_PROVIDER == "groq":
+        llm_label = f"groq:{GROQ_MODEL}"
+    else:
+        llm_label = f"ollama:{OLLAMA_MODEL}"
+    _progress.console.print(f"[bold cyan]LLM[/]      : {llm_label}")
 
     if args.dry_run:
         total = len(companies)
