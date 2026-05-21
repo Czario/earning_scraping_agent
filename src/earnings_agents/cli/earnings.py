@@ -465,6 +465,13 @@ def main() -> None:
         default=False,
         help="Skip companies that already have a saved document in MongoDB for the current year.",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Show full DEBUG-level log output from every pipeline node.",
+    )
     args = parser.parse_args()
 
     if not args.cik and not args.ticker:
@@ -485,14 +492,22 @@ def main() -> None:
         TimeElapsedColumn(),
     )
 
-    # Route all logging through rich's console so warnings print above the
+    # Route all logging through rich's console so log lines print above the
     # live progress display instead of writing raw bytes to stderr and
     # breaking the ANSI cursor control.
+    log_level = logging.DEBUG if args.verbose else logging.WARNING
     logging.basicConfig(
-        level=logging.WARNING,
+        level=log_level,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(console=_progress.console, show_path=False, rich_tracebacks=False)],
+        handlers=[
+            RichHandler(
+                console=_progress.console,
+                show_path=args.verbose,
+                rich_tracebacks=args.verbose,
+                log_time_format="[%X]",
+            )
+        ],
         force=True,
     )
 
