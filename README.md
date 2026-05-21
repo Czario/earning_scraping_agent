@@ -20,6 +20,9 @@ Metrics are extracted dynamically with company-native labels and stored in Mongo
 - Ollama running locally
 - MongoDB running locally (or update URI in env)
 
+pkill ollama
+OLLAMA_NUM_PARALLEL=4 ollama serve
+
 uv run earnings --ticker MSFT --dry-run
 uv run earnings --ticker AAPL MSFT GOOGL --dry-run
 

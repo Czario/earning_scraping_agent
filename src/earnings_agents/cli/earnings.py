@@ -61,7 +61,7 @@ from earnings_agents.nodes.detect_document_type import detect_document_type_node
 from earnings_agents.workflow import build_graph  # noqa: E402
 from earnings_agents.company_registry import lookup_by_cik, lookup_by_ticker  # noqa: E402
 from earnings_agents.tools.edgar_client import get_latest_earnings_url  # noqa: E402
-from earnings_agents.hooks import set_node_callback  # noqa: E402
+from earnings_agents.hooks import set_detail_callback, set_node_callback  # noqa: E402
 
 SEP = "=" * 64
 
@@ -313,15 +313,23 @@ def _run_company_parallel(args: tuple) -> dict:
 
     company_task = progress.add_task(f"{label}  resolving\u2026", total=None)
 
+    _current_stage: list[str] = ["resolving\u2026"]
+
     def _node_cb(node_name: str, event: str, _ticker: str) -> None:
         if event == "start":
             stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
+            _current_stage[0] = stage
             progress.update(company_task, description=f"{label}  {stage}")
 
+    def _detail_cb(detail: str) -> None:
+        progress.update(company_task, description=f"{label}  {_current_stage[0]}  [dim]{detail}[/]")
+
     set_node_callback(_node_cb)
+    set_detail_callback(_detail_cb)
     result = _run_company(graph, info, source=source, ir_url_override=ir_url_override,
                           printer=lambda _: None)
     set_node_callback(None)
+    set_detail_callback(None)
 
     status = result.get("status", "?")
     if status == "saved":

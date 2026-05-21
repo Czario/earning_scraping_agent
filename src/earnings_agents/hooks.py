@@ -36,6 +36,22 @@ def set_node_callback(callback) -> None:
     _thread_local.node_callback = callback
 
 
+def set_detail_callback(callback) -> None:
+    """Register a per-thread callback for sub-node progress detail.
+
+    The callback receives a single ``detail`` string (e.g. ``"chunk 3/8"``).
+    Pass ``None`` to clear.
+    """
+    _thread_local.detail_callback = callback
+
+
+def report_detail(detail: str) -> None:
+    """Fire the thread-local detail callback if one is registered."""
+    cb = getattr(_thread_local, "detail_callback", None)
+    if cb:
+        cb(detail)
+
+
 def with_hooks(
     node_fn: Callable[[EarningsAgentState], EarningsAgentState],
 ) -> Callable[[EarningsAgentState], EarningsAgentState]:

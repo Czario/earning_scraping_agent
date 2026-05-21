@@ -19,6 +19,7 @@ from earnings_agents.config import (
     OLLAMA_MODEL,
     OLLAMA_NUM_CTX,
 )
+from earnings_agents.hooks import report_detail
 from earnings_agents.workflow_state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
@@ -575,6 +576,7 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
                 idx = future_to_idx[future]
                 ordered[idx] = future.result()
                 completed += 1
+                report_detail(f"chunk {completed}/{total}")
                 logger.info(
                     "Parallel progress for %s: %d/%d chunk task(s) completed",
                     ticker,
@@ -583,6 +585,7 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
                 )
     else:
         for i, prompt in enumerate(prompts):
+            report_detail(f"chunk {i + 1}/{total}")
             ordered[i] = _invoke_chunk_with_retry(prompt, i + 1, total, ticker, shares_multiplier)
 
     chunk_results: list[dict[str, Any]] = []
