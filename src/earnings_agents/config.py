@@ -50,3 +50,18 @@ CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "300"))
 # Local Ollama is single-threaded, so >1 here only helps when using a
 # remote / multi-GPU Ollama instance. Default: 1 (serialize LLM calls).
 OLLAMA_CONCURRENCY: int = int(os.getenv("OLLAMA_CONCURRENCY", "1"))
+
+# When True (default), refuse to upsert a document whose accounting identity
+# checks failed (e.g. Gross margin ≠ Revenue − COGS). When False, the document
+# is saved with an "identity_warnings" field listing the failures.
+STRICT_ACCURACY: bool = os.getenv("STRICT_ACCURACY", "1").strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+# When True (default), run an additional LLM cleanup pass over the extracted
+# metrics before saving. The cleanup is constrained: it can ONLY drop keys
+# (duplicates, obvious scale errors). It cannot invent or mutate values —
+# any such attempt is rejected by deterministic guardrails.
+CLEANUP_METRICS: bool = os.getenv("CLEANUP_METRICS", "1").strip().lower() not in {
+    "0", "false", "no", "off", ""
+}

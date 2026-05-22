@@ -44,6 +44,18 @@ class _OpenAIInvokeAdapter:
         return content if isinstance(content, str) else str(content)
 
 
+class _GroqInvokeAdapter:
+    """Pass-through Groq adapter — relies on server-side rate limiting."""
+
+    def __init__(self, chat_model: Any) -> None:
+        self._chat = chat_model
+
+    def invoke(self, prompt: str) -> str:
+        msg = self._chat.invoke(prompt)
+        content = getattr(msg, "content", msg)
+        return content if isinstance(content, str) else str(content)
+
+
 def build_llm(*, format_json: bool = False, request_timeout: float | None = None) -> Any:
     """Build an LLM client for the configured provider.
 
@@ -93,7 +105,7 @@ def build_llm(*, format_json: bool = False, request_timeout: float | None = None
         }
         if format_json:
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
-        return _OpenAIInvokeAdapter(ChatOpenAI(**kwargs))
+        return _GroqInvokeAdapter(ChatOpenAI(**kwargs))
 
     # Default: Ollama
     from langchain_ollama import OllamaLLM

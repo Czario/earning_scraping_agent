@@ -114,7 +114,9 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
     - EDGAR SGML document wrappers
     - JS-rendered pages (Playwright fallback for non-SEC URLs)
     """
-    url = state.get("discovered_file_url", "")
+    # TypedDict.get may still infer Optional[str]; normalize to plain str
+    # so substring checks ("sec.gov" in/not in url) are type-safe.
+    url = state.get("discovered_file_url") or ""
     ticker = state["ticker"]
 
     try:

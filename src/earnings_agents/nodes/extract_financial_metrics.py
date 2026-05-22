@@ -6,7 +6,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Optional
 
 from langchain_ollama import OllamaLLM
 
@@ -39,10 +39,66 @@ _OLLAMA_SEMAPHORE = threading.Semaphore(OLLAMA_CONCURRENCY)
 _PROMPT_TEMPLATE = """\
 You are a financial data extraction assistant.
 
-Extract ALL numeric financial metrics from the text excerpt below for {company_name} ({ticker}).
+Extract ONLY income statement metrics from the text excerpt below for {company_name} ({ticker}).
 This is chunk {chunk_num} of {total_chunks} of the full document.
 {focus_hint}{scale_hint}{period_hint}
+SCOPE — extract ONLY these income statement concepts.
+Always use the EXACT single row label printed in the document as the JSON key.
+The canonical names below are for concept recognition only — never use them as keys
+and never combine multiple names into one key.
+
+  Income statement concepts to extract:
+  • Revenue
+  • Cost of revenue
+  • Gross profit
+  • Research and development expense
+  • Sales and marketing expense
+  • General and administrative expense
+  • Total operating expenses
+  • Operating income
+  • Interest income
+  • Interest expense
+  • Other income (expense), net
+  • Income before income taxes
+  • Income tax expense
+  • Net income
+  • Basic earnings per share
+  • Diluted earnings per share
+  • Weighted-average basic shares outstanding
+  • Weighted-average diluted shares outstanding
+
+  Common alternative labels (for recognition only — use whichever the document uses):
+    Revenue → "Net revenue", "Net sales"
+    Cost of revenue → "Cost of goods sold", "Cost of sales"
+    Operating income → "Operating profit", "Operating loss", "Income from operations"
+    Income tax expense → "Provision for income taxes"
+    Net income → "Net earnings", "Net loss"
+    Basic EPS → "Basic net income per share", "Net income per share — Basic"
+    Diluted EPS → "Diluted net income per share", "Net income per share — Diluted"
+
+IGNORE — do NOT extract any of the following:
+  • Percentage-form metrics: gross margin %, operating margin %, net margin %.
+    These are derivable — capture Gross profit (dollar amount) instead.
+  • Balance sheet items (Assets, Liabilities, Equity, Inventory, Receivables, etc.)
+  • Cash flow items (Operating / Investing / Financing cash flows, Capex, Depreciation, etc.)
+  • Guidance, forecasts, or forward-looking projections.
+  • Any table whose header or column labels contain "Non-GAAP", "non-GAAP", "Adjusted",
+    "Reconciliation", "Supplemental", or lists both a GAAP and a Non-GAAP column side-by-side.
+    Skip the ENTIRE table — do not extract any rows from it, even the GAAP column.
+    If you are unsure whether a table is a reconciliation, skip it.
+  • Any key prefixed with "GAAP " or "Non-GAAP " or containing "impact of", "adjustment".
+  • Duplicate summary rows that restate a metric already captured (e.g. "Total operating
+    expenses" when "Operating expenses" is already present with the same value).
+
+TABLE PRIORITY — when the same metric appears in multiple tables, prefer this order:
+  1. Primary condensed GAAP income statement (usually the first financial table).
+  2. Segment or product-line breakdowns — skip unless the primary table is absent.
+  3. GAAP-to-Non-GAAP reconciliation — always skip (covered by IGNORE above).
+  Use the plain metric label from table (1); never prefix keys with "GAAP " or "Non-GAAP ".
+
 Return ONLY a flat JSON object — no markdown fences, no extra text, no nested objects.
+Every value must be a number or null. NEVER produce {{"Key": {{"SubKey": value}}}} — that is
+a nested object and is illegal. If a metric has sub-categories, create separate flat keys.
 
 FIRST field must be "__scale__":
   Set it to the unit of the table in this excerpt:
@@ -96,8 +152,8 @@ Other rules:
      "stations", "connectors", "subscriptions", "days of supply",
      "lease count", "units".
   7. PERCENTAGE METRICS are never scaled — report as a number 0–100 for any
-     key containing: "operating margin", "net margin", "gross margin %",
-     "profit margin", "margin %", "growth rate".
+     key containing: "gross margin", "operating margin", "net margin",
+     "gross margin %", "profit margin", "margin %", "growth rate".
 Text excerpt:
 \"\"\"
 {text}
@@ -106,18 +162,17 @@ Text excerpt:
 
 # Keys whose values are percentages, per-share amounts, or non-dollar counts —
 # excluded from the sanity check AND from scale multiplication.
-# "margin" intentionally omitted: "Gross margin" is a dollar amount, not a %.
+# "gross margin" (standalone) is treated as a percentage; "gross profit" is the dollar form.
 _PCT_OR_PER_SHARE_PATTERNS = re.compile(
     r"(%|percent|\bgrowth\b|\bratio\b|\beps\b|per share|\byield\b|\brate\b|\byoy\b|\bpct\b"
     r"|\bemployee\b|\bheadcount\b|basis points|percentage points"
+    r"|\bgross margin\b|\boperating margin\b|\bnet margin\b|\bprofit margin\b|\bmargin\s*%"
     # Operational unit counts — physical quantities, never dollar-scaled
     r"|\bproduction\b|\bdeliveries\b|\bdelivered\b"
     r"|(?:super)?charger.{0,12}(?:station|connector)"
     r"|\bstations?\b|\bconnectors?\b"
     r"|\bdays.{0,5}supply\b|\blease count\b"
-    r"|\bactive\b.{0,20}\bsubscriptions?\b|\bfsd subscriptions?\b"
-    # Percentage-type margins (distinct from 'Gross margin' which is a dollar amount)
-    r"|\boperating margin\b|\bnet margin\b|\bprofit margin\b|\bmargin\s*%)",
+    r"|\bactive\b.{0,20}\bsubscriptions?\b|\bfsd subscriptions?\b)",
     re.IGNORECASE,
 )
 
@@ -154,12 +209,11 @@ _MIN_DOLLAR_FRACTION = 0.001   # 0.1 % of revenue
 # before discarding.  Non-major metrics (specific investing / financing line
 # items) can be legitimately tiny and are kept as-is.
 _MAJOR_METRIC_RX = re.compile(
-    r"\brevenue\b|\bnet sales\b|\bsales\b"
-    r"|\bgross profit\b|\bgross margin\b"
+    r"\brevenue\b|\bnet sales\b"
+    r"|\bgross profit\b"
     r"|\boperating income\b|\boperating profit\b|\boperating loss\b"
     r"|\bebit\b|\bebitda\b"
-    r"|\bnet income\b|\bnet earnings\b|\bnet loss\b"
-    r"|\boperating cash flow\b|\bcash (?:from|provided by) operations\b",
+    r"|\bnet income\b|\bnet earnings\b|\bnet loss\b",
     re.IGNORECASE,
 )
 # A ×1 000 rescaled value is accepted only when it stays below this multiple
@@ -356,12 +410,16 @@ def _parse_llm_response(response: str, shares_multiplier: int = 1) -> dict[str, 
                 and multiplier > 1
                 and abs(v) < _TABLE_RAW_MAX   # skip values already at full USD scale
             ):
+                # Ambiguous 'gross margin' label: percentage (≤ 100) vs dollar amount (> 100).
+                # Skip scaling when the value is clearly already a percentage.
+                if "gross margin" in k.lower() and abs(v) <= 100:
+                    continue
                 parsed[k] = v * multiplier
 
     return parsed
 
 
-def _merge_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _merge_metrics(results: list[dict[str, Any]], source_text: str = "") -> dict[str, Any]:
     """Merge per-chunk extraction dicts into one dict of all discovered metrics.
 
     Strategy per key:
@@ -429,6 +487,9 @@ def _merge_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
             # legitimately small (e.g. $26 M investing item for an $80 B company).
 
     # Drop keys where the final value is None to keep the stored document clean.
+    # Note: duplicate / synonym folding is handled downstream by the
+    # constrained LLM cleanup_metrics_node, not here. Keys are preserved
+    # exactly as the LLM extracted them (matching company wording).
     return {k: v for k, v in merged.items() if v is not None}
 
 
@@ -443,16 +504,51 @@ def _find_first(
     return None, None
 
 
-def _validate_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+def _check_identity(
+    name: str,
+    lhs: float | None,
+    rhs: float | None,
+    *,
+    tolerance: float = 0.005,
+) -> str | None:
+    """Return a warning string if |lhs - rhs| / max(|lhs|, |rhs|) > tolerance.
+
+    Both sides must be present and numeric for the check to fire. ``tolerance``
+    defaults to 0.5 % which absorbs rounding in published figures.
+    """
+    if lhs is None or rhs is None:
+        return None
+    if not isinstance(lhs, (int, float)) or not isinstance(rhs, (int, float)):
+        return None
+    denom = max(abs(lhs), abs(rhs))
+    if denom == 0:
+        return None
+    drift = abs(lhs - rhs) / denom
+    if drift > tolerance:
+        return (
+            f"{name}: computed {rhs:,.0f} vs reported {lhs:,.0f} "
+            f"(drift {drift * 100:.2f}%)"
+        )
+    return None
+
+
+def _validate_metrics(metrics: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Apply deterministic post-merge cross-field consistency checks.
 
-    Catches values the LLM accidentally pulled from the wrong table section
-    or period column by verifying known financial identities:
-      1. Free Cash Flow ≤ Operating Cash Flow  (FCF = Op CF − Capex, Capex ≥ 0)
-      2. "Less: purchases of property and equipment" ≈ "Purchases of property
-         and equipment"  (same concept in different table contexts)
+    Returns ``(metrics, warnings)``. *warnings* lists any accounting identity
+    that failed by more than 0.5 %; the caller decides whether to save anyway.
+
+    Checks:
+      1. Free Cash Flow ≤ Operating Cash Flow.
+      2. "Less: purchases of property and equipment" within 50 % of direct capex.
+      3. Gross margin ≈ Revenue − Cost of revenue.
+      4. Operating income ≈ Gross margin − (R&D + S&M + G&A).
+      5. Income before taxes ≈ Operating income + Other income (expense).
+      6. Net income ≈ Income before taxes − Provision for income taxes.
+      7. Diluted EPS × Diluted shares ≈ Net income (within 1 ¢ on the EPS).
     """
     result = dict(metrics)
+    warnings: list[str] = []
 
     # 1. FCF must be ≤ operating cash flow
     _, op_cf = _find_first(result, r"net cash provided by operating")
@@ -471,7 +567,6 @@ def _validate_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
 
     # 2. "Less: purchases of property and equipment" is the FCF reconciliation
     #    entry for capex — it must be within 50% of the direct capex line.
-    #    If they diverge significantly, the "Less:" value came from a wrong section.
     _, capex_val = _find_first(result, r"^purchases of property and equipment")
     less_key, less_val = _find_first(result, r"less:?\s+purchases of property")
     if (
@@ -487,7 +582,114 @@ def _validate_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         )
         result[less_key] = None
 
-    return {k: v for k, v in result.items() if v is not None}
+    def _num(pattern: str) -> float | None:
+        _, v = _find_first(result, pattern)
+        return v if isinstance(v, (int, float)) else None
+
+    revenue = _num(r"^revenue$|^total revenue$|^net sales$|^total net sales$")
+    cogs = _num(r"^cost of revenue$|^total cost of revenue$|^cost of sales$")
+    gross = _num(r"^gross (margin|profit)$")
+    rnd = _num(r"^research and development")
+    snm = _num(r"^sales and marketing|^selling and marketing")
+    gna = _num(r"^general and administrative")
+    op_income = _num(r"^operating income$|^operating profit$|^income from operations$")
+    other_inc = _num(r"^other income.*expense|^other.*income.*net$|^other,?\s*net$")
+    interest_income = _num(r"^interest income")
+    interest_expense = _num(r"^interest expense")
+    interest_net = _num(r"^interest income.*expense|^interest,?\s*net$|^net interest")
+    income_before_tax = _num(r"^income before .*tax")
+    tax = _num(r"^provision for income tax|^income tax expense|^income tax provision")
+    net_income = _num(r"^net income$|^net earnings$")
+    eps_d = _num(r"^diluted earnings per share$")
+    shares_d = _num(r"weighted average shares outstanding:?\s*diluted")
+
+    # ------------------------------------------------------------------
+    # Identity checks are split into two tiers:
+    #
+    #   BLOCKING — universal sanity checks that catch catastrophic LLM
+    #              errors (wrong scale, hallucinated numbers, swapped
+    #              values). Work for every industry — banks, REITs,
+    #              insurers, foreign issuers — because they only rely on
+    #              numbers every company reports.
+    #
+    #   ADVISORY — structural decompositions (gross margin = revenue −
+    #              COGS, operating income = gross − opex, pre-tax =
+    #              op + non-op). These are useful but fragile: banks
+    #              have no COGS, REITs use FFO, insurers use claims and
+    #              reserves, etc. They are logged for inspection but do
+    #              NOT block the save.
+    # ------------------------------------------------------------------
+
+    def _advisory(label: str, lhs: float, rhs: float, *, tolerance: float = 0.005) -> None:
+        w = _check_identity(label, lhs, rhs, tolerance=tolerance)
+        if w:
+            logger.warning("Identity check (advisory): %s", w)
+
+    # --- ADVISORY: structural decompositions (informational only) -----
+    if revenue is not None and cogs is not None and gross is not None:
+        _advisory("Gross margin = Revenue − COGS", gross, revenue - cogs)
+
+    if gross is not None and op_income is not None and (
+        rnd is not None and snm is not None and gna is not None
+    ):
+        _advisory("Operating income = Gross − opex", op_income, gross - rnd - snm - gna)
+
+    non_op_parts = [x for x in (other_inc, interest_income, interest_net) if x is not None]
+    non_op_sum: Optional[float] = sum(non_op_parts) if non_op_parts else None
+    if non_op_sum is not None and interest_expense is not None:
+        non_op_sum -= interest_expense
+    if op_income is not None and income_before_tax is not None and non_op_sum is not None:
+        _advisory(
+            "Income before taxes = Op income + Non-operating items",
+            income_before_tax,
+            op_income + non_op_sum,
+        )
+
+    if income_before_tax is not None and tax is not None and net_income is not None:
+        _advisory("Net income = Pre-tax − Tax", net_income, income_before_tax - tax)
+
+    # --- BLOCKING: universal sanity checks ----------------------------
+    # 1. Diluted EPS × Diluted shares ≈ Net income.
+    #    The single most reliable cross-check: three numbers from the
+    #    same column of the income statement, present for virtually
+    #    every public company. Catches scale errors (off by 1000×) and
+    #    hallucinated values. Tolerance: max(1¢, 2% of computed EPS)
+    #    — the 2% band accommodates rounding when reported EPS has
+    #    only 2 decimal places and shares are reported in millions.
+    if eps_d is not None and shares_d is not None and net_income is not None and shares_d > 0:
+        computed_eps = net_income / shares_d
+        tol = max(0.01, abs(eps_d) * 0.02)
+        if abs(computed_eps - eps_d) > tol:
+            warnings.append(
+                f"Diluted EPS sanity check: reported {eps_d:.4f} vs computed "
+                f"{computed_eps:.4f} (Net income / Diluted shares)"
+            )
+
+    # 2. Scale sanity: a Revenue value below $100K or above $10T is
+    #    almost certainly a scale-parsing error (the LLM read "in
+    #    millions" wrong, or grabbed a per-share value).
+    if revenue is not None and revenue > 0 and not (1e5 <= revenue <= 1e13):
+        warnings.append(
+            f"Scale sanity check: Revenue {revenue:,.0f} is outside the plausible "
+            f"range [$100K, $10T] — likely a scale-parsing error"
+        )
+
+    # 3. Net income magnitude sanity: |Net income| should not exceed
+    #    ~2× Revenue. Catches swapped Revenue/Net income or one-off
+    #    extraction noise. (Some loss-heavy companies have NI < 0 with
+    #    large magnitude, hence the 2× headroom rather than 1×.)
+    if revenue is not None and net_income is not None and revenue > 0:
+        if abs(net_income) > 2 * revenue:
+            warnings.append(
+                f"Magnitude sanity check: |Net income| {net_income:,.0f} > 2× "
+                f"Revenue {revenue:,.0f} — values may be swapped or mis-scaled"
+            )
+
+    for w in warnings:
+        logger.error("Identity check (blocking): %s", w)
+
+    return {k: v for k, v in result.items() if v is not None}, warnings
+
 
 
 def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
@@ -653,7 +855,15 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
             "error": f"All {total} chunk(s) failed to extract metrics for {ticker} (pass {attempt_num})",
         }
 
-    metrics = _merge_metrics(chunk_results)
-    metrics = _validate_metrics(metrics)
+    metrics = _merge_metrics(chunk_results, source_text=raw_text)
+    metrics, identity_warnings = _validate_metrics(metrics)
     logger.info("Merged %d metric(s) for %s: %s", len(metrics), ticker, list(metrics.keys()))
-    return {**state, "metrics": metrics, "extraction_attempts": attempt_num, "status": "extracted"}
+    new_state: EarningsAgentState = {
+        **state,
+        "metrics": metrics,
+        "extraction_attempts": attempt_num,
+        "status": "extracted",
+    }
+    if identity_warnings:
+        new_state["identity_warnings"] = identity_warnings
+    return new_state

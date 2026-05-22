@@ -19,3 +19,12 @@ class EarningsAgentState(TypedDict):
     # Agentic loop fields
     extraction_attempts: int          # incremented before each extraction pass; caps retries
     extraction_notes: Optional[str]   # reflection output: hints for the next extraction pass
+    # Populated by _validate_metrics when accounting identities don't reconcile.
+    # The save node refuses to upsert when this is non-empty and STRICT_ACCURACY is on.
+    identity_warnings: Optional[list]
+    # Keys dropped by the LLM cleanup pass (cleanup_metrics_node). Informational.
+    cleanup_removed: Optional[list]
+    # Structured Finding.to_dict() entries produced by analyze_metrics_node.
+    # Drives the re-extract loop and is consumed by cleanup_metrics for
+    # deterministic case-duplicate removal.
+    findings: Optional[list]

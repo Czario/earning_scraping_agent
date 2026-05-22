@@ -112,6 +112,8 @@ def test_merge_first_nonnull_wins():
         {"Revenue": 20000000000, "Net Income": None},
     ]
     merged = _merge_metrics(chunks)
+    # Keys are preserved exactly as the LLM extracted them; duplicate folding
+    # is delegated to the downstream cleanup_metrics_node.
     assert merged["Revenue"] == pytest.approx(20_000_000_000)
     assert merged["Net Income"] == pytest.approx(5_000_000_000)
 
@@ -122,8 +124,33 @@ def test_merge_discards_implausible_dollar_values():
         {"Total Revenue": 80000000000, "Net Income": 500},   # 500 = unscaled
     ]
     merged = _merge_metrics(chunks)
+    # Key preserved as-is; tiny Net Income discarded by plausibility check.
     assert merged.get("Net Income") is None
     assert merged["Total Revenue"] == pytest.approx(80_000_000_000)
+
+
+def test_merge_preserves_synonym_variants_for_llm_cleanup():
+    """Synonym/case duplicates are NOT folded by the merge step.
+
+    Duplicate folding now happens in cleanup_metrics_node (the constrained
+    LLM pass), which can apply context-aware judgement instead of relying
+    on a hard-coded synonym table.
+    """
+    chunks = [
+        {
+            "Revenue": 82_886_000_000,
+            "Total revenue": 82_886_000_000,
+            "Operating Income": 38_398_000_000,
+            "Operating income": 38_398_000_000,
+        },
+    ]
+    merged = _merge_metrics(chunks)
+    # All four keys survive the merge — cleanup_metrics_node will drop the
+    # duplicates afterwards.
+    assert merged["Revenue"] == pytest.approx(82_886_000_000)
+    assert merged["Total revenue"] == pytest.approx(82_886_000_000)
+    assert merged["Operating Income"] == pytest.approx(38_398_000_000)
+    assert merged["Operating income"] == pytest.approx(38_398_000_000)
 
 
 def test_scale_millions_applied_by_python():
@@ -257,3 +284,110 @@ def test_extraction_fails_when_no_raw_text():
 
     assert result["status"] == "failed"
     assert "No raw text" in result["error"]
+
+
+def test_validate_metrics_passes_consistent_income_statement():
+    """A self-consistent income statement produces no identity warnings."""
+    from earnings_agents.nodes.extract_financial_metrics import _validate_metrics
+
+    metrics = {
+        "Revenue": 82_886_000_000,
+        "Cost of revenue": 26_828_000_000,
+        "Gross margin": 56_058_000_000,
+        "Research and development": 8_915_000_000,
+        "Sales and marketing": 6_814_000_000,
+        "General and administrative": 1_931_000_000,
+        "Operating income": 38_398_000_000,
+        "Other income (expense), net": 942_000_000,
+        "Income before income taxes": 39_340_000_000,
+        "Provision for income taxes": 7_562_000_000,
+        "Net income": 31_778_000_000,
+        "Diluted Earnings per Share": 4.27,
+        "Weighted average shares outstanding: Diluted": 7_445_000_000,
+    }
+    cleaned, warnings = _validate_metrics(metrics)
+    assert warnings == []
+    assert cleaned["Net income"] == 31_778_000_000
+
+
+def test_validate_metrics_flags_broken_identity():
+    """A bad Net income that breaks the EPS × shares sanity check is blocking."""
+    from earnings_agents.nodes.extract_financial_metrics import _validate_metrics
+
+    # EPS 4.27 × Diluted shares 7.445B ≈ $31.8B Net income.
+    # Asserting a Net income of $12.3B trips the universal EPS sanity check.
+    metrics = {
+        "Net income": 12_345_000_000,
+        "Diluted Earnings per Share": 4.27,
+        "Weighted average shares outstanding: Diluted": 7_445_000_000,
+    }
+    _, warnings = _validate_metrics(metrics)
+    assert warnings, "expected EPS sanity warning for broken Net income"
+    assert any("EPS" in w for w in warnings)
+
+
+def test_validate_metrics_advisory_only_for_structural_drift():
+    """Structural decomposition drift (e.g. Net income = Pre-tax − Tax) is advisory only."""
+    from earnings_agents.nodes.extract_financial_metrics import _validate_metrics
+
+    # Pre-tax 39.34B − Tax 7.56B = 31.78B, but reported Net income is 12.3B.
+    # Without EPS / shares to cross-check, this is logged as advisory only.
+    metrics = {
+        "Income before income taxes": 39_340_000_000,
+        "Provision for income taxes": 7_562_000_000,
+        "Net income": 12_345_000_000,
+    }
+    _, warnings = _validate_metrics(metrics)
+    assert warnings == [], "structural decomposition mismatches must not block"
+
+
+def test_save_gate_blocks_when_identity_warnings_and_strict():
+    """mongodb_save_node refuses to upsert when identity warnings exist and STRICT is on."""
+    import earnings_agents.workflow as wf
+
+    state = {
+        "ticker": "TEST",
+        "company_name": "Test Co",
+        "discovered_file_url": "https://example.com",
+        "file_type": "html",
+        "metrics": {"Revenue": 1},
+        "identity_warnings": ["Net income drift 50.00%"],
+        "status": "extracted",
+    }
+    original = wf.STRICT_ACCURACY
+    wf.STRICT_ACCURACY = True
+    try:
+        result = wf.mongodb_save_node(state)
+    finally:
+        wf.STRICT_ACCURACY = original
+    assert result["status"] == "failed"
+    assert "identity" in result["error"].lower()
+
+
+def test_save_gate_saves_with_warnings_when_lenient(monkeypatch):
+    """When STRICT_ACCURACY is False the document is upserted with warnings attached."""
+    import earnings_agents.workflow as wf
+
+    captured: dict = {}
+
+    def _fake_upsert(doc):
+        captured["doc"] = doc
+
+    monkeypatch.setattr(wf, "upsert_earnings", _fake_upsert)
+    state = {
+        "ticker": "TEST",
+        "company_name": "Test Co",
+        "discovered_file_url": "https://example.com",
+        "file_type": "html",
+        "metrics": {"Revenue": 1},
+        "identity_warnings": ["Gross margin drift 5%"],
+        "status": "extracted",
+    }
+    original = wf.STRICT_ACCURACY
+    wf.STRICT_ACCURACY = False
+    try:
+        result = wf.mongodb_save_node(state)
+    finally:
+        wf.STRICT_ACCURACY = original
+    assert result["status"] == "saved"
+    assert captured["doc"]["identity_warnings"] == ["Gross margin drift 5%"]

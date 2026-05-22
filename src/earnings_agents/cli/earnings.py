@@ -472,10 +472,38 @@ def main() -> None:
         default=False,
         help="Show full DEBUG-level log output from every pipeline node.",
     )
+    parser.add_argument(
+        "--allow-inconsistent",
+        action="store_true",
+        default=False,
+        help=(
+            "Save the document to MongoDB even when accounting identity checks "
+            "fail (Gross margin = Revenue − COGS, Net income = Pre-tax − Tax, …). "
+            "Warnings are still recorded in the document's identity_warnings field."
+        ),
+    )
+    parser.add_argument(
+        "--no-llm-cleanup",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the LLM cleanup pass that removes duplicate/mis-scaled keys "
+            "from the extracted metrics before saving."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.cik and not args.ticker:
         parser.error("Provide at least one --cik or --ticker argument.")
+
+    if args.allow_inconsistent:
+        # Override the env-default save gate so this run accepts identity warnings.
+        import earnings_agents.workflow as _wf
+        _wf.STRICT_ACCURACY = False
+
+    if args.no_llm_cleanup:
+        import earnings_agents.nodes.cleanup_metrics as _cm
+        _cm.CLEANUP_METRICS = False
 
     if args.ir_url and args.source != "ir":
         parser.error("--ir-url is only meaningful with --source ir.")

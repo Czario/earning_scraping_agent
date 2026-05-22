@@ -33,6 +33,9 @@ uv run earnings --ticker MSFT -v
 # or
 uv run earnings --ticker MSFT --verbose
 
+uv run earnings --ticker MSFT          # strict — refuses to save bad data
+uv run earnings --ticker MSFT --allow-inconsistent   # save anyway, with audit
+
 --max-workers N (default 4): bounds the ThreadPoolExecutor
 Single-company runs skip the thread pool entirely (zero overhead)
 Each worker buffers its own output; output is printed in submission order after all workers finish — no interleaved lines
