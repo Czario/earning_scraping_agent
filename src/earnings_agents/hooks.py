@@ -90,7 +90,7 @@ def with_hooks(
             new_state = node_fn(state)
         except Exception as exc:  # noqa: BLE001
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            logger.error(
+            logger.exception(
                 '{"event":"node_error","node":"%s","ticker":"%s","error":"%s","duration_ms":%.1f}',
                 node_name,
                 ticker,

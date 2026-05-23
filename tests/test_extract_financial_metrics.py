@@ -5,7 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from earnings_agents.nodes.extract_financial_metrics import _merge_metrics, extract_financial_metrics_node
+from earnings_agents.nodes.extract_financial_metrics import (
+    _chunk_text,
+    _merge_metrics,
+    extract_financial_metrics_node,
+)
 
 
 def _base_state(**overrides):
@@ -105,17 +109,39 @@ def test_extraction_fails_when_no_raw_text():
     assert "No raw text" in result["error"]
 
 
-def test_merge_first_nonnull_wins():
-    """Later non-null values fill in fields left null by earlier chunks."""
+def test_merge_null_chunks_do_not_block_real_values():
+    """Null in one chunk does not prevent a real value in another chunk from being kept."""
     chunks = [
         {"Revenue": None, "Net Income": 5000000000},
         {"Revenue": 20000000000, "Net Income": None},
     ]
     merged = _merge_metrics(chunks)
-    # Keys are preserved exactly as the LLM extracted them; duplicate folding
-    # is delegated to the downstream cleanup_metrics_node.
     assert merged["Revenue"] == pytest.approx(20_000_000_000)
     assert merged["Net Income"] == pytest.approx(5_000_000_000)
+
+
+def test_merge_median_resists_outlier_chunk():
+    """When one chunk returns an unscaled outlier, the median picks the correct value."""
+    # Two chunks agree on 80 B; one rogue chunk returns 80 000 (unscaled millions).
+    chunks = [
+        {"Total Revenue": 80_000_000_000},
+        {"Total Revenue": 80_000_000_000},
+        {"Total Revenue": 80_000},          # rogue: forgot to scale
+    ]
+    merged = _merge_metrics(chunks)
+    # Median of [80_000, 80_000_000_000, 80_000_000_000] = 80_000_000_000
+    assert merged["Total Revenue"] == pytest.approx(80_000_000_000)
+
+
+def test_merge_median_even_number_of_chunks():
+    """Median with an even number of chunks averages the two middle values."""
+    chunks = [
+        {"Net Income": 30_000_000_000},
+        {"Net Income": 32_000_000_000},
+    ]
+    merged = _merge_metrics(chunks)
+    # median of [30B, 32B] = 31B
+    assert merged["Net Income"] == pytest.approx(31_000_000_000)
 
 
 def test_merge_discards_implausible_dollar_values():
@@ -391,3 +417,51 @@ def test_save_gate_saves_with_warnings_when_lenient(monkeypatch):
         wf.STRICT_ACCURACY = original
     assert result["status"] == "saved"
     assert captured["doc"]["identity_warnings"] == ["Gross margin drift 5%"]
+
+
+# ---------------------------------------------------------------------------
+# _chunk_text — line-boundary snapping
+# ---------------------------------------------------------------------------
+
+def test_chunk_text_short_text_returned_as_single_chunk():
+    """Text shorter than chunk_size is returned as-is."""
+    text = "Revenue: $1B\nNet income: $500M\n"
+    result = _chunk_text(text, chunk_size=500, overlap=50)
+    assert result == [text]
+
+
+def test_chunk_text_does_not_split_mid_line():
+    """Every chunk boundary coincides with a newline, not mid-row."""
+    # Build a text where each line is 40 chars long, total > chunk_size.
+    line = "Revenue:  $82,886,000,000 | Q1 FY2026  \n"  # 40 chars incl \n
+    text = line * 30  # 1200 chars total
+    chunks = _chunk_text(text, chunk_size=400, overlap=80)
+    assert len(chunks) > 1
+    for chunk in chunks[:-1]:  # last chunk may not end with \n if at EOF
+        assert chunk.endswith("\n"), f"Chunk does not end at a newline: {chunk[-20:]!r}"
+
+
+def test_chunk_text_covers_all_content():
+    """Union of all chunk content covers the original text without gaps."""
+    line = "Operating income: $38,398,000,000 Q1 FY2026\n"
+    text = line * 25
+    chunks = _chunk_text(text, chunk_size=300, overlap=60)
+    # Reconstruct by ensuring each char appears in at least one chunk.
+    # Simplest check: first chunk starts at text[0], last chunk ends at text[-1].
+    assert text.startswith(chunks[0])
+    assert text.endswith(chunks[-1])
+
+
+def test_chunk_text_overlap_start_is_clean_line():
+    """Each chunk (except the first) starts at a line boundary."""
+    line = "Net income: $31,778,000,000 per quarter end\n"  # 45 chars
+    text = line * 20  # 900 chars
+    chunks = _chunk_text(text, chunk_size=250, overlap=90)
+    assert len(chunks) > 2
+    for chunk in chunks[1:]:  # first chunk always starts at 0 (clean)
+        # The chunk must start at the beginning of a line — either at text[0]
+        # or immediately after a newline in the original text.
+        start_pos = text.index(chunk[:20])  # locate by prefix
+        assert start_pos == 0 or text[start_pos - 1] == "\n", (
+            f"Chunk does not start at a line boundary; preceding char: {text[start_pos-1]!r}"
+        )

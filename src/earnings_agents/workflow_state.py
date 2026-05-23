@@ -19,6 +19,14 @@ class EarningsAgentState(TypedDict):
     # Agentic loop fields
     extraction_attempts: int          # incremented before each extraction pass; caps retries
     extraction_notes: Optional[str]   # reflection output: hints for the next extraction pass
+    # Routing signal emitted by analyze_metrics_node. True = loop back to
+    # extract_financial_metrics. Using a dedicated field avoids overloading the
+    # status field as a routing signal.
+    needs_reextract: bool
+    # Snapshot of high-severity finding messages from the previous analysis pass.
+    # Used by analyze_metrics_node to detect no-progress loops (same findings
+    # across consecutive passes → break early rather than burn remaining attempts).
+    previous_high_finding_keys: Optional[list]
     # Populated by _validate_metrics when accounting identities don't reconcile.
     # The save node refuses to upsert when this is non-empty and STRICT_ACCURACY is on.
     identity_warnings: Optional[list]

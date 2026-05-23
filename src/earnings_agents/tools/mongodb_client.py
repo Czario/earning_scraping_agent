@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -35,19 +36,39 @@ def get_collection() -> Collection:
     return _client[MONGODB_DB][MONGODB_COLLECTION]
 
 
+_MONGO_MAX_RETRIES: int = 3
+_MONGO_RETRY_BASE_DELAY: float = 0.5  # seconds; doubles on each retry
+
+
 def upsert_earnings(doc: dict) -> None:
-    """Insert or update an earnings document identified by its ``_id`` field."""
+    """Insert or update an earnings document identified by its ``_id`` field.
+
+    Retries up to ``_MONGO_MAX_RETRIES`` times on transient errors (network
+    blip, primary step-down, etc.) with exponential back-off.
+    """
     if "_id" not in doc:
         raise ValueError("Earnings document must have an '_id' field")
 
     doc = {**doc, "scraped_at": datetime.now(timezone.utc)}
     collection = get_collection()
-    collection.update_one(
-        {"_id": doc["_id"]},
-        {"$set": doc},
-        upsert=True,
-    )
-    logger.info("Upserted earnings document: %s", doc["_id"])
+    for attempt in range(_MONGO_MAX_RETRIES + 1):
+        try:
+            collection.update_one(
+                {"_id": doc["_id"]},
+                {"$set": doc},
+                upsert=True,
+            )
+            logger.info("Upserted earnings document: %s", doc["_id"])
+            return
+        except Exception as exc:  # noqa: BLE001
+            if attempt == _MONGO_MAX_RETRIES:
+                raise
+            delay = _MONGO_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "MongoDB upsert failed for %s (attempt %d/%d): %s; retrying in %.1f s",
+                doc["_id"], attempt + 1, _MONGO_MAX_RETRIES + 1, exc, delay,
+            )
+            time.sleep(delay)
 
 
 def find_existing(ticker: str, fiscal_year: int, quarter: str) -> Optional[dict]:

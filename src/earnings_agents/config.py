@@ -65,3 +65,7 @@ STRICT_ACCURACY: bool = os.getenv("STRICT_ACCURACY", "1").strip().lower() not in
 CLEANUP_METRICS: bool = os.getenv("CLEANUP_METRICS", "1").strip().lower() not in {
     "0", "false", "no", "off", ""
 }
+
+# Maximum extraction passes in the agentic loop (initial pass + retries).
+# Override with the MAX_EXTRACTION_ATTEMPTS environment variable.
+MAX_EXTRACTION_ATTEMPTS: int = int(os.getenv("MAX_EXTRACTION_ATTEMPTS", "3"))

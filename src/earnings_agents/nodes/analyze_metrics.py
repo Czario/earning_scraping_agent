@@ -6,13 +6,12 @@ Runs pure-Python checkers from ``earnings_agents.analysis`` and produces:
                               and persistence.
   * ``state["extraction_notes"]`` — structured hint string consumed by
                               ``extract_financial_metrics`` on re-extract.
-  * ``state["status"]``    — flipped to ``"text_extracted"`` to trigger a
-                              re-extract loop ONLY when a ``high``-severity
-                              finding exists AND ``extraction_attempts``
-                              remain below ``MAX_EXTRACTION_ATTEMPTS``.
+  * ``state["needs_reextract"]`` — True when a high-severity finding exists
+                              AND ``extraction_attempts`` remain below
+                              ``MAX_EXTRACTION_ATTEMPTS`` AND new findings
+                              differ from the previous pass (progress detected).
 
-This node *replaces* ``reflect_metrics`` in the graph. The old node remains
-on disk for now (its ``MAX_EXTRACTION_ATTEMPTS`` constant is re-used).
+This node *replaces* ``reflect_metrics`` in the graph.
 """
 from __future__ import annotations
 
@@ -26,27 +25,45 @@ from earnings_agents.analysis.findings import (
     check_case_duplicates,
     check_composite_keys,
     check_gaap_nongaap_leakage,
+    check_opex_label_collision,
     check_presence,
     check_sign_anomalies,
     check_suspect_round,
+    derive_corrected_total_opex,
 )
-from earnings_agents.nodes.reflect_metrics import MAX_EXTRACTION_ATTEMPTS
+from earnings_agents.config import MAX_EXTRACTION_ATTEMPTS
 from earnings_agents.workflow_state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
 
 
-def _build_extraction_notes(findings: list[Finding]) -> str:
+def _build_extraction_notes(
+    findings: list[Finding],
+    attempt_num: int,
+    prev_notes: str,
+) -> str:
     """Build a focused hint block for the next extraction pass.
 
     Only ``high`` and ``medium`` findings are surfaced — ``low`` findings
     (e.g. case duplicates) are handled deterministically downstream.
+
+    The previous pass's notes are prepended so the model has cumulative
+    context on what has already been attempted and still failed.
     """
-    lines: list[str] = [
-        "Previous extraction was incomplete. On this pass, prioritise finding:",
-    ]
     high = [f for f in findings if f.severity == "high"]
     medium = [f for f in findings if f.severity == "medium"]
+
+    lines: list[str] = []
+    if prev_notes and attempt_num > 1:
+        lines.append(
+            f"[Attempt {attempt_num - 1} history] {prev_notes.strip()}"
+        )
+        lines.append("")
+
+    lines.append(
+        f"Attempt {attempt_num} still incomplete. Prioritise finding these metrics "
+        f"(search income statement, balance sheet, cash-flow, and supplementary tables):"
+    )
     for f in high:
         lines.append(f"  - [REQUIRED] {f.message}")
     if medium:
@@ -54,9 +71,7 @@ def _build_extraction_notes(findings: list[Finding]) -> str:
         for f in medium:
             lines.append(f"  - {f.message}")
     lines.append(
-        "Search the source text exhaustively (income statement, balance sheet, "
-        "cash-flow statement, and supplementary tables). Preserve the exact "
-        "wording each metric uses in the document."
+        "Preserve the exact wording each metric uses in the document."
     )
     return "\n".join(lines)
 
@@ -71,7 +86,7 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
     if not metrics:
         logger.warning("analyze_metrics: no metrics on state for %s", ticker)
-        return state
+        return {**state, "needs_reextract": False}
 
     presence = presence_summary(metrics.keys())
     findings: list[Finding] = []
@@ -82,6 +97,42 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     findings.extend(check_balance_sheet_identity(metrics))
     findings.extend(check_sign_anomalies(metrics))
     findings.extend(check_suspect_round(metrics))
+    findings.extend(check_opex_label_collision(metrics))
+
+    # Deterministic correction: when Total operating expenses collided with
+    # Operating income, derive the correct value from Cost of revenue +
+    # Operating expenses (the opex-line-items subtotal) if both are present.
+    opex_collision = any(
+        f.type == "suspect_value"
+        and any("total operating expenses" in k.lower() for k in (f.keys or ()))
+        for f in findings
+    )
+    if opex_collision:
+        corrected_key, corrected_value = derive_corrected_total_opex(metrics)
+        if corrected_key is not None and corrected_value is not None:
+            old_value = metrics[corrected_key]
+            metrics = {**metrics, corrected_key: corrected_value}
+            findings.append(
+                Finding(
+                    type="auto_corrected",
+                    severity="low",
+                    message=(
+                        f"Auto-corrected '{corrected_key}' from {old_value:,.0f} "
+                        f"to {corrected_value:,.0f} "
+                        f"(Cost of revenue + Operating expenses)."
+                    ),
+                    keys=(corrected_key,),
+                    evidence={
+                        "old_value": old_value,
+                        "corrected_value": corrected_value,
+                        "method": "Cost_of_revenue + Operating_expenses",
+                    },
+                )
+            )
+            logger.info(
+                "analyze_metrics %s: auto-corrected '%s' %s → %s",
+                ticker, corrected_key, old_value, corrected_value,
+            )
 
     # Log a compact summary.
     by_type: dict[str, int] = {}
@@ -98,24 +149,44 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
     out: dict[str, Any] = {
         **state,
+        "metrics": metrics,
         "findings": [f.to_dict() for f in findings],
+        "needs_reextract": False,
     }
 
     high = [f for f in findings if f.severity == "high"]
     attempts = state.get("extraction_attempts", 0)
-    if high and attempts < MAX_EXTRACTION_ATTEMPTS:
-        out["extraction_notes"] = _build_extraction_notes(findings)
-        out["status"] = "text_extracted"
-        logger.info(
-            "analyze_metrics %s: %d critical metric(s) missing — looping back "
-            "(attempt %d/%d)",
-            ticker, len(high), attempts + 1, MAX_EXTRACTION_ATTEMPTS,
-        )
-    elif high:
-        logger.warning(
-            "analyze_metrics %s: %d critical metric(s) still missing after "
-            "%d attempts — proceeding to cleanup/save",
-            ticker, len(high), attempts,
-        )
 
+    if not high or attempts >= MAX_EXTRACTION_ATTEMPTS:
+        if high:
+            logger.warning(
+                "analyze_metrics %s: %d critical metric(s) still missing after "
+                "%d attempt(s) — proceeding to cleanup/save",
+                ticker, len(high), attempts,
+            )
+        return out  # type: ignore[return-value]
+
+    # No-progress detection: if the set of high-severity messages is identical
+    # to the previous pass, the LLM gained nothing — break the loop early.
+    current_high_keys = sorted(f.message for f in high)
+    prev_high_keys: list[str] = state.get("previous_high_finding_keys") or []
+    if attempts > 0 and current_high_keys == prev_high_keys:
+        logger.warning(
+            "analyze_metrics %s: same %d high finding(s) as previous pass — "
+            "no progress detected, skipping re-extract",
+            ticker, len(high),
+        )
+        return out  # type: ignore[return-value]
+
+    # Loop back: build cumulative extraction notes.
+    prev_notes = state.get("extraction_notes") or ""
+    out["extraction_notes"] = _build_extraction_notes(findings, attempts + 1, prev_notes)
+    out["needs_reextract"] = True
+    out["previous_high_finding_keys"] = current_high_keys
+    logger.info(
+        "analyze_metrics %s: %d critical metric(s) missing — looping back "
+        "(attempt %d/%d)",
+        ticker, len(high), attempts + 1, MAX_EXTRACTION_ATTEMPTS,
+    )
     return out  # type: ignore[return-value]
+

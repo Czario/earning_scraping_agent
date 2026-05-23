@@ -138,8 +138,9 @@ def test_returns_none_on_submissions_api_error(mock_get):
 
 @patch("earnings_agents.tools.edgar_client.requests.get")
 def test_falls_back_to_primary_doc_when_index_fails(mock_get):
-    """When the HTML index fetch fails, uses primaryDocument from submissions."""
+    """When the HTML index fetch fails on every retry, uses primaryDocument from submissions."""
     import requests as req
+    from earnings_agents.tools.edgar_client import _EDGAR_MAX_RETRIES
 
     submissions_resp = MagicMock()
     submissions_resp.raise_for_status = MagicMock()
@@ -150,12 +151,79 @@ def test_falls_back_to_primary_doc_when_index_fails(mock_get):
         primary_docs=["aapl-20260430.htm"],
     )
 
-    mock_get.side_effect = [
-        submissions_resp,
-        req.RequestException("index not found"),
-    ]
+    # Provide enough RequestExceptions to exhaust all retry attempts, then the
+    # caller (_find_exhibit_99_in_index) catches the final raised exception and
+    # falls back to the primary document.
+    index_errors = [req.RequestException("index not found")] * (_EDGAR_MAX_RETRIES + 1)
 
-    url = get_latest_earnings_url("0000320193")
+    with patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None):
+        mock_get.side_effect = [submissions_resp, *index_errors]
+        url = get_latest_earnings_url("0000320193")
+
     assert url is not None
     assert "aapl-20260430.htm" in url
+
+
+# ---------------------------------------------------------------------------
+# _edgar_get — retry behaviour
+# ---------------------------------------------------------------------------
+# The rate-limiter token bucket uses _time.sleep and _time.monotonic internally.
+# Patching _EDGAR_RATE_LIMITER.acquire to a no-op keeps these tests fast and
+# deterministic — rate-limiting is already covered by the TokenBucket unit.
+
+@patch("earnings_agents.tools.edgar_client._EDGAR_RATE_LIMITER")
+@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None)
+def test_edgar_get_retries_on_503(mock_sleep, mock_get, mock_limiter):
+    """_edgar_get retries on HTTP 503 and eventually returns the successful response."""
+    from earnings_agents.tools.edgar_client import _edgar_get
+
+    fail_resp = MagicMock()
+    fail_resp.status_code = 503
+
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+
+    mock_get.side_effect = [fail_resp, ok_resp]
+
+    resp = _edgar_get("https://data.sec.gov/submissions/CIK0000320193.json", timeout=10)
+
+    assert resp.status_code == 200
+    assert mock_get.call_count == 2
+    assert mock_sleep.call_count == 1   # one delay between attempts
+
+
+@patch("earnings_agents.tools.edgar_client._EDGAR_RATE_LIMITER")
+@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None)
+def test_edgar_get_exhausts_retries_and_returns_last_error_response(mock_sleep, mock_get, mock_limiter):
+    """After MAX_RETRIES all fail with 503, _edgar_get returns the final response."""
+    from earnings_agents.tools.edgar_client import _edgar_get, _EDGAR_MAX_RETRIES
+
+    fail_resp = MagicMock()
+    fail_resp.status_code = 503
+    mock_get.return_value = fail_resp
+
+    resp = _edgar_get("https://data.sec.gov/test", timeout=10)
+
+    assert resp.status_code == 503
+    assert mock_get.call_count == _EDGAR_MAX_RETRIES + 1
+
+
+@patch("earnings_agents.tools.edgar_client._EDGAR_RATE_LIMITER")
+@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None)
+def test_edgar_get_retries_on_connection_error_then_succeeds(mock_sleep, mock_get, mock_limiter):
+    """A transient RequestException is retried; success on the second attempt."""
+    import requests as req
+    from earnings_agents.tools.edgar_client import _edgar_get
+
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+    mock_get.side_effect = [req.RequestException("timeout"), ok_resp]
+
+    resp = _edgar_get("https://data.sec.gov/test", timeout=10)
+
+    assert resp.status_code == 200
+    assert mock_sleep.call_count == 1
 

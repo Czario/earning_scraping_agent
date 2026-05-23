@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re as _re
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -11,7 +12,6 @@ from earnings_agents.nodes.detect_document_type import detect_document_type_node
 from earnings_agents.nodes.extract_html_text import extract_html_text_node
 from earnings_agents.nodes.discover_earnings_release import discover_earnings_release_node
 from earnings_agents.nodes.extract_pdf_text import extract_pdf_text_node
-from earnings_agents.nodes.reflect_metrics import MAX_EXTRACTION_ATTEMPTS
 from earnings_agents.nodes.analyze_metrics import analyze_metrics_node
 from earnings_agents.nodes.cleanup_metrics import cleanup_metrics_node
 from earnings_agents.workflow_state import EarningsAgentState
@@ -46,14 +46,29 @@ def _route_after_extraction(
 
 def _route_after_analysis(
     state: EarningsAgentState,
-) -> Literal["extract_financial_metrics", "cleanup_metrics"]:
-    """Loop back to re-extract when analyze_metrics flagged a critical gap."""
-    if (
-        state.get("status") == "text_extracted"
-        and state.get("extraction_attempts", 0) < MAX_EXTRACTION_ATTEMPTS
-    ):
+) -> Literal["extract_financial_metrics", "cleanup_metrics", "__end__"]:
+    """Route after analyze_metrics: loop back, proceed, or abort on failure."""
+    if state.get("status") == "failed":
+        return "__end__"
+    if state.get("needs_reextract"):
         return "extract_financial_metrics"
     return "cleanup_metrics"
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _fiscal_year_from_period(metrics: dict, fallback_year: int) -> int:
+    """Extract the 4-digit fiscal year from the ``__period__`` metric key.
+
+    Falls back to *fallback_year* (UTC current year) when the period label
+    is absent or contains no parseable year.
+    """
+    period = (metrics or {}).get("__period__")
+    if period:
+        m = _re.search(r"\b(20\d{2}|19\d{2})\b", str(period))
+        if m:
+            return int(m.group(1))
+    return fallback_year
 
 
 # ── MongoDB save node ────────────────────────────────────────────────────────
@@ -79,8 +94,27 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
         logger.error(msg)
         return {**state, "status": "failed", "error": msg}
 
-    # Use a stable _id so re-runs upsert rather than duplicate
-    doc_id = f"{ticker}_{now.year}_latest"
+    # Use a stable _id so re-runs upsert rather than duplicate.
+    # Year is taken from the __period__ label in the extracted metrics (fiscal
+    # year from the source document), falling back to UTC current year.
+    metrics = state.get("metrics") or {}
+    fiscal_year = _fiscal_year_from_period(metrics, now.year)
+    doc_id = f"{ticker}_{fiscal_year}_latest"
+
+    # Mark as degraded when high-severity findings remain after all loop passes.
+    findings = state.get("findings") or []
+    high_unresolved = [
+        f for f in findings
+        if isinstance(f, dict) and f.get("severity") == "high"
+    ]
+    doc_status = "degraded" if high_unresolved else "success"
+    if high_unresolved:
+        logger.warning(
+            "Saving %s as 'degraded' — %d unresolved critical finding(s): %s",
+            ticker,
+            len(high_unresolved),
+            [f.get("message") for f in high_unresolved],
+        )
 
     doc = {
         "_id": doc_id,
@@ -88,12 +122,16 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
         "company_name": state["company_name"],
         "source_url": state.get("discovered_file_url"),
         "file_type": state.get("file_type"),
-        "metrics": state.get("metrics"),
+        "metrics": metrics,
         "scraped_at": now,
-        "status": "success",
+        "status": doc_status,
     }
+    if findings:
+        doc["findings"] = findings
     if identity_warnings:
         doc["identity_warnings"] = identity_warnings
+    if high_unresolved:
+        doc["unresolved_findings"] = high_unresolved
 
     try:
         upsert_earnings(doc)
@@ -147,6 +185,7 @@ def build_graph():
         {
             "extract_financial_metrics": "extract_financial_metrics",
             "cleanup_metrics": "cleanup_metrics",
+            "__end__": END,
         },
     )
     graph.add_edge("cleanup_metrics", "mongodb_save")

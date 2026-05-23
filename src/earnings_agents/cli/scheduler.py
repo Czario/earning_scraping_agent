@@ -32,6 +32,8 @@ def _run_ticker(ticker: str, cfg: dict, graph) -> None:
         "status": "pending",
         "extraction_attempts": 0,
         "extraction_notes": None,
+        "needs_reextract": False,
+        "previous_high_finding_keys": None,
     }
     final_state = graph.invoke(initial_state)
     logger.info(

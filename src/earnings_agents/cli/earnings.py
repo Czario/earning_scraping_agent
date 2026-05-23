@@ -77,7 +77,8 @@ _NODE_LABELS: dict[str, str] = {
     "extract_html_text_node": "fetch text",
     "extract_pdf_text_node": "fetch pdf",
     "extract_financial_metrics_node": "extract metrics",
-    "reflect_metrics_node": "reflect",
+    "analyze_metrics_node": "analyse",
+    "cleanup_metrics_node": "cleanup",
     "mongodb_save_node": "save",
 }
 
@@ -165,6 +166,8 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
         "error": None,
         "extraction_attempts": 0,
         "extraction_notes": None,
+        "needs_reextract": False,
+        "previous_high_finding_keys": None,
     }
 
     if source == "ir":

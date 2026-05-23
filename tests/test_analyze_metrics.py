@@ -1,6 +1,8 @@
 """Tests for the analyze_metrics node and its underlying checkers."""
 from __future__ import annotations
 
+import pytest
+
 from earnings_agents.analysis.critical_metrics import check_presence as presence_summary
 from earnings_agents.analysis.findings import (
     check_balance_sheet_identity,
@@ -10,9 +12,10 @@ from earnings_agents.analysis.findings import (
     check_presence,
     check_sign_anomalies,
     check_suspect_round,
+    derive_corrected_total_opex,
 )
 from earnings_agents.nodes.analyze_metrics import analyze_metrics_node
-from earnings_agents.nodes.reflect_metrics import MAX_EXTRACTION_ATTEMPTS
+from earnings_agents.config import MAX_EXTRACTION_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +115,7 @@ def test_analyze_missing_tier1_triggers_reextract():
     del m["Total revenue"]
     del m["Net income"]
     out = analyze_metrics_node(_state(m, attempts=1))
-    assert out["status"] == "text_extracted"      # loop-back signalled
+    assert out["needs_reextract"] is True         # loop-back signalled
     assert out["extraction_notes"] is not None
     assert "Total Revenue" in out["extraction_notes"]
     assert any(f["type"] == "missing_critical" for f in out["findings"])
@@ -253,7 +256,7 @@ def test_analyze_balance_sheet_violation_triggers_reextract():
     m["Total liabilities"] = 200_000_000_000
     m["Total stockholders' equity"] = 10_000_000_000   # 200 + 10 ≠ 500
     out = analyze_metrics_node(_state(m, attempts=1))
-    assert out["status"] == "text_extracted"
+    assert out["needs_reextract"] is True
     assert any(f["type"] == "identity_violation" for f in out["findings"])
 
 
@@ -352,4 +355,150 @@ def test_composite_key_recorded_by_analyze_node_no_reextract():
     out = analyze_metrics_node(_state(m))
     assert any(f["type"] == "composite_key" for f in out["findings"])
     assert out["status"] == "extracted"   # low severity — no re-extract
+
+
+# ---------------------------------------------------------------------------
+# Opex-label collision checker
+# ---------------------------------------------------------------------------
+
+from earnings_agents.analysis.findings import check_opex_label_collision
+
+
+def test_opex_collision_flags_when_opex_equals_operating_income():
+    """Mirrors the real MSFT Q3 FY2026 defect: Total operating expenses = 38,398M = Operating income."""
+    metrics = {
+        "Revenue": 82_886_000_000.0,
+        "Operating income": 38_398_000_000.0,
+        "Total operating expenses": 38_398_000_000.0,   # wrong — should be ~17,660M or 44,488M
+    }
+    findings = check_opex_label_collision(metrics)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.type == "suspect_value"
+    assert f.severity == "medium"
+    assert "Total operating expenses" in f.keys
+    assert "Operating income" in f.keys
+
+
+def test_opex_collision_flags_when_opex_equals_revenue():
+    metrics = {
+        "Revenue": 50_000_000_000.0,
+        "Total operating expenses": 50_000_000_000.0,
+    }
+    findings = check_opex_label_collision(metrics)
+    assert len(findings) == 1
+    assert findings[0].type == "suspect_value"
+
+
+def test_opex_collision_clean_when_opex_differs():
+    """Opex = COGS + opex lines ≠ operating income → no finding."""
+    metrics = {
+        "Revenue": 82_886_000_000.0,
+        "Operating income": 38_398_000_000.0,
+        "Total operating expenses": 44_488_000_000.0,   # 26,828 + 17,660
+    }
+    assert check_opex_label_collision(metrics) == []
+
+
+def test_opex_collision_no_opex_key_returns_empty():
+    """If the document doesn't have 'Total operating expenses', no finding is emitted."""
+    metrics = {
+        "Revenue": 82_886_000_000.0,
+        "Operating income": 38_398_000_000.0,
+        "Operating expenses": 17_660_000_000.0,
+    }
+    assert check_opex_label_collision(metrics) == []
+
+
+def test_opex_collision_recorded_by_analyze_node_no_reextract():
+    """medium severity — appended to notes but does NOT trigger re-extract on its own."""
+    m = _full_metrics()
+    m["Total operating expenses"] = m.get("Operating income", 38_398_000_000.0)
+    m["Operating income"] = m.get("Operating income", 38_398_000_000.0)
+    out = analyze_metrics_node(_state(m, attempts=1))
+    assert any(f["type"] == "suspect_value" for f in out["findings"])
+    # No high-severity findings expected → no re-extract
+    assert out["needs_reextract"] is False
+
+
+# ---------------------------------------------------------------------------
+# Auto-correction: derive Total operating expenses from components
+# ---------------------------------------------------------------------------
+
+_COGS = 26_828_000_000.0
+_OPEX_SUB = 17_660_000_000.0   # R&D + S&M + G&A
+_OPINC = 38_398_000_000.0       # wrong value LLM assigned to Total opex
+_CORRECTED = _COGS + _OPEX_SUB  # 44_488_000_000.0
+
+
+def _collision_metrics_with_components() -> dict:
+    """Metrics where Total operating expenses collides with Operating income
+    AND the correct components (Cost of revenue, Operating expenses) are present."""
+    return {
+        "Total revenue": 82_886_000_000.0,
+        "Revenue": 82_886_000_000.0,
+        "Cost of revenue": _COGS,
+        "Gross profit": 56_058_000_000.0,
+        "Operating expenses": _OPEX_SUB,
+        "Operating income": _OPINC,
+        "Total operating expenses": _OPINC,   # ← wrong (collision)
+        "Net income": 31_778_000_000.0,
+        "Diluted earnings per share": 4.27,
+    }
+
+
+def test_derive_corrected_total_opex_returns_sum():
+    m = _collision_metrics_with_components()
+    key, value = derive_corrected_total_opex(m)
+    assert key == "Total operating expenses"
+    assert value == pytest.approx(_CORRECTED)
+
+
+def test_derive_corrected_total_opex_returns_none_when_cogs_missing():
+    m = _collision_metrics_with_components()
+    del m["Cost of revenue"]
+    key, value = derive_corrected_total_opex(m)
+    assert key is None
+    assert value is None
+
+
+def test_derive_corrected_total_opex_returns_none_when_opex_sub_missing():
+    m = _collision_metrics_with_components()
+    del m["Operating expenses"]
+    key, value = derive_corrected_total_opex(m)
+    assert key is None
+    assert value is None
+
+
+def test_opex_auto_correction_applied_when_components_present():
+    """analyze_metrics_node should correct Total operating expenses in metrics."""
+    m = _collision_metrics_with_components()
+    out = analyze_metrics_node(_state(m, attempts=1))
+
+    # Corrected value in out["metrics"]
+    assert out["metrics"]["Total operating expenses"] == pytest.approx(_CORRECTED)
+
+    # auto_corrected finding emitted
+    ac = [f for f in out["findings"] if f["type"] == "auto_corrected"]
+    assert len(ac) == 1
+    assert ac[0]["severity"] == "low"
+    assert ac[0]["evidence"]["corrected_value"] == pytest.approx(_CORRECTED)
+    assert ac[0]["evidence"]["old_value"] == pytest.approx(_OPINC)
+
+    # Still no re-extract (medium collision + low correction, no high)
+    assert out["needs_reextract"] is False
+
+
+def test_opex_no_correction_when_components_missing():
+    """When Cost of revenue is absent, no auto_corrected finding is emitted."""
+    m = _collision_metrics_with_components()
+    del m["Cost of revenue"]
+    out = analyze_metrics_node(_state(m, attempts=1))
+
+    # suspect_value finding still present (collision detected)
+    assert any(f["type"] == "suspect_value" for f in out["findings"])
+    # no auto_corrected finding
+    assert not any(f["type"] == "auto_corrected" for f in out["findings"])
+    # metrics value unchanged (still the colliding wrong value)
+    assert out["metrics"]["Total operating expenses"] == pytest.approx(_OPINC)
 

@@ -103,5 +103,4 @@ Documents are upserted with `_id = "{TICKER}_{YEAR}_latest"` (e.g. `GOOGL_2026_l
 
 ## Known Issues
 
-- `tools/edgar_client.py` contains duplicate definitions of `normalize_cik` and `get_latest_earnings_url`. The later definitions override the earlier ones at runtime; consolidate when editing that file.
-- `nodes/reflect_metrics.py` is still on disk but **no longer wired into the graph** — it was replaced by `analyze_metrics`. Its `MAX_EXTRACTION_ATTEMPTS` constant is imported by both `analyze_metrics.py` and `workflow.py`. Do not delete it without updating those imports.
+- No known structural issues. `tools/edgar_client.py` has a single canonical definition of `normalize_cik` and `get_latest_earnings_url`; `MAX_EXTRACTION_ATTEMPTS` lives in `config.py` (env-overridable); `nodes/reflect_metrics.py` has been deleted and all its consumers updated.

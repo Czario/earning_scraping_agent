@@ -246,7 +246,15 @@ _PRESCAN_PERIOD_RX = re.compile(
     # Q-style: Q1 2026, Q1-2026, Q1'26 (used by Netflix, Tesla, etc.)
     r"|Q[1-4][\s\-](?:20\d{2})"
     # Spelled-out quarter: "First Quarter 2026", "First Quarter Fiscal 2026"
-    r"|(?:First|Second|Third|Fourth)\s+Quarter\s+(?:Fiscal\s+)?20\d{2}",
+    r"|(?:First|Second|Third|Fourth)\s+Quarter\s+(?:Fiscal\s+)?20\d{2}"
+    # Annual periods: "Year Ended December 31, 2025",
+    # "Fiscal Year Ended March 31, 2026", "Full Year 2025"
+    r"|(?:Fiscal\s+)?Year\s+Ended\s+"
+    r"(?:March|June|September|December|Jan(?:uary)?|Feb(?:ruary)?"
+    r"|Apr(?:il)?|May|Jul(?:y)?|Aug(?:ust)?|Oct(?:ober)?|Nov(?:ember)?)\s+"
+    r"\d{1,2},\s*\d{4}"
+    r"|Full\s+Year\s+20\d{2}"
+    r"|(?:Fiscal\s+)?Year\s+20\d{2}",
     re.I,
 )
 
@@ -314,18 +322,45 @@ def _invoke_chunk_with_retry(
     return None
 
 
+# When a character boundary falls mid-line, snap at most this many chars
+# backward (for the chunk end) or forward (for the overlap start) to the
+# nearest newline, keeping financial table rows intact inside one chunk.
+_BOUNDARY_SNAP = 200
+
+
 def _chunk_text(text: str, chunk_size: int = _CHUNK_SIZE, overlap: int = _CHUNK_OVERLAP) -> list[str]:
-    """Split *text* into overlapping chunks of *chunk_size* chars."""
+    """Split *text* into overlapping chunks, snapping boundaries to newlines.
+
+    When a character-based boundary falls mid-line, the split point is moved
+    backward to the last newline within ``_BOUNDARY_SNAP`` chars, keeping
+    financial table rows intact inside a single chunk.  The overlap window is
+    similarly snapped forward to a newline so each chunk begins at a clean
+    line boundary.
+    """
     if len(text) <= chunk_size:
         return [text]
     chunks: list[str] = []
     start = 0
     while start < len(text):
         end = min(start + chunk_size, len(text))
+        if end < len(text):
+            # Snap end backward to the last newline within _BOUNDARY_SNAP chars.
+            # Guard: search from at least start+1 so end always advances.
+            snap_from = max(start + 1, end - _BOUNDARY_SNAP)
+            nl = text.rfind("\n", snap_from, end)
+            if nl != -1:
+                end = nl + 1  # include the trailing newline in this chunk
         chunks.append(text[start:end])
-        if end == len(text):
+        if end >= len(text):
             break
-        start = end - overlap
+        # Next chunk overlaps by _overlap_ chars; snap its start forward to the
+        # next newline so it begins at a clean line boundary.
+        # Search only up to end-1 to guarantee next_start < end (no infinite loop).
+        next_start = max(start + 1, end - overlap)
+        nl = text.find("\n", next_start, min(next_start + _BOUNDARY_SNAP, end - 1))
+        if nl != -1:
+            next_start = nl + 1
+        start = next_start
     return chunks
 
 
@@ -423,24 +458,55 @@ def _merge_metrics(results: list[dict[str, Any]], source_text: str = "") -> dict
     """Merge per-chunk extraction dicts into one dict of all discovered metrics.
 
     Strategy per key:
-    - First non-null value wins (null from an earlier chunk never blocks a later real value).
-    - For string values (guidance narrative etc.) the longest non-null wins.
+    - Numeric values: median of all non-null chunk values.  Chunks that return
+      an unscaled outlier or a prior-year figure are outvoted by the majority.
+      When values diverge by more than 10 %, a warning is logged.
+    - String values: longest non-null wins (most descriptive period label,
+      narrative text, etc.).
     - Dollar-amount fields that are implausibly small relative to the largest
-      revenue-like value are discarded (unscaled table cells).
+      revenue-like value are discarded (unscaled table cells) after merging.
     """
-    merged: dict[str, Any] = {}
+    # Pass 1: collect all non-null values per key across every chunk.
+    numeric_candidates: dict[str, list[float]] = {}
+    string_candidates: dict[str, list[str]] = {}
 
     for result in results:
         for key, value in result.items():
             if value is None:
-                merged.setdefault(key, None)
+                continue
+            if isinstance(value, (int, float)):
+                numeric_candidates.setdefault(key, []).append(float(value))
             elif isinstance(value, str):
-                existing = merged.get(key)
-                if existing is None or len(value) > len(str(existing)):
-                    merged[key] = value
-            else:
-                if merged.get(key) is None:
-                    merged[key] = value
+                string_candidates.setdefault(key, []).append(value)
+
+    merged: dict[str, Any] = {}
+
+    # Numeric: median of all non-null chunk values — resistant to outlier chunks.
+    for key, values in numeric_candidates.items():
+        n = len(values)
+        if n == 1:
+            merged[key] = values[0]
+        else:
+            sorted_vals = sorted(values)
+            median = (
+                sorted_vals[n // 2]
+                if n % 2
+                else (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
+            )
+            lo, hi = sorted_vals[0], sorted_vals[-1]
+            denom = max(abs(lo), abs(hi))
+            if denom > 0 and (hi - lo) / denom > 0.10:
+                logger.warning(
+                    "Metric %r: chunks reported diverging values %s; using median %.6g",
+                    key, sorted_vals, median,
+                )
+            merged[key] = median
+
+    # String: longest non-null wins (most descriptive wins, e.g. full period name).
+    # Never clobbers a numeric result for the same key.
+    for key, values in string_candidates.items():
+        if key not in merged:
+            merged[key] = max(values, key=len)
 
     # Sanity check: find the largest "revenue"-labelled value as reference.
     revenue_ref = max(
@@ -863,7 +929,10 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         "metrics": metrics,
         "extraction_attempts": attempt_num,
         "status": "extracted",
+        # Always overwrite identity_warnings so a successful re-extract clears
+        # warnings that were produced by a prior pass.  Only setting this when
+        # non-empty would leave stale warnings in state and could incorrectly
+        # block a save that should succeed.
+        "identity_warnings": identity_warnings,
     }
-    if identity_warnings:
-        new_state["identity_warnings"] = identity_warnings
     return new_state

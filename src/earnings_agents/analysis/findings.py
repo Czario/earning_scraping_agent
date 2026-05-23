@@ -24,8 +24,10 @@ FindingType = Literal[
     "identity_violation",     # accounting identity does not reconcile
     "sign_anomaly",           # value carries the wrong sign for its concept
     "suspect_round",          # implausibly round number (likely narrative prose)
+    "suspect_value",          # value matches a different metric — likely mis-assigned row
     "gaap_nongaap_leakage",   # key leaked from a GAAP/Non-GAAP reconciliation table
     "composite_key",          # key is a comma/slash list of synonyms, not a real label
+    "auto_corrected",         # value was provably wrong and deterministically fixed
     # Reserved for later steps (not emitted yet):
     "section_mismatch",
 ]
@@ -392,3 +394,84 @@ def check_composite_keys(metrics: dict[str, Any]) -> list[Finding]:
             evidence={"composite_keys": bad},
         )
     ]
+
+
+# -----------------------------------------------------------------------------
+# Opex-label collision: Total operating expenses ≡ Operating income / Revenue.
+# -----------------------------------------------------------------------------
+
+_OPEX_TOTAL_RE = re.compile(r"^\s*total\s+operating\s+expenses\b", re.IGNORECASE)
+_OPINC_RE = re.compile(r"^\s*operating\s+income\b", re.IGNORECASE)
+_REVENUE_RE = re.compile(r"^\s*revenue\b", re.IGNORECASE)
+_COGS_RE = re.compile(r"^\s*cost\s+of\s+revenue\b", re.IGNORECASE)
+_OPEX_SUBTOTAL_RE = re.compile(r"^\s*operating\s+expenses\b", re.IGNORECASE)
+
+
+def check_opex_label_collision(metrics: dict[str, Any]) -> list[Finding]:
+    """Flag when 'Total operating expenses' carries the same value as operating income or revenue.
+
+    Total operating expenses (COGS + opex line items) can never equal Operating
+    income (gross profit − opex) unless gross margin is zero. When they match,
+    the LLM almost certainly assigned the value of a neighbouring row to the
+    wrong label. Severity is ``"medium"`` — appended to extraction notes on the
+    next pass but does not trigger a re-extract on its own.
+    """
+    opex_key, opex = _find_metric(metrics, _OPEX_TOTAL_RE)
+    if opex is None:
+        return []
+
+    collisions: list[tuple[str, float]] = []
+    for pat in (_OPINC_RE, _REVENUE_RE):
+        other_key, other = _find_metric(metrics, pat)
+        if other is not None and other_key is not None and _values_close(opex, other):
+            collisions.append((other_key, other))
+
+    if not collisions:
+        return []
+
+    collision_desc = "; ".join(f"{k}={v:,.0f}" for k, v in collisions)
+    all_keys = tuple(k for k in (opex_key, *(k for k, _ in collisions)) if k is not None)
+    return [
+        Finding(
+            type="suspect_value",
+            severity="medium",
+            message=(
+                f"'Total operating expenses' ({opex:,.0f}) equals {collision_desc}. "
+                f"These metrics cannot be equal; the LLM likely assigned the wrong row value."
+            ),
+            keys=all_keys,
+            suggested_action=(
+                "Re-extract 'Total operating expenses' from the income statement. "
+                "It equals Cost of revenue + all operating expense line items "
+                "(R&D, S&M, G&A), NOT Operating income."
+            ),
+            evidence={
+                "total_operating_expenses": opex,
+                "colliding_metrics": {k: v for k, v in collisions},
+            },
+        )
+    ]
+
+
+# -----------------------------------------------------------------------------
+# Deterministic correction: derive Total operating expenses from components.
+# -----------------------------------------------------------------------------
+
+def derive_corrected_total_opex(
+    metrics: dict[str, Any],
+) -> tuple[str | None, float | None]:
+    """Return ``(opex_key, corrected_value)`` when *Total operating expenses*
+    can be derived deterministically as ``Cost of revenue + Operating expenses``.
+
+    Returns ``(None, None)`` when the opex key is absent or either component
+    is missing.  The caller is responsible for updating the metrics dict and
+    emitting an ``"auto_corrected"`` Finding.
+    """
+    opex_key, _ = _find_metric(metrics, _OPEX_TOTAL_RE)
+    if opex_key is None:
+        return None, None
+    _, cogs = _find_metric(metrics, _COGS_RE)
+    _, opex_sub = _find_metric(metrics, _OPEX_SUBTOTAL_RE)
+    if cogs is None or opex_sub is None:
+        return None, None
+    return opex_key, cogs + opex_sub

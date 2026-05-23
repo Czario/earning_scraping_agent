@@ -63,11 +63,43 @@ class _TokenBucket:
 # ≤ 8 req/s against sec.gov (SEC guideline: ≤ 10 req/s per user-agent)
 _EDGAR_RATE_LIMITER = _TokenBucket(rate=float(os.getenv("EDGAR_RATE_LIMIT", "8")))
 
+# HTTP status codes that warrant a retry (transient server-side errors).
+_EDGAR_RETRY_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+_EDGAR_MAX_RETRIES: int = 3
+_EDGAR_RETRY_BASE_DELAY: float = 1.0  # seconds; doubles on each retry
+
 
 def _edgar_get(url: str, **kwargs) -> requests.Response:
-    """Rate-limited GET wrapper for all sec.gov requests."""
-    _EDGAR_RATE_LIMITER.acquire()
-    return requests.get(url, headers=_HEADERS, **kwargs)
+    """Rate-limited GET with exponential-backoff retry for transient EDGAR errors.
+
+    Retries up to ``_EDGAR_MAX_RETRIES`` times on HTTP 429/5xx or connection
+    errors, re-acquiring the rate-limit token before each attempt.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_EDGAR_MAX_RETRIES + 1):
+        _EDGAR_RATE_LIMITER.acquire()
+        try:
+            resp = requests.get(url, headers=_HEADERS, **kwargs)
+            if resp.status_code not in _EDGAR_RETRY_STATUSES or attempt == _EDGAR_MAX_RETRIES:
+                return resp
+            delay = _EDGAR_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "EDGAR %s returned HTTP %d (attempt %d/%d); retrying in %.1f s",
+                url, resp.status_code, attempt + 1, _EDGAR_MAX_RETRIES + 1, delay,
+            )
+            _time.sleep(delay)
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == _EDGAR_MAX_RETRIES:
+                raise
+            delay = _EDGAR_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "EDGAR %s connection error (attempt %d/%d): %s; retrying in %.1f s",
+                url, attempt + 1, _EDGAR_MAX_RETRIES + 1, exc, delay,
+            )
+            _time.sleep(delay)
+    # Unreachable in normal operation; satisfies the type checker.
+    raise requests.RequestException(f"_edgar_get exhausted retries for {url}") from last_exc
 
 
 def _find_exhibit_99_in_index(cik_int: str, acc: str, acc_nodash: str) -> Optional[str]:
