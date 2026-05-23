@@ -64,18 +64,67 @@ def get_company_by_ticker(ticker: str) -> dict[str, Any] | None:
 
 # ── Concept lookup ───────────────────────────────────────────────────────────
 
+_CONCEPT_PREFIX_RX = re.compile(r"(?:us-gaap|system|ifrs-full|dei|srt):", re.IGNORECASE)
+_MEMBER_RX = re.compile(
+    r"(?:us-gaap|system|ifrs-full|dei|srt):([A-Za-z0-9_]+)", re.IGNORECASE
+)
+_CAMEL_SPLIT_RX = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def _clean_label(raw: str) -> tuple[str, str]:
+    """Split a raw concept label into ``(base_label, member_qualifier)``.
+
+    Some upstream rows store ``label`` as a multi-line string with an XBRL
+    axis member appended after blank lines, e.g.::
+
+        "Net sales\\n\\n\\n\\nus-gaap:ProductMember"
+
+    Splitting it lets us:
+      * use ``base_label`` (``"Net sales"``) so the LLM can match the document
+        text directly when the breakdown labels are already unique;
+      * fall back to ``"Net sales (Product)"`` only when another row in the
+        same statement collapses to the same ``base_label``.
+
+    Returns ``("", "")`` when the raw string is empty or contains nothing but
+    a concept reference.
+    """
+    if not raw:
+        return "", ""
+    parts = _CONCEPT_PREFIX_RX.split(raw, maxsplit=1)
+    head = re.sub(r"\s+", " ", parts[0]).strip()
+    if not head:
+        return "", ""
+    member = ""
+    m = _MEMBER_RX.search(raw)
+    if m:
+        token = re.sub(r"Member$", "", m.group(1))
+        member = _CAMEL_SPLIT_RX.sub(" ", token).strip()
+    return head, member
+
+
 def get_statement_concepts(
     cik: str,
     statement_types: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return sorted concept dicts for *cik* and *statement_types*.
 
-    Filters out abstract and dimension-only concepts.  Results are sorted by
-    ``path`` so the prompt lists concepts in the order they appear in the
-    financial statement.
+    Filters out abstract, hidden, and inactive rows.  Dimensional value rows
+    (``dimension: true``) and axis/dimension definition rows
+    (``dimension_concept: true``) are both **kept**, since earnings releases
+    routinely report breakdowns like "Net sales — Product" / "Membership fee
+    income — Membership" and the upstream pipeline expects both forms to
+    round-trip.  Results are sorted by ``path`` so the prompt lists concepts
+    in statement order.
 
     Each returned dict has keys: ``_id`` (str), ``concept`` (GAAP name),
-    ``label``, ``path``, ``statement_type``.
+    ``label`` (cleaned, disambiguated only when needed), ``path``,
+    ``statement_type``.
+
+    Rows whose ``label`` is empty after cleanup are dropped with a debug log.
+    When two rows in the same statement collapse to the same base label, the
+    axis member qualifier (e.g. ``"(Product)"``) is appended to keep keys
+    unique; otherwise the bare base label is used so it matches the
+    document text exactly.
     """
     if statement_types is None:
         statement_types = ["income_statement"]
@@ -84,8 +133,9 @@ def get_statement_concepts(
         {
             "company_cik": cik,
             "statement_type": {"$in": statement_types},
-            "dimension_concept": {"$ne": True},
             "abstract": {"$ne": True},
+            "hide": {"$ne": True},
+            "active": {"$ne": False},
         },
         {
             "_id": 1,
@@ -95,16 +145,52 @@ def get_statement_concepts(
             "statement_type": 1,
         },
     ).sort("path", 1)
-    return [
-        {
-            "_id": str(d["_id"]),
-            "concept": d.get("concept", ""),
-            "label": d.get("label", ""),
-            "path": d.get("path", ""),
-            "statement_type": d.get("statement_type", ""),
-        }
-        for d in cursor
-    ]
+
+    # First pass: collect rows with cleaned labels.
+    parsed: list[tuple[dict[str, Any], str, str]] = []
+    base_counts: dict[tuple[str, str], int] = {}
+    for d in cursor:
+        head, member = _clean_label(d.get("label", ""))
+        if not head:
+            logger.debug(
+                "get_statement_concepts: dropping concept with empty label "
+                "(cik=%s concept=%s raw_label=%r)",
+                cik, d.get("concept"), d.get("label"),
+            )
+            continue
+        parsed.append((d, head, member))
+        key = (d.get("statement_type", ""), head.lower())
+        base_counts[key] = base_counts.get(key, 0) + 1
+
+    # Second pass: disambiguate only when a base label collides with another
+    # row in the same statement; emit dedup_key to drop exact duplicates.
+    out: list[dict[str, Any]] = []
+    seen_final: set[tuple[str, str]] = set()
+    for d, head, member in parsed:
+        base_key = (d.get("statement_type", ""), head.lower())
+        if base_counts[base_key] > 1 and member:
+            final_label = f"{head} ({member})"
+        else:
+            final_label = head
+        final_key = (d.get("statement_type", ""), final_label.lower())
+        if final_key in seen_final:
+            logger.debug(
+                "get_statement_concepts: dropping duplicate label %r "
+                "(cik=%s concept=%s)",
+                final_label, cik, d.get("concept"),
+            )
+            continue
+        seen_final.add(final_key)
+        out.append(
+            {
+                "_id": str(d["_id"]),
+                "concept": d.get("concept", ""),
+                "label": final_label,
+                "path": d.get("path", ""),
+                "statement_type": d.get("statement_type", ""),
+            }
+        )
+    return out
 
 
 # ── Period helpers ───────────────────────────────────────────────────────────

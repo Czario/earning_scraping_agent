@@ -231,6 +231,11 @@ FIRST field must be "__scale__":
 
 SECOND field must be "__period__":
   The most recent period column label exactly as printed, or null.
+  MUST include the full duration phrase, not just the end date.
+  GOOD:  "Thirteen Weeks Ended May 2, 2026"
+         "Three Months Ended March 31, 2026"
+         "Six Months Ended June 30, 2026"
+  BAD :  "May 2, 2026"   (date alone — quarter cannot be inferred)
 
 ALL OTHER fields: use EXACTLY the label strings in quotes from the concept list above.
 
@@ -245,19 +250,31 @@ Text excerpt:
 """
 
 
+_TAXONOMY_PREFIXES = ("us-gaap:", "ifrs-full:", "dei:", "srt:")
+
+
 def _build_concept_prompt_list(target_concepts: list[dict]) -> str:
     """Format concept list for the targeted prompt.
 
-    Each line: "Label" (GAAP: LocalName)
+    Each line: ``  • "Label"  (GAAP: LocalName)``
     Listed in path order (income statement order).
+
+    The taxonomy hint is appended only when the underlying ``concept`` carries
+    a real XBRL prefix (us-gaap / ifrs-full / dei / srt) — synthetic prefixes
+    like ``system:`` are unknown to the LLM and would add noise.  The label
+    remains the contract: the prompt explicitly tells the model to use the
+    quoted label string as the JSON key.
     """
     lines: list[str] = []
     for c in target_concepts:
         label = c.get("label", "")
-        concept = c.get("concept", "")
-        local = concept.split(":")[-1] if ":" in concept else concept
-        if local:
-            lines.append(f'  • "{label}"  (GAAP concept: {local})')
+        if not label:
+            continue
+        concept = c.get("concept", "") or ""
+        concept_lc = concept.lower()
+        if any(concept_lc.startswith(p) for p in _TAXONOMY_PREFIXES):
+            local = concept.split(":", 1)[1]
+            lines.append(f'  • "{label}"  (GAAP: {local})')
         else:
             lines.append(f'  • "{label}"')
     return "\n".join(lines)
@@ -445,7 +462,10 @@ _SECTION_CHUNK_LABELS: list[tuple[str, str]] = [
 ]
 
 
-def _build_section_chunks(raw_sections: dict | None) -> list[str] | None:
+def _build_section_chunks(
+    raw_sections: dict | None,
+    target_concepts: list[dict] | None = None,
+) -> list[str] | None:
     """Return one chunk per classified GAAP table, or None if unavailable.
 
     When the HTML extractor has classified tables (``raw_sections`` present),
@@ -455,13 +475,34 @@ def _build_section_chunks(raw_sections: dict | None) -> list[str] | None:
     none of their values map to the GAAP income-statement / balance-sheet /
     cash-flow registries.
 
+    When ``target_concepts`` is non-empty (normalize_data mode), only sections
+    whose ``statement_type`` matches at least one targeted concept are
+    emitted.  Sending the balance-sheet table through an income-statement-only
+    targeted prompt produces all-null responses, wasting ~30-60 s per chunk
+    per pass.  The ``other`` bucket (unclassified supplementary tables) is
+    always included when any target is present.
+
     Returns ``None`` for PDF documents or the HTML fallback path (no GAAP
     tables classified) so the caller can fall back to ``_chunk_text``.
     """
     if not raw_sections:
         return None
+
+    allowed_keys: set[str] | None = None
+    if target_concepts:
+        allowed_keys = {
+            (c.get("statement_type") or "").strip().lower()
+            for c in target_concepts
+            if c.get("statement_type")
+        }
+        allowed_keys.discard("")
+        if allowed_keys:
+            allowed_keys.add("other")
+
     chunks: list[str] = []
     for key, label in _SECTION_CHUNK_LABELS:
+        if allowed_keys is not None and key not in allowed_keys:
+            continue
         for entry in raw_sections.get(key) or []:
             chunks.append(f"=== {label} ===\n{entry}")
     return chunks or None
@@ -931,7 +972,10 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         else ""
     )
 
-    chunks = _build_section_chunks(state.get("raw_sections"))
+    chunks = _build_section_chunks(
+        state.get("raw_sections"),
+        state.get("target_concepts"),
+    )
     chunk_source = "section"
     if chunks is None:
         chunks = _chunk_text(raw_text)

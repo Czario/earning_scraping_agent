@@ -154,6 +154,23 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
         "needs_reextract": False,
     }
 
+    # In targeted mode (normalize_data) the truth set is ``target_concepts``,
+    # not the hardcoded TIER1 registry.  Looping based on TIER1 misses is
+    # futile when the company simply doesn't report that metric (e.g. BJ
+    # Wholesale Club never reports a standalone Gross Profit line) AND when
+    # the targeted prompt was only asked about a subset of statements.
+    # Demote ``missing_critical`` findings to medium severity so they no
+    # longer trigger re-extract; keep them in ``findings`` for visibility.
+    if state.get("target_concepts"):
+        from dataclasses import replace as _dc_replace
+        findings = [
+            _dc_replace(f, severity="medium")
+            if f.severity == "high" and f.type == "missing_critical"
+            else f
+            for f in findings
+        ]
+        out["findings"] = [f.to_dict() for f in findings]
+
     high = [f for f in findings if f.severity == "high"]
     attempts = state.get("extraction_attempts", 0)
 
