@@ -14,10 +14,11 @@ from earnings_agents.nodes.discover_earnings_release import discover_earnings_re
 from earnings_agents.nodes.extract_pdf_text import extract_pdf_text_node
 from earnings_agents.nodes.analyze_metrics import analyze_metrics_node
 from earnings_agents.nodes.cleanup_metrics import cleanup_metrics_node
+from earnings_agents.nodes.load_company_concepts_node import load_company_concepts_node
 from earnings_agents.workflow_state import EarningsAgentState
 from earnings_agents.tools.mongodb_client import upsert_earnings
 from earnings_agents.hooks import with_hooks
-from earnings_agents.config import STRICT_ACCURACY
+from earnings_agents.config import EARNINGS_SAVE_TARGET, STRICT_ACCURACY
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 def _route_after_discovery(
     state: EarningsAgentState,
-) -> Literal["detect_document_type", "__end__"]:
-    return "__end__" if state.get("status") == "failed" else "detect_document_type"
+) -> Literal["load_company_concepts", "__end__"]:
+    return "__end__" if state.get("status") == "failed" else "load_company_concepts"
 
 
 def _route_by_file_type(
@@ -136,9 +137,47 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
     try:
         upsert_earnings(doc)
         logger.info("Saved earnings for %s as %s", ticker, doc_id)
-        return {**state, "status": "saved"}
     except Exception as exc:  # noqa: BLE001
         return {**state, "status": "failed", "error": f"MongoDB save failed: {exc}"}
+
+    # When EARNINGS_SAVE_TARGET=normalize_data, also upsert into the
+    # normalize_data DB using the concept_id-keyed metrics.
+    if EARNINGS_SAVE_TARGET == "normalize_data":
+        concept_metrics: dict = state.get("concept_metrics") or {}
+        cik: str | None = state.get("company_cik")  # type: ignore[assignment]
+        fy_end_month: int | None = state.get("fiscal_year_end_month")  # type: ignore[assignment]
+        fy_end_code: str = str(state.get("fiscal_year_end_code") or "1231")
+        period_str: str = str(metrics.get("__period__") or "")
+        if concept_metrics and cik and fy_end_month and period_str:
+            from earnings_agents.tools.normalize_data_client import upsert_concept_values
+            try:
+                n = upsert_concept_values(
+                    cik=cik,
+                    company_name=state["company_name"],
+                    concept_metrics=concept_metrics,
+                    period_str=period_str,
+                    fiscal_year_end_month=fy_end_month,
+                    fiscal_year_end_code=fy_end_code,
+                )
+                logger.info(
+                    "normalize_data: upserted %d concept value(s) for %s", n, ticker
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "normalize_data upsert failed for %s: %s", ticker, exc
+                )
+        else:
+            logger.warning(
+                "normalize_data mode: skipping concept upsert for %s — "
+                "missing concept_metrics=%s cik=%s fy_end_month=%s period=%r",
+                ticker,
+                bool(concept_metrics),
+                cik,
+                fy_end_month,
+                period_str,
+            )
+
+    return {**state, "status": "saved"}
 
 
 # ── Graph builder ────────────────────────────────────────────────────────────
@@ -148,6 +187,7 @@ def build_graph():
     graph = StateGraph(EarningsAgentState)
 
     graph.add_node("discover_earnings_release", with_hooks(discover_earnings_release_node))
+    graph.add_node("load_company_concepts", with_hooks(load_company_concepts_node))
     graph.add_node("detect_document_type", with_hooks(detect_document_type_node))
     graph.add_node("extract_pdf_text", with_hooks(extract_pdf_text_node))
     graph.add_node("extract_html_text", with_hooks(extract_html_text_node))
@@ -161,8 +201,9 @@ def build_graph():
     graph.add_conditional_edges(
         "discover_earnings_release",
         _route_after_discovery,
-        {"detect_document_type": "detect_document_type", "__end__": END},
+        {"load_company_concepts": "load_company_concepts", "__end__": END},
     )
+    graph.add_edge("load_company_concepts", "detect_document_type")
     graph.add_conditional_edges(
         "detect_document_type",
         _route_by_file_type,

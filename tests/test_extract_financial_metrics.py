@@ -8,6 +8,7 @@ import pytest
 from earnings_agents.nodes.extract_financial_metrics import (
     _chunk_text,
     _merge_metrics,
+    _prescan_document,
     extract_financial_metrics_node,
 )
 
@@ -465,3 +466,47 @@ def test_chunk_text_overlap_start_is_clean_line():
         assert start_pos == 0 or text[start_pos - 1] == "\n", (
             f"Chunk does not start at a line boundary; preceding char: {text[start_pos-1]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# _prescan_document — scale detection
+# ---------------------------------------------------------------------------
+
+class TestPrescanDocument:
+    """_prescan_document detects the document scale from table headers."""
+
+    def test_classic_in_thousands(self):
+        """Standard '(In thousands)' header is detected."""
+        text = "Condensed Consolidated Statements of Operations\n(In thousands, except per share data)\nRevenue 5661524\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "thousands"
+
+    def test_amounts_in_thousands(self):
+        """BJ Wholesale-style '(Amounts in thousands, except per share amounts)' is detected."""
+        text = "CONDENSED CONSOLIDATED STATEMENTS OF INCOME\n(Amounts in thousands, except per share amounts)\nNet revenues 5661524\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "thousands"
+
+    def test_in_millions(self):
+        """Standard '(In millions)' header is detected."""
+        text = "Condensed Statements of Operations\n(In millions, except per share data)\nRevenue 124300\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "millions"
+
+    def test_amounts_in_millions(self):
+        """'(Amounts in millions, except per share data)' variant is detected."""
+        text = "Consolidated Statements of Operations\n(Amounts in millions, except per share data)\nRevenue 124300\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "millions"
+
+    def test_in_billions(self):
+        """Standard '(In billions)' header is detected."""
+        text = "Statements of Income\n(In billions, except EPS)\nRevenue 1.24\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "billions"
+
+    def test_no_scale_header_returns_none(self):
+        """Text with no scale header returns None."""
+        text = "Revenue was $132.4 million in the quarter. Gross profit of $1.03 billion.\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale is None

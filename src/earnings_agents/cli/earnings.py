@@ -73,13 +73,28 @@ SEP = "=" * 64
 # Human-readable stage names for the rich progress description
 _NODE_LABELS: dict[str, str] = {
     "discover_earnings_release_node": "discover",
-    "detect_document_type_node": "detect type",
-    "extract_html_text_node": "fetch text",
-    "extract_pdf_text_node": "fetch pdf",
+    "load_company_concepts_node":     "load concepts",
+    "detect_document_type_node":      "detect type",
+    "extract_html_text_node":         "fetch text",
+    "extract_pdf_text_node":          "fetch pdf",
     "extract_financial_metrics_node": "extract metrics",
-    "analyze_metrics_node": "analyse",
-    "cleanup_metrics_node": "cleanup",
-    "mongodb_save_node": "save",
+    "analyze_metrics_node":           "analyse",
+    "cleanup_metrics_node":           "cleanup",
+    "mongodb_save_node":              "save",
+}
+
+# Short abbreviations used when compacting the completed-stage breadcrumb
+# so it fits within the terminal width.
+_SHORT_STAGE: dict[str, str] = {
+    "discover":       "disc",
+    "load concepts":  "cncpt",
+    "detect type":    "type",
+    "fetch text":     "fetch",
+    "fetch pdf":      "fetch",
+    "extract metrics": "extr",
+    "analyse":        "anal",
+    "cleanup":        "clean",
+    "save":           "save",
 }
 
 
@@ -344,24 +359,72 @@ def _run_company_parallel(args: tuple) -> dict:
     _completed: list[str] = []
     _current_stage: list[str] = ["resolving\u2026"]
     _current_detail: list[str] = [""]
+    _extract_pass: list[int] = [0]  # counts how many extraction passes have started
 
     def _render() -> str:
-        parts = [f"[green]{s} \u2713[/]" for s in _completed]
-        active = f"[bold]{_current_stage[0]}[/]"
-        if _current_detail[0]:
-            active = f"{active} [dim]{_current_detail[0]}[/]"
-        parts.append(active)
-        return f"{label}  " + "  \u2192  ".join(parts)
+        """Build a terminal-width-aware progress description.
+
+        Completed stages are abbreviated (e.g. "\u2713disc \u2713type \u2713fetch"). When
+        the full string exceeds the available terminal width, the breadcrumb
+        is replaced with a compact count ("(3\u2713)") and, if still too long,
+        the active-stage detail is truncated to fit.
+        """
+        try:
+            term_w = progress.console.width
+        except Exception:  # noqa: BLE001
+            term_w = 80
+        # Overhead: spinner(2) + bar(36) + timer(10) + padding(6) \u2248 54 chars
+        max_chars = max(30, term_w - 54)
+
+        active_stage = _current_stage[0]
+        detail = _current_detail[0]
+        active_text = f"{active_stage}: {detail}" if detail else active_stage
+
+        done_parts = [f"\u2713{_SHORT_STAGE.get(s, s[:5])}" for s in _completed]
+        done_plain = " ".join(done_parts)
+
+        # Attempt 1: name + all abbreviated completed stages + active stage
+        sep = "  \u2192 "
+        full_plain = (
+            f"{name}  {done_plain}{sep}{active_text}"
+            if done_parts
+            else f"{name}  \u2192 {active_text}"
+        )
+        if len(full_plain) <= max_chars:
+            done_markup = f"[green]{done_plain}[/]" if done_parts else ""
+            return f"{label}  {done_markup}{sep}[bold]{active_text}[/]"
+
+        # Attempt 2: name + count of completed + active stage
+        n = len(_completed)
+        count_plain = f"{name}  ({n}\u2713){sep}{active_text}"
+        if len(count_plain) <= max_chars:
+            count_markup = f"[green]({n}\u2713)[/]" if n > 0 else ""
+            return f"{label}  {count_markup}{sep}[bold]{active_text}[/]"
+
+        # Attempt 3: name + count + active stage, truncating detail to fit
+        avail = max_chars - len(name) - len(active_stage) - 8
+        short_detail = detail[:max(0, avail)] if detail else ""
+        trunc_ellipsis = "\u2026" if detail and len(detail) > avail else ""
+        active_trunc = (
+            f"{active_stage}: {short_detail}{trunc_ellipsis}" if short_detail else active_stage
+        )
+        count_markup = f"[green]({n}\u2713)[/]  " if n > 0 else ""
+        return f"{label}  {count_markup}[bold]\u2192 {active_trunc}[/]"
 
     def _node_cb(node_name: str, event: str, _ticker: str) -> None:
         stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
         if event == "start":
+            if node_name == "extract_financial_metrics_node":
+                _extract_pass[0] += 1
+                if _extract_pass[0] > 1:
+                    stage = f"re-extract #{_extract_pass[0]}"
             _current_stage[0] = stage
             _current_detail[0] = ""
             progress.update(company_task, description=_render())
         elif event == "end":
-            if stage not in _completed:
-                _completed.append(stage)
+            finished = _current_stage[0]  # may be "re-extract #2" etc.
+            if finished not in _completed:
+                _completed.append(finished)
             progress.update(company_task, description=_render())
 
     def _detail_cb(detail: str) -> None:

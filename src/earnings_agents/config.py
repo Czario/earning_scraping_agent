@@ -27,6 +27,11 @@ MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")
 
+# Save target: "earnings_db" (default) saves to the earnings pipeline DB.
+# Set to "normalize_data" to also load company GAAP concepts before extraction
+# and upsert results into the normalize_data.concept_values_quarterly collection.
+EARNINGS_SAVE_TARGET: str = os.getenv("EARNINGS_SAVE_TARGET", "earnings_db").strip().lower()
+
 # Hard-coded IR URLs per company.
 # Only add a company here if you want to use its own IR website for discovery
 # instead of SEC EDGAR. Companies NOT listed here automatically fall back to

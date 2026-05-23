@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 
 class EarningsAgentState(TypedDict):
@@ -36,3 +36,20 @@ class EarningsAgentState(TypedDict):
     # Drives the re-extract loop and is consumed by cleanup_metrics for
     # deterministic case-duplicate removal.
     findings: Optional[list]
+    # ── normalize_data targeted extraction ──────────────────────────────────
+    # Populated by load_company_concepts_node when EARNINGS_SAVE_TARGET=normalize_data.
+    # Empty list (not None) means the node ran but the company was not found,
+    # triggering the generic extraction path.
+    company_cik: NotRequired[Optional[str]]
+    target_concepts: NotRequired[Optional[list]]    # concept dicts from normalized_concepts_quarterly
+    concept_metrics: NotRequired[Optional[dict]]    # concept_id → float for normalize_data upsert
+    fiscal_year_end_month: NotRequired[Optional[int]]
+    fiscal_year_end_code: NotRequired[Optional[str]]  # raw MMDD string, e.g. "0130" or "1231"
+    # ── Table-aware HTML extraction ─────────────────────────────────────────
+    # Populated by extract_html_text_node when GAAP tables are classified.
+    # Maps section type ('income_statement', 'balance_sheet', 'cash_flow',
+    # 'other', 'non_gaap') to a list of markdown-rendered table entries.
+    # When present, extract_financial_metrics_node feeds one LLM call per
+    # GAAP table instead of char-based chunking — eliminates chunk divergence
+    # on numeric values that straddle char boundaries.
+    raw_sections: NotRequired[Optional[dict]]

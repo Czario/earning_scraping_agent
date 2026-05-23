@@ -167,6 +167,8 @@ _PCT_OR_PER_SHARE_PATTERNS = re.compile(
     r"(%|percent|\bgrowth\b|\bratio\b|\beps\b|per share|\byield\b|\brate\b|\byoy\b|\bpct\b"
     r"|\bemployee\b|\bheadcount\b|basis points|percentage points"
     r"|\bgross margin\b|\boperating margin\b|\bnet margin\b|\bprofit margin\b|\bmargin\s*%"
+    # XBRL-style per-share suffixes: "Per Basic Share", "Per Diluted Share", etc.
+    r"|\bper\s+(?:basic|diluted|basic\s+and\s+diluted|common)\s+share\b"
     # Operational unit counts — physical quantities, never dollar-scaled
     r"|\bproduction\b|\bdeliveries\b|\bdelivered\b"
     r"|(?:super)?charger.{0,12}(?:station|connector)"
@@ -199,6 +201,67 @@ _SCALE_MULTIPLIERS: dict[str, int] = {
 # a narrative value like 82_900_000_000) and won't be re-multiplied.
 _TABLE_RAW_MAX = 10_000_000  # 10 M raw → $10T if ×1M — implausible, so skip
 
+# ── Targeted extraction (normalize_data mode) ────────────────────────────────
+
+# Prompt used when target_concepts are loaded from normalize_data.
+# The LLM is given the company's exact GAAP concept labels and told to use
+# them verbatim as JSON keys, ensuring lossless mapping back to concept_id.
+_TARGETED_PROMPT_TEMPLATE = """\
+You are a financial data extraction assistant.
+
+Extract ONLY the income statement metrics listed below from the text excerpt for {company_name} ({ticker}).
+This is chunk {chunk_num} of {total_chunks} of the full document.
+{focus_hint}{scale_hint}{period_hint}
+SCOPE — extract ONLY the concepts listed below.
+Use EXACTLY the label shown in quotes as the JSON key — not the document's own wording.
+
+{concept_list}
+IGNORE — do NOT extract:
+  • Balance sheet items, cash flow items, non-GAAP metrics, guidance / forecasts.
+  • Any table from a GAAP-to-Non-GAAP reconciliation.
+  • Percentage metrics (margins, growth rates).
+
+TABLE PRIORITY: prefer the primary condensed GAAP income statement. Skip Non-GAAP tables.
+
+Return ONLY a flat JSON object — no markdown fences, no extra text.
+Every value must be a number or null.
+
+FIRST field must be "__scale__":
+  "millions", "thousands", "billions", or "as-is" (no table).
+
+SECOND field must be "__period__":
+  The most recent period column label exactly as printed, or null.
+
+ALL OTHER fields: use EXACTLY the label strings in quotes from the concept list above.
+
+IMPORTANT — report RAW numbers, do NOT scale yourself:
+  If the table says "(In millions)" and shows "82,886" → report 82886 (NOT 82886000000).
+  EPS values and percentages are always reported as-is regardless of __scale__.
+
+Text excerpt:
+\"\"\"
+{text}
+\"\"\"
+"""
+
+
+def _build_concept_prompt_list(target_concepts: list[dict]) -> str:
+    """Format concept list for the targeted prompt.
+
+    Each line: "Label" (GAAP: LocalName)
+    Listed in path order (income statement order).
+    """
+    lines: list[str] = []
+    for c in target_concepts:
+        label = c.get("label", "")
+        concept = c.get("concept", "")
+        local = concept.split(":")[-1] if ":" in concept else concept
+        if local:
+            lines.append(f'  • "{label}"  (GAAP concept: {local})')
+        else:
+            lines.append(f'  • "{label}"')
+    return "\n".join(lines)
+
 # Minimum fraction of the largest revenue-like value that a dollar field must
 # have to be considered plausible (filters out residual unscaled cells).
 _MIN_DOLLAR_FRACTION = 0.001   # 0.1 % of revenue
@@ -225,9 +288,12 @@ _RESCALE_UPPER_MULTIPLE = 3.0
 # chunk prompt, eliminating wrong-scale errors that occur when the
 # "(In millions)" table header only appears in the first chunk.
 _PRESCAN_SCALE: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\(in millions\b", re.I), "millions"),
-    (re.compile(r"\(in thousands\b", re.I), "thousands"),
-    (re.compile(r"\(in billions\b", re.I), "billions"),
+    # Match "(in millions)" or "(Amounts in millions, except ...)" etc.
+    (re.compile(r"\([^)]{0,30}?\bin millions\b", re.I), "millions"),
+    # Match "(in thousands)" or "(Amounts in thousands, except ...)" etc.
+    (re.compile(r"\([^)]{0,30}?\bin thousands\b", re.I), "thousands"),
+    # Match "(in billions)" or "(Amounts in billions, except ...)" etc.
+    (re.compile(r"\([^)]{0,30}?\bin billions\b", re.I), "billions"),
 ]
 # Detects when share counts use a DIFFERENT scale than dollar amounts.
 # e.g. "(In millions, except number of shares which are reflected in thousands"
@@ -265,6 +331,7 @@ def _invoke_chunk_with_retry(
     total_chunks: int,
     ticker: str,
     shares_multiplier: int = 1,
+    prescan_dollar_multiplier: int = 0,
     max_retries: int = _CHUNK_MAX_RETRIES,
     detail_callback=None,
     report_chunk=None,
@@ -303,7 +370,9 @@ def _invoke_chunk_with_retry(
                 "Chunk %d/%d attempt %d raw response for %s: %r",
                 chunk_num, total_chunks, attempt + 1, ticker, response[:300],
             )
-            parsed = _parse_llm_response(response, shares_multiplier)
+            parsed = _parse_llm_response(
+                response, shares_multiplier, prescan_dollar_multiplier
+            )
             if parsed is not None:
                 if report_chunk is not None:
                     report_chunk(chunk_num - 1, "done", attempt + 1)
@@ -364,6 +433,40 @@ def _chunk_text(text: str, chunk_size: int = _CHUNK_SIZE, overlap: int = _CHUNK_
     return chunks
 
 
+# Labels for each GAAP section that becomes its own LLM chunk.
+# Order controls which chunk index a given statement type receives, which in
+# turn controls which __scale__/__period__ the merge step adopts on conflict.
+# Income statement first so it's chunk 1 (highest authority).
+_SECTION_CHUNK_LABELS: list[tuple[str, str]] = [
+    ("income_statement", "GAAP INCOME STATEMENT"),
+    ("balance_sheet",    "GAAP BALANCE SHEET"),
+    ("cash_flow",        "GAAP CASH FLOWS"),
+    ("other",            "FINANCIAL DATA"),
+]
+
+
+def _build_section_chunks(raw_sections: dict | None) -> list[str] | None:
+    """Return one chunk per classified GAAP table, or None if unavailable.
+
+    When the HTML extractor has classified tables (``raw_sections`` present),
+    each GAAP table is sent to the LLM as its own chunk \u2014 no char-based
+    splitting, no overlap, no risk of a table row being cut in half between
+    two chunks.  Non-GAAP reconciliation tables are skipped entirely because
+    none of their values map to the GAAP income-statement / balance-sheet /
+    cash-flow registries.
+
+    Returns ``None`` for PDF documents or the HTML fallback path (no GAAP
+    tables classified) so the caller can fall back to ``_chunk_text``.
+    """
+    if not raw_sections:
+        return None
+    chunks: list[str] = []
+    for key, label in _SECTION_CHUNK_LABELS:
+        for entry in raw_sections.get(key) or []:
+            chunks.append(f"=== {label} ===\n{entry}")
+    return chunks or None
+
+
 def _prescan_document(raw_text: str) -> tuple[str | None, str | None, str | None]:
     """Scan the full document once for scale and current reporting period.
 
@@ -396,7 +499,11 @@ def _prescan_document(raw_text: str) -> tuple[str | None, str | None, str | None
     return scale, shares_scale, period
 
 
-def _parse_llm_response(response: str, shares_multiplier: int = 1) -> dict[str, Any] | None:
+def _parse_llm_response(
+    response: str,
+    shares_multiplier: int = 1,
+    prescan_dollar_multiplier: int = 0,
+) -> dict[str, Any] | None:
     """Strip markdown fences, parse JSON, and apply the __scale__ multiplier.
 
     The LLM is asked to report raw table values plus a ``__scale__`` sentinel.
@@ -406,6 +513,10 @@ def _parse_llm_response(response: str, shares_multiplier: int = 1) -> dict[str, 
     used in EPS calculation) and may differ from the dollar multiplier when the
     document explicitly states a different scale for share counts (e.g. Apple
     reports dollars in millions but share counts in thousands).
+
+    ``prescan_dollar_multiplier``: when > 0, overrides the LLM's ``__scale__``
+    for dollar fields.  This prevents hallucinated scale labels (e.g. "millions"
+    when the header says "thousands") from corrupting the merge.
     """
     cleaned = (
         response.strip()
@@ -425,9 +536,14 @@ def _parse_llm_response(response: str, shares_multiplier: int = 1) -> dict[str, 
     except json.JSONDecodeError:
         return None
 
-    # Extract __scale__ and apply the multiplier to all dollar-amount fields.
+    # Extract __scale__ — always pop it to keep the dict clean.
     scale_str = str(parsed.pop("__scale__", "as-is")).lower()
-    multiplier = _SCALE_MULTIPLIERS.get(scale_str, 1)
+    # If the prescan detected the document scale from the header (e.g. "(In thousands)"),
+    # trust that over the LLM's returned label to prevent hallucinated-scale corruption.
+    if prescan_dollar_multiplier > 1:
+        multiplier = prescan_dollar_multiplier
+    else:
+        multiplier = _SCALE_MULTIPLIERS.get(scale_str, 1)
     if multiplier > 1 or shares_multiplier > 1:
         for k, v in list(parsed.items()):
             if v is None or not isinstance(v, (int, float)):
@@ -815,9 +931,16 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         else ""
     )
 
-    chunks = _chunk_text(raw_text)
+    chunks = _build_section_chunks(state.get("raw_sections"))
+    chunk_source = "section"
+    if chunks is None:
+        chunks = _chunk_text(raw_text)
+        chunk_source = "char"
     total = len(chunks)
-    logger.info("Extracting metrics for %s across %d chunk(s)", ticker, total)
+    logger.info(
+        "Extracting metrics for %s across %d %s chunk(s)",
+        ticker, total, chunk_source,
+    )
     detail_callback = get_detail_callback()
 
     # Shared per-chunk status tracker so the progress bar can show every
@@ -845,19 +968,37 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         report_detail(summary)
 
     # Build all chunk prompts up front
-    prompts = [
-        _PROMPT_TEMPLATE.format(
-            company_name=state["company_name"],
-            ticker=ticker,
-            chunk_num=i,
-            total_chunks=total,
-            focus_hint=focus_hint,
-            scale_hint=scale_hint,
-            period_hint=period_hint,
-            text=chunk,
-        )
-        for i, chunk in enumerate(chunks, start=1)
-    ]
+    target_concepts: list[dict] = state.get("target_concepts") or []  # type: ignore[assignment]
+    if target_concepts:
+        concept_list_str = _build_concept_prompt_list(target_concepts)
+        prompts = [
+            _TARGETED_PROMPT_TEMPLATE.format(
+                company_name=state["company_name"],
+                ticker=ticker,
+                chunk_num=i,
+                total_chunks=total,
+                focus_hint=focus_hint,
+                scale_hint=scale_hint,
+                period_hint=period_hint,
+                concept_list=concept_list_str,
+                text=chunk,
+            )
+            for i, chunk in enumerate(chunks, start=1)
+        ]
+    else:
+        prompts = [
+            _PROMPT_TEMPLATE.format(
+                company_name=state["company_name"],
+                ticker=ticker,
+                chunk_num=i,
+                total_chunks=total,
+                focus_hint=focus_hint,
+                scale_hint=scale_hint,
+                period_hint=period_hint,
+                text=chunk,
+            )
+            for i, chunk in enumerate(chunks, start=1)
+        ]
 
     # Parallel execution when OLLAMA_NUM_PARALLEL > 1.
     # Requires Ollama server started with OLLAMA_NUM_PARALLEL set to the same value.
@@ -875,6 +1016,7 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
                     total,
                     ticker,
                     shares_multiplier,
+                    dollar_multiplier,
                     _CHUNK_MAX_RETRIES,
                     detail_callback,
                     _report_chunk,
@@ -900,6 +1042,7 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
                 total,
                 ticker,
                 shares_multiplier,
+                dollar_multiplier,
                 _CHUNK_MAX_RETRIES,
                 detail_callback,
                 _report_chunk,
@@ -924,6 +1067,25 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     metrics = _merge_metrics(chunk_results, source_text=raw_text)
     metrics, identity_warnings = _validate_metrics(metrics)
     logger.info("Merged %d metric(s) for %s: %s", len(metrics), ticker, list(metrics.keys()))
+
+    # When running in targeted mode (normalize_data), build concept_metrics:
+    # a dict mapping concept_id → value for direct upsert into
+    # normalize_data.concept_values_quarterly.
+    concept_metrics: dict[str, float] | None = None
+    if target_concepts:
+        label_to_id = {c["label"]: c["_id"] for c in target_concepts}
+        concept_metrics = {
+            label_to_id[label]: float(value)
+            for label, value in metrics.items()
+            if label in label_to_id and isinstance(value, (int, float))
+        }
+        logger.info(
+            "Targeted mode: mapped %d/%d concept(s) to concept_id for %s",
+            len(concept_metrics),
+            len(target_concepts),
+            ticker,
+        )
+
     new_state: EarningsAgentState = {
         **state,
         "metrics": metrics,
@@ -935,4 +1097,6 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         # block a save that should succeed.
         "identity_warnings": identity_warnings,
     }
+    if concept_metrics is not None:
+        new_state["concept_metrics"] = concept_metrics
     return new_state

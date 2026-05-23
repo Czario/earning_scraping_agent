@@ -34,6 +34,100 @@ _BROWSER_HEADERS = {
 # Minimum meaningful content length; below this we assume JS rendering is needed
 _MIN_CONTENT_CHARS = 300
 
+# ── HTML table classification ───────────────────────────────────────────────
+# Each 8-K press release typically contains several HTML tables:
+#   • 1-2 GAAP income statement tables (sometimes with a % growth variant)
+#   • 1 GAAP balance sheet table
+#   • 1 GAAP cash flow table
+#   • N non-GAAP reconciliation tables (Adjusted income, EBITDA, FCF, Net debt…)
+#
+# Mixing these into one flat text blob causes the LLM to:
+#   – Read non-GAAP "Adjusted net income" instead of GAAP "Net income"
+#   – Get confused by narrative dollar amounts ("$132.4 million") that use a
+#     different scale than the table values ("132,355" in thousands)
+#
+# These patterns classify tables by their content + preceding heading text.
+# non_gaap is checked FIRST because non-GAAP tables often contain metric names
+# ("Net income") that would otherwise trigger positive GAAP classification.
+
+_NON_GAAP_TABLE_RX = re.compile(
+    r"non.?gaap"
+    r"|reconciliation\s+of\s+(?:gaap|net\s+income|adjusted)"
+    r"|\badjusted\s+(?:ebitda|net\s+income|operating\s+income|earnings)\b"
+    r"|\bebitda\b"
+    r"|\bfree\s+cash\s+flow\b",
+    re.I,
+)
+_INCOME_STMT_TABLE_RX = re.compile(
+    r"statement[s]?\s+of\s+(?:operations|income|earnings|loss)"
+    r"|total\s+revenue[s]?\b"
+    r"|net\s+revenue[s]?\b"
+    r"|net\s+sales\b",
+    re.I,
+)
+_BALANCE_SHEET_TABLE_RX = re.compile(
+    r"balance\s+sheet[s]?"
+    r"|financial\s+position"
+    r"|\btotal\s+assets\b",
+    re.I,
+)
+_CASH_FLOW_TABLE_RX = re.compile(
+    r"cash\s+flow[s]?"
+    r"|statement[s]?\s+of\s+cash"
+    r"|net\s+cash\s+(?:provided|used)\s+by\s+operating",
+    re.I,
+)
+
+
+def _get_table_context(table, max_chars: int = 400) -> str:
+    """Return up to *max_chars* of text from DOM elements immediately preceding *table*.
+
+    Only looks at **direct previous siblings** of the table element — not at
+    ancestor siblings.  This keeps the context tightly scoped to the heading
+    and scale indicator that appear between the prior table and this one (e.g.
+    "Reconciliation to adjusted EBITDA" or "(In thousands)"), and prevents
+    distant sections of the press release (non-GAAP disclaimers, earlier
+    narrative) from contaminating the classification probe.
+
+    Because tables are decomposed one at a time before this is called for the
+    next table, the previous siblings only cover text *between* consecutive
+    tables — not the rows of the preceding table itself.
+    """
+    parts: list[str] = []
+    total = 0
+
+    for sib in table.previous_siblings:
+        if total >= max_chars:
+            break
+        t = sib.get_text(" ", strip=True) if hasattr(sib, "get_text") else str(sib).strip()
+        if t:
+            parts.append(t)
+            total += len(t)
+
+    return "\n".join(reversed(parts))
+
+
+def _classify_table(table_text: str, context_text: str) -> str:
+    """Classify a financial table as one of five types.
+
+    ``non_gaap`` is checked against the *full* table text because reconciliation
+    tables often have the key phrase ('Adjusted net income') near the bottom.
+    Positive GAAP classifications use a shorter probe to avoid false matches on
+    non-GAAP tables that share metric names (e.g. 'Net income as reported').
+    """
+    full_probe = context_text + " " + table_text
+    if _NON_GAAP_TABLE_RX.search(full_probe):
+        return "non_gaap"
+    short_probe = context_text[-600:] + " " + table_text[:600]
+    if _INCOME_STMT_TABLE_RX.search(short_probe):
+        return "income_statement"
+    if _CASH_FLOW_TABLE_RX.search(short_probe):
+        return "cash_flow"
+    if _BALANCE_SHEET_TABLE_RX.search(short_probe):
+        return "balance_sheet"
+    return "other"
+
+
 # Boilerplate section markers that contain no financial data.
 # Only searched in the second half of the document to avoid accidentally cutting
 # the beginning of a document that opens with a disclaimer.
@@ -138,17 +232,87 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
         for tag in soup(_NOISE_TAGS):
             tag.decompose()
 
-        # Convert financial tables to markdown before text extraction.
-        # This preserves column structure (period headers, side-by-side values)
-        # that get_text() would otherwise destroy, making multi-period
-        # column selection reliable for the LLM.
-        for table in soup.find_all("table"):
-            table.replace_with(_table_to_markdown(table) + "\n")
+        # ── Table-aware structured extraction ────────────────────────────────
+        # Classify each HTML table by financial statement type, then assemble
+        # raw_text so GAAP tables appear first and non-GAAP reconciliation
+        # tables are isolated at the end with a clear label.
+        #
+        # Processing order matters: each table is decomposed from the soup
+        # before the next table's context is collected, so `_get_table_context`
+        # only sees text *between* consecutive tables (not the prior table's
+        # rows), keeping the scale/period header attached to the right table.
+        sections: dict[str, list[str]] = {
+            "income_statement": [],
+            "balance_sheet": [],
+            "cash_flow": [],
+            "other": [],
+            "non_gaap": [],
+        }
+        has_gaap_tables = False
 
-        raw_text = soup.get_text(separator="\n", strip=True)
-        raw_text = _strip_boilerplate(raw_text)
-        logger.info("HTML extracted %d chars for %s", len(raw_text), ticker)
-        return {**state, "raw_text": raw_text, "status": "text_extracted"}
+        for table in list(soup.find_all("table")):
+            context = _get_table_context(table)
+            table_text = table.get_text(" ", strip=True)
+            ttype = _classify_table(table_text, context)
+            md = _table_to_markdown(table)
+            entry = (f"{context}\n" if context.strip() else "") + md
+            sections[ttype].append(entry)
+            if ttype in ("income_statement", "balance_sheet", "cash_flow"):
+                has_gaap_tables = True
+            table.decompose()  # Remove before processing next table
+
+        # Prose text with all tables removed
+        prose = soup.get_text(separator="\n", strip=True)
+        prose = _strip_boilerplate(prose)
+
+        if has_gaap_tables:
+            # Structured output: GAAP tables first → narrative → non-GAAP
+            parts: list[str] = []
+            for stmt_type, label in [
+                ("income_statement", "GAAP INCOME STATEMENT"),
+                ("balance_sheet",    "GAAP BALANCE SHEET"),
+                ("cash_flow",        "GAAP CASH FLOWS"),
+                ("other",            "FINANCIAL DATA"),
+            ]:
+                for entry in sections[stmt_type]:
+                    parts.append(f"=== {label} ===\n{entry}")
+            if prose.strip():
+                parts.append(f"=== NARRATIVE ===\n{prose}")
+            for entry in sections["non_gaap"]:
+                parts.append(
+                    "=== NON-GAAP (FOR REFERENCE ONLY — DO NOT USE FOR GAAP METRICS) ===\n"
+                    + entry
+                )
+            raw_text = "\n\n".join(parts)
+            logger.info(
+                "HTML extracted %d chars for %s — %d income, %d balance, "
+                "%d cashflow, %d other, %d non-gaap table(s)",
+                len(raw_text), ticker,
+                len(sections["income_statement"]), len(sections["balance_sheet"]),
+                len(sections["cash_flow"]), len(sections["other"]),
+                len(sections["non_gaap"]),
+            )
+            return {
+                **state,
+                "raw_text": raw_text,
+                "raw_sections": sections,
+                "status": "text_extracted",
+            }
+        else:
+            # Fallback: no GAAP tables classified — convert all tables to
+            # markdown inline (original behaviour) so nothing is lost.
+            soup2 = BeautifulSoup(html, "lxml")
+            for tag in soup2(_NOISE_TAGS):
+                tag.decompose()
+            for tbl in soup2.find_all("table"):
+                tbl.replace_with(_table_to_markdown(tbl) + "\n")
+            raw_text = soup2.get_text(separator="\n", strip=True)
+            raw_text = _strip_boilerplate(raw_text)
+            logger.info(
+                "HTML extracted %d chars for %s (fallback — no GAAP tables classified)",
+                len(raw_text), ticker,
+            )
+            return {**state, "raw_text": raw_text, "status": "text_extracted"}
     except Exception as exc:  # noqa: BLE001
         return {**state, "status": "failed", "error": f"HTML extraction failed: {exc}"}
 
