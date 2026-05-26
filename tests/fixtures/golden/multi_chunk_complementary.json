@@ -1,0 +1,22 @@
+{
+  "description": "Multi-chunk run: two complementary chunks each returning non-overlapping keys. Verifies the merge step assembles metrics from both chunks into a single correct result. chunk_size_override is used to force the text to be split into exactly 2 chunks.",
+  "ticker": "SYNTH",
+  "company_name": "Synthetic Corp.",
+  "raw_text": "CONDENSED CONSOLIDATED STATEMENTS OF INCOME\n(In millions, except per share data)\nQ2 2026\n\nRevenue                    94,000\nCost of revenue            52,000\nGross profit               42,000\n\nXXXCHUNKBREAKXXX\n\nOperating expenses         17,000\nOperating income           25,000\nNet income                 20,000\nDiluted earnings per share   2.40\n",
+  "chunk_size_override": 160,
+  "chunk_overlap_override": 0,
+  "llm_responses": [
+    "{\"__scale__\": \"millions\", \"__period__\": \"Q2 2026\", \"Revenue\": 94000, \"Cost of revenue\": 52000, \"Gross profit\": 42000}",
+    "{\"__scale__\": \"millions\", \"__period__\": \"Q2 2026\", \"Operating expenses\": 17000, \"Operating income\": 25000, \"Net income\": 20000, \"Diluted earnings per share\": 2.40}"
+  ],
+  "expected": {
+    "Revenue": 94000000000,
+    "Cost of revenue": 52000000000,
+    "Gross profit": 42000000000,
+    "Operating expenses": 17000000000,
+    "Operating income": 25000000000,
+    "Net income": 20000000000,
+    "Diluted earnings per share": 2.40
+  },
+  "must_be_absent": ["__scale__"]
+}

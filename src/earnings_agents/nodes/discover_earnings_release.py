@@ -3,20 +3,25 @@ from __future__ import annotations
 import json
 import logging
 
-from langchain_ollama import OllamaLLM
-
-from earnings_agents.config import (
-    COMPANIES,
-    IR_PAGE_MAX_CHARS,
-    OLLAMA_BASE_URL,
-    OLLAMA_MODEL,
-)
+from earnings_agents.config import IR_PAGE_MAX_CHARS
 from earnings_agents.llm_factory import build_llm
 from earnings_agents.workflow_state import EarningsAgentState
 from earnings_agents.tools.playwright_scraper import fetch_page_js
 from earnings_agents.tools.static_scraper import extract_links, fetch_page
 
 logger = logging.getLogger(__name__)
+
+# JSON schema enforced by Ollama at the model level; used as a json_object hint
+# for Groq. Guarantees the LLM returns {"url": "...", "reason": "..."} without
+# markdown fences or extra fields.
+_DISCOVERY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["url", "reason"],
+}
 
 
 def _is_valid_url(url: str) -> bool:
@@ -94,15 +99,16 @@ def discover_earnings_release_node(state: EarningsAgentState) -> EarningsAgentSt
     )
 
     # ── 4. Ask LLM ───────────────────────────────────────────────────────────
-    llm = build_llm(format_json=True)
+    # Ollama enforces _DISCOVERY_SCHEMA at model level; Groq uses json_object mode.
+    # Neither wraps output in markdown fences, so no stripping is needed.
+    llm = build_llm(json_schema=_DISCOVERY_SCHEMA)
     try:
         response: str = llm.invoke(prompt)
-        # Strip accidental markdown code fences
-        cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        result = json.loads(cleaned)
+        result = json.loads(response.strip())
         file_url: str = result.get("url", "").strip()
 
-        # Stage 4 (Reflect & Decide): validate the URL; retry once with stricter instructions
+        # Validate the URL; retry once with a stricter instruction if the model
+        # returned a placeholder or relative path despite the schema.
         if not _is_valid_url(file_url):
             logger.warning(
                 "LLM returned invalid URL %r for %s — retrying with stricter prompt",
@@ -114,8 +120,7 @@ def discover_earnings_release_node(state: EarningsAgentState) -> EarningsAgentSt
                 "Do not return placeholder text, relative paths, or an empty string.\n\n"
             )
             response = llm.invoke(strict_prefix + prompt)
-            cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            result = json.loads(cleaned)
+            result = json.loads(response.strip())
             file_url = result.get("url", "").strip()
 
         if not _is_valid_url(file_url):

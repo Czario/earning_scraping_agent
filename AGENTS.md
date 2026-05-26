@@ -1,6 +1,6 @@
 # Earnings Agents — AI Agent Instructions
 
-LangGraph-based pipeline that scrapes earnings releases (SEC EDGAR or IR pages), extracts financial metrics via a local Ollama LLM (or Groq/OpenAI), and upserts results into MongoDB.
+LangGraph-based pipeline that scrapes earnings releases (SEC EDGAR or IR pages), extracts financial metrics via a local Ollama LLM (or Groq), and upserts results into MongoDB.
 
 See [README.md](README.md) for full setup and CLI usage. See [project_flow.md](project_flow.md) for a step-by-step trace of the SEC flow.
 
@@ -18,7 +18,7 @@ uv run pytest -q                                 # full test suite
 uv run pytest tests/test_extract_financial_metrics.py -q    # focused test
 ```
 
-Runtime requires **Ollama** (or a Groq/OpenAI API key) and **MongoDB** running locally. Copy `.env.example` → `.env` and adjust before first run.
+Runtime requires **Ollama** (or a Groq API key) and **MongoDB** running locally. Copy `.env.example` → `.env` and adjust before first run.
 
 ---
 
@@ -47,7 +47,7 @@ Pure-Python analysis helpers live in `analysis/`: `critical_metrics.py` (tiered 
 
 External integrations live in `tools/`: `edgar_client.py`, `mongodb_client.py`, `playwright_scraper.py`, `static_scraper.py`.
 
-LLM provider selection is in `llm_factory.py` (reads `LLM_PROVIDER` env var: `"ollama"` | `"groq"` | `"openai"`). Configuration is in `config.py` (reads `.env` via `python-dotenv`).
+LLM provider selection is in `llm_factory.py` (reads `LLM_PROVIDER` env var: `"ollama"` | `"groq"`). Configuration is in `config.py` (reads `.env` via `python-dotenv`).
 
 ---
 

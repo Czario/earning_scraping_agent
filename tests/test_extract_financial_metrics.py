@@ -1,12 +1,16 @@
 """Tests for the data extraction node (LLM → flexible metrics dict)."""
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from earnings_agents.nodes.extract_financial_metrics import (
+    _HINTS_DIR,
     _chunk_text,
+    _llm_map_concepts,
+    _load_company_hints,
     _merge_metrics,
     _prescan_document,
     extract_financial_metrics_node,
@@ -510,3 +514,306 @@ class TestPrescanDocument:
         text = "Revenue was $132.4 million in the quarter. Gross profit of $1.03 billion.\n"
         scale, _, _ = _prescan_document(text)
         assert scale is None
+
+
+# ---------------------------------------------------------------------------
+# _load_company_hints
+# ---------------------------------------------------------------------------
+
+class TestLoadCompanyHints:
+    def test_returns_empty_when_no_file(self, tmp_path, monkeypatch):
+        """Missing hint file returns empty string."""
+        monkeypatch.setattr(
+            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+        )
+        assert _load_company_hints("AAPL") == ""
+
+    def test_returns_content_when_file_exists(self, tmp_path, monkeypatch):
+        """Existing hint file returns its stripped content."""
+        (tmp_path / "AAPL.md").write_text("  Report shares in thousands.\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+        )
+        assert _load_company_hints("AAPL") == "Report shares in thousands."
+
+    def test_ticker_uppercased_for_lookup(self, tmp_path, monkeypatch):
+        """Ticker is upper-cased so 'aapl' finds AAPL.md."""
+        (tmp_path / "AAPL.md").write_text("hint content", encoding="utf-8")
+        monkeypatch.setattr(
+            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+        )
+        assert _load_company_hints("aapl") == "hint content"
+
+    def test_empty_file_returns_empty_string(self, tmp_path, monkeypatch):
+        """An all-whitespace hint file is treated as absent."""
+        (tmp_path / "MSFT.md").write_text("   \n\n  ", encoding="utf-8")
+        monkeypatch.setattr(
+            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+        )
+        assert _load_company_hints("MSFT") == ""
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_hint_injected_into_prompt(self, mock_build_llm, tmp_path, monkeypatch):
+        """Company hint text appears in the LLM prompt when a hint file is present."""
+        (tmp_path / "AAPL.md").write_text("Always look for segment revenue.", encoding="utf-8")
+        monkeypatch.setattr(
+            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+        )
+        captured_prompts: list[str] = []
+
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = lambda prompt: (
+            captured_prompts.append(prompt)
+            or '{"Net income": 31000000000}'
+        )
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(ticker="AAPL", company_name="Apple Inc.")
+        extract_financial_metrics_node(state)
+
+        assert captured_prompts, "LLM was never invoked"
+        assert "Always look for segment revenue." in captured_prompts[0]
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_no_hint_file_does_not_alter_prompt(self, mock_build_llm, tmp_path, monkeypatch):
+        """When no hint file exists the prompt is unchanged (no hint section)."""
+        monkeypatch.setattr(
+            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+        )
+        captured_prompts: list[str] = []
+
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = lambda prompt: (
+            captured_prompts.append(prompt)
+            or '{"Net income": 31000000000}'
+        )
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(ticker="AAPL", company_name="Apple Inc.")
+        extract_financial_metrics_node(state)
+
+        assert captured_prompts, "LLM was never invoked"
+        assert "Company-specific extraction hints" not in captured_prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# Provider escalation
+# ---------------------------------------------------------------------------
+
+class TestProviderEscalation:
+    """Verify that extraction attempt 2+ escalates to Groq when configured."""
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
+    @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_attempt_2_escalates_to_groq(self, mock_build_llm):
+        """Second extraction pass passes provider='groq' to build_llm."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = '{"Net income": 5000000000}'
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(extraction_attempts=1)  # already did attempt 1
+        extract_financial_metrics_node(state)
+
+        call_kwargs = mock_build_llm.call_args.kwargs
+        assert call_kwargs.get("provider") == "groq"
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
+    @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_attempt_1_uses_default_provider(self, mock_build_llm):
+        """First extraction pass leaves provider=None (uses configured default)."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = '{"Net income": 5000000000}'
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(extraction_attempts=0)
+        extract_financial_metrics_node(state)
+
+        call_kwargs = mock_build_llm.call_args.kwargs
+        assert call_kwargs.get("provider") is None
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "")
+    @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_no_groq_key_stays_on_ollama(self, mock_build_llm):
+        """Without GROQ_API_KEY, attempt 2 stays on default provider (no escalation)."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = '{"Net income": 5000000000}'
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(extraction_attempts=1)
+        extract_financial_metrics_node(state)
+
+        call_kwargs = mock_build_llm.call_args.kwargs
+        assert call_kwargs.get("provider") is None
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
+    @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "groq")
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_groq_primary_does_not_double_escalate(self, mock_build_llm):
+        """When LLM_PROVIDER is already 'groq', no escalation override is applied."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = '{"Net income": 5000000000}'
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(extraction_attempts=1)
+        extract_financial_metrics_node(state)
+
+        call_kwargs = mock_build_llm.call_args.kwargs
+        assert call_kwargs.get("provider") is None
+
+
+# ── Taxonomy-key targeted extraction ─────────────────────────────────────────
+
+class TestTaxonomyKeyMapping:
+    """Verify two-tier concept mapping in targeted (normalize_data) mode."""
+
+    _TARGET_CONCEPTS = [
+        {
+            "_id": "aaa111",
+            "concept": "us-gaap:Revenues",
+            "label": "Net sales",
+            "taxonomy_key": "us-gaap:Revenues",
+            "path": "001",
+            "statement_type": "income_statement",
+        },
+        {
+            "_id": "bbb222",
+            "concept": "us-gaap:CostOfRevenue",
+            "label": "Cost of sales",
+            "taxonomy_key": "us-gaap:CostOfRevenue",
+            "path": "002",
+            "statement_type": "income_statement",
+        },
+        {
+            "_id": "ccc333",
+            "concept": "us-gaap:OperatingIncomeLoss",
+            "label": "Operating income",
+            "taxonomy_key": "us-gaap:OperatingIncomeLoss",
+            "path": "003",
+            "statement_type": "income_statement",
+        },
+    ]
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_exact_label_match_maps_concept_ids(self, mock_build_llm):
+        """Tier 1: exact label match populates concept_metrics."""
+        mock_llm = MagicMock()
+        # LLM echoes exact labels
+        mock_llm.invoke.return_value = (
+            '{"__scale__": "millions", "__period__": "Three Months Ended Mar 31, 2026",'
+            ' "Net sales": 5234, "Cost of sales": 3900}'
+        )
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(target_concepts=self._TARGET_CONCEPTS)
+        result = extract_financial_metrics_node(state)
+
+        assert result["status"] == "extracted"
+        cm = result.get("concept_metrics", {})
+        assert cm["aaa111"] == pytest.approx(5_234_000_000)
+        assert cm["bbb222"] == pytest.approx(3_900_000_000)
+        assert "ccc333" not in cm  # not returned by LLM
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_normalised_label_match_handles_casing_drift(self, mock_build_llm):
+        """Tier 1: normalised match handles casing/whitespace drift."""
+        mock_llm = MagicMock()
+        # LLM returns slightly different casing
+        mock_llm.invoke.return_value = (
+            '{"__scale__": "as-is", "__period__": null,'
+            ' "net sales": 5234000000, "COST OF SALES": 3900000000}'
+        )
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(target_concepts=self._TARGET_CONCEPTS)
+        result = extract_financial_metrics_node(state)
+
+        cm = result.get("concept_metrics", {})
+        assert cm.get("aaa111") == pytest.approx(5_234_000_000)
+        assert cm.get("bbb222") == pytest.approx(3_900_000_000)
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_llm_semantic_mapping_used_for_residual(self, mock_build_llm):
+        """Tier 2: LLM mapping resolves semantically similar but unmatched keys."""
+        # First call (extraction): LLM returns a synonym key not in target labels
+        extraction_response = (
+            '{"__scale__": "as-is", "__period__": null,'
+            ' "Revenue from operations": 5234000000}'
+        )
+        # Second call (mapping): LLM semantic mapper returns the match
+        mapping_response = (
+            '{"aaa111": "Revenue from operations", "bbb222": null, "ccc333": null}'
+        )
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = [extraction_response, mapping_response]
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(target_concepts=self._TARGET_CONCEPTS)
+        result = extract_financial_metrics_node(state)
+
+        cm = result.get("concept_metrics", {})
+        assert cm.get("aaa111") == pytest.approx(5_234_000_000)
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_llm_mapping_ignores_hallucinated_keys(self, mock_build_llm):
+        """Tier 2: LLM mapper cannot hallucinate keys not in extracted metrics."""
+        extraction_response = (
+            '{"__scale__": "as-is", "__period__": null, "Revenue": 5234000000}'
+        )
+        # LLM mapping hallucinates a key that wasn't extracted
+        mapping_response = '{"aaa111": "Net sales"}'  # "Net sales" not in extracted
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = [extraction_response, mapping_response]
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(target_concepts=self._TARGET_CONCEPTS)
+        result = extract_financial_metrics_node(state)
+
+        # "Net sales" was hallucinated → must NOT be mapped
+        cm = result.get("concept_metrics", {})
+        assert "aaa111" not in cm
+
+
+# ── _llm_map_concepts unit tests ──────────────────────────────────────────────
+
+class TestLlmMapConcepts:
+    """Unit tests for the _llm_map_concepts helper (no full pipeline)."""
+
+    _CONCEPTS = [
+        {"_id": "aaa", "concept": "us-gaap:Revenues", "label": "Net sales"},
+        {"_id": "bbb", "concept": "us-gaap:CostOfRevenue", "label": "Cost of sales"},
+    ]
+
+    def test_valid_mapping_returned(self):
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = '{"aaa": "Revenue from operations", "bbb": null}'
+        result = _llm_map_concepts(["Revenue from operations", "Other"], self._CONCEPTS, mock_llm)
+        assert result == {"aaa": "Revenue from operations"}
+
+    def test_hallucinated_key_rejected(self):
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = '{"aaa": "Invented key"}'
+        result = _llm_map_concepts(["Revenue from operations"], self._CONCEPTS, mock_llm)
+        assert result == {}  # "Invented key" not in extracted_keys
+
+    def test_duplicate_key_assignment_rejected(self):
+        """Same extracted key cannot be assigned to two concepts."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = '{"aaa": "Revenue", "bbb": "Revenue"}'
+        result = _llm_map_concepts(["Revenue"], self._CONCEPTS, mock_llm)
+        # First assignment wins; second is dropped
+        assert len(result) == 1
+        assert result.get("aaa") == "Revenue"
+
+    def test_llm_failure_returns_empty(self):
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = "not json at all"
+        result = _llm_map_concepts(["Revenue"], self._CONCEPTS, mock_llm)
+        assert result == {}
+
+    def test_empty_inputs_return_empty(self):
+        mock_llm = MagicMock()
+        assert _llm_map_concepts([], self._CONCEPTS, mock_llm) == {}
+        assert _llm_map_concepts(["Revenue"], [], mock_llm) == {}

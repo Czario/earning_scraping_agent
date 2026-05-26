@@ -1,0 +1,21 @@
+{
+  "description": "Millions scale with share-count fields included. EPS must NOT be scaled; weighted-average shares must be scaled by shares_multiplier (= dollar_multiplier = 1 000 000 when no separate shares scale is declared).",
+  "ticker": "SYNTH",
+  "company_name": "Synthetic Corp.",
+  "raw_text": "CONSOLIDATED STATEMENTS OF OPERATIONS\n(In millions, except per share data)\nYear Ended December 31, 2025\n\nRevenue                                              82,886\nCost of goods sold                                   42,180\nGross profit                                         40,706\nOperating income                                     29,000\nNet income                                           31,778\n\nEarnings per share:\n  Basic                                               4.30\n  Diluted                                             4.27\n\nWeighted-average shares outstanding:\n  Basic                                               7,400\n  Diluted                                             7,447\n",
+  "llm_responses": [
+    "{\"__scale__\": \"millions\", \"__period__\": \"Year Ended December 31, 2025\", \"Revenue\": 82886, \"Cost of goods sold\": 42180, \"Gross profit\": 40706, \"Operating income\": 29000, \"Net income\": 31778, \"Basic earnings per share\": 4.30, \"Diluted earnings per share\": 4.27, \"Weighted-average shares outstanding - basic\": 7400, \"Weighted-average shares outstanding - diluted\": 7447}"
+  ],
+  "expected": {
+    "Revenue": 82886000000,
+    "Cost of goods sold": 42180000000,
+    "Gross profit": 40706000000,
+    "Operating income": 29000000000,
+    "Net income": 31778000000,
+    "Basic earnings per share": 4.30,
+    "Diluted earnings per share": 4.27,
+    "Weighted-average shares outstanding - basic": 7400000000,
+    "Weighted-average shares outstanding - diluted": 7447000000
+  },
+  "must_be_absent": ["__scale__"]
+}

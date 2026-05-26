@@ -1,0 +1,23 @@
+{
+  "description": "Single-chunk income statement with millions scale. Core scaling path: raw table values × 1 000 000, EPS exempted.",
+  "ticker": "SYNTH",
+  "company_name": "Synthetic Corp.",
+  "raw_text": "CONDENSED CONSOLIDATED STATEMENTS OF INCOME\n(In millions, except per share data)\nThree Months Ended March 31, 2026\n\nRevenue                               50,000\nCost of revenue                       20,000\nGross profit                          30,000\nOperating expenses:\n  Research and development            10,000\n  Sales and marketing                  3,000\n  General and administrative           2,000\nTotal operating expenses              15,000\nOperating income                      15,000\nNet income                            10,000\n\nEarnings per share:\n  Basic                                 4.30\n  Diluted                               4.25\n",
+  "llm_responses": [
+    "{\"__scale__\": \"millions\", \"__period__\": \"Three Months Ended March 31, 2026\", \"Revenue\": 50000, \"Cost of revenue\": 20000, \"Gross profit\": 30000, \"Research and development\": 10000, \"Sales and marketing\": 3000, \"General and administrative\": 2000, \"Total operating expenses\": 15000, \"Operating income\": 15000, \"Net income\": 10000, \"Basic earnings per share\": 4.30, \"Diluted earnings per share\": 4.25}"
+  ],
+  "expected": {
+    "Revenue": 50000000000,
+    "Cost of revenue": 20000000000,
+    "Gross profit": 30000000000,
+    "Research and development": 10000000000,
+    "Sales and marketing": 3000000000,
+    "General and administrative": 2000000000,
+    "Total operating expenses": 15000000000,
+    "Operating income": 15000000000,
+    "Net income": 10000000000,
+    "Basic earnings per share": 4.30,
+    "Diluted earnings per share": 4.25
+  },
+  "must_be_absent": ["__scale__"]
+}

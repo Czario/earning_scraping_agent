@@ -13,11 +13,6 @@ OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 # LLM provider selector: "ollama" (default), "openai", or "groq".
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 
-# OpenAI-only settings (read when LLM_PROVIDER="openai").
-OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_REQUEST_TIMEOUT: float = float(os.getenv("OPENAI_REQUEST_TIMEOUT", "60"))
-
 # Groq-only settings (read when LLM_PROVIDER="groq").
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -62,6 +57,15 @@ OLLAMA_CONCURRENCY: int = int(os.getenv("OLLAMA_CONCURRENCY", "1"))
 STRICT_ACCURACY: bool = os.getenv("STRICT_ACCURACY", "1").strip().lower() not in {
     "0", "false", "no", "off", ""
 }
+
+# Dev LLM response cache — opt-in, never enabled in production.
+# Set LLM_CACHE=1 (or true/yes) in .env to cache LLM responses to disk.
+# Responses are keyed by sha256(provider:model + prompt) and persist across
+# runs until the cache directory is deleted manually.
+LLM_CACHE_ENABLED: bool = os.getenv("LLM_CACHE", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+LLM_CACHE_DIR: str = os.getenv("LLM_CACHE_DIR", ".llm_cache")
 
 # When True (default), run an additional LLM cleanup pass over the extracted
 # metrics before saving. The cleanup is constrained: it can ONLY drop keys

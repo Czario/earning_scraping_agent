@@ -1,12 +1,48 @@
 """Unit tests for normalize_data_client helpers (no DB required)."""
 import pytest
 from earnings_agents.tools.normalize_data_client import (
+    _clean_label,
+    _extract_member_tag,
     compute_fiscal_period,
     detect_period_type,
     parse_period_end_date,
     parse_period_start_date,
 )
 from datetime import date
+
+
+# ── _clean_label ──────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("raw, expected_head, expected_member", [
+    # Plain label — no member
+    ("Net sales", "Net sales", ""),
+    # Dimensional label with member concept appended after blank lines
+    ("Net sales\n\n\nus-gaap:ProductMember", "Net sales", "Product"),
+    # Label that IS only a concept reference — should produce empty head
+    ("us-gaap:Revenues", "", ""),
+    # Whitespace-only head
+    ("  \n\nus-gaap:Revenues", "", ""),
+])
+def test_clean_label(raw, expected_head, expected_member):
+    head, member = _clean_label(raw)
+    assert head == expected_head
+    assert member == expected_member
+
+
+# ── _extract_member_tag ───────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("raw, expected_tag", [
+    # Dimensional label
+    ("Net sales\n\n\nus-gaap:ProductMember", "us-gaap:ProductMember"),
+    # No member
+    ("Net sales", ""),
+    # Plain concept with no Member suffix — not a member tag
+    ("us-gaap:Revenues", ""),
+    # Multiple references — first Member wins
+    ("Fee income\n\nus-gaap:MembershipMember\nus-gaap:ProductMember", "us-gaap:MembershipMember"),
+])
+def test_extract_member_tag(raw, expected_tag):
+    assert _extract_member_tag(raw) == expected_tag
 
 
 # ── detect_period_type ────────────────────────────────────────────────────────

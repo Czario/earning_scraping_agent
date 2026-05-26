@@ -18,6 +18,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "lxml>=5.2.0",
     "rich>=13.0.0",
+    "diskcache>=5.6.3",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +32,8 @@ dev = [
 earnings-scheduler = "earnings_agents.cli.scheduler:main"
 earnings-run-once = "earnings_agents.cli.earnings:main"
 earnings = "earnings_agents.cli.earnings:main"
+earnings-failures = "earnings_agents.cli.failures:main"
+earnings-propose-hint = "earnings_agents.cli.propose_hint:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -6,24 +6,39 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext as _nullcontext
+from pathlib import Path
 from typing import Any, Optional
-
-from langchain_ollama import OllamaLLM
 
 from earnings_agents.config import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     EXTRACTION_MAX_CHARS,
-    OLLAMA_BASE_URL,
+    GROQ_API_KEY,
+    GROQ_REQUEST_TIMEOUT,
+    LLM_PROVIDER,
     OLLAMA_CONCURRENCY,
-    OLLAMA_MODEL,
-    OLLAMA_NUM_CTX,
 )
 from earnings_agents.hooks import get_detail_callback, report_detail, set_detail_callback
 from earnings_agents.llm_factory import build_llm
 from earnings_agents.workflow_state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
+
+# Human-curated hint files: data/company_hints/{TICKER}.md
+_HINTS_DIR = Path(__file__).parents[3] / "data" / "company_hints"
+
+
+def _load_company_hints(ticker: str) -> str:
+    """Return contents of data/company_hints/{TICKER}.md, or empty string."""
+    hint_file = _HINTS_DIR / f"{ticker.upper()}.md"
+    if hint_file.is_file():
+        content = hint_file.read_text(encoding="utf-8").strip()
+        if content:
+            logger.info("Loaded company hints for %s (%d chars)", ticker, len(content))
+            return content
+    return ""
+
 
 # Chunking parameters — sourced from config (which reads .env)
 _CHUNK_SIZE = CHUNK_SIZE
@@ -204,8 +219,10 @@ _TABLE_RAW_MAX = 10_000_000  # 10 M raw → $10T if ×1M — implausible, so ski
 # ── Targeted extraction (normalize_data mode) ────────────────────────────────
 
 # Prompt used when target_concepts are loaded from normalize_data.
-# The LLM is given the company's exact GAAP concept labels and told to use
-# them verbatim as JSON keys, ensuring lossless mapping back to concept_id.
+# The LLM is given the company's display label as the JSON key (reliable echo)
+# and the XBRL taxonomy key as a bracketed hint for semantic grounding.
+# Mapping back to concept_id uses normalized label matching (case/whitespace
+# insensitive) so minor label drift does not break the round-trip.
 _TARGETED_PROMPT_TEMPLATE = """\
 You are a financial data extraction assistant.
 
@@ -252,18 +269,109 @@ Text excerpt:
 
 _TAXONOMY_PREFIXES = ("us-gaap:", "ifrs-full:", "dei:", "srt:")
 
+# ── LLM semantic concept mapper ───────────────────────────────────────────────
+
+_LLM_MAP_PROMPT = """\
+You are a financial concept mapper.
+
+Below are metric keys extracted from an earnings press release and a list of
+target concepts (XBRL tag + display label + concept_id) that we want to map to.
+
+For each target concept, decide which extracted key best matches it (if any).
+
+Rules:
+  1. Each extracted key may be assigned to AT MOST ONE concept.
+  2. Only assign a key when you are confident — do NOT guess.
+  3. If no extracted key fits a concept, return null for that concept.
+  4. Do not invent new keys; only use keys from the extracted list.
+
+Extracted metric keys:
+{extracted_keys}
+
+Target concepts:
+{concept_rows}
+
+Return ONLY a flat JSON object mapping concept_id → matched extracted key (or null):
+{{"<concept_id>": "<extracted_key_or_null>", ...}}
+"""
+
+
+def _llm_map_concepts(
+    extracted_keys: list[str],
+    unmapped_concepts: list[dict],
+    llm: object,
+) -> dict[str, str]:
+    """Ask the LLM to semantically match *extracted_keys* to *unmapped_concepts*.
+
+    Returns a dict of ``concept_id → extracted_key`` for confident matches only.
+    Null/missing entries from the LLM response are silently dropped.
+
+    Guardrails:
+    - LLM can only pick from the supplied *extracted_keys* list (no hallucination).
+    - Each extracted key is used at most once (first assignment wins).
+    - Non-string or null LLM return values are discarded.
+    """
+    if not extracted_keys or not unmapped_concepts:
+        return {}
+
+    keys_block = "\n".join(f'  - "{k}"' for k in extracted_keys)
+    rows_block = "\n".join(
+        f'  - concept_id: "{c["_id"]}"  '
+        f'GAAP: {c.get("concept", "")}  '
+        f'label: "{c.get("label", "")}"'
+        for c in unmapped_concepts
+    )
+    prompt = _LLM_MAP_PROMPT.format(
+        extracted_keys=keys_block,
+        concept_rows=rows_block,
+    )
+    import json as _json
+    try:
+        raw = llm.invoke(prompt)  # type: ignore[union-attr]
+        if hasattr(raw, "content"):
+            raw = raw.content
+        raw = str(raw).strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        mapping: dict = _json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("LLM concept mapping call failed: %s", exc)
+        return {}
+
+    valid_keys = set(extracted_keys)
+    used_keys: set[str] = set()
+    result: dict[str, str] = {}
+    for concept_id, matched_key in mapping.items():
+        if not isinstance(matched_key, str):
+            continue  # null or wrong type
+        if matched_key not in valid_keys:
+            logger.debug(
+                "_llm_map_concepts: ignoring hallucinated key %r for concept %s",
+                matched_key, concept_id,
+            )
+            continue
+        if matched_key in used_keys:
+            logger.debug(
+                "_llm_map_concepts: key %r already used, skipping concept %s",
+                matched_key, concept_id,
+            )
+            continue
+        result[concept_id] = matched_key
+        used_keys.add(matched_key)
+    return result
+
 
 def _build_concept_prompt_list(target_concepts: list[dict]) -> str:
     """Format concept list for the targeted prompt.
 
-    Each line: ``  • "Label"  (GAAP: LocalName)``
+    Each line: ``  • "Label"  [concept_tag]``
     Listed in path order (income statement order).
 
-    The taxonomy hint is appended only when the underlying ``concept`` carries
-    a real XBRL prefix (us-gaap / ifrs-full / dei / srt) — synthetic prefixes
-    like ``system:`` are unknown to the LLM and would add noise.  The label
-    remains the contract: the prompt explicitly tells the model to use the
-    quoted label string as the JSON key.
+    The label is the JSON key contract — the LLM reliably echoes the quoted
+    string verbatim.  The bracketed concept tag is a semantic grounding hint
+    (the LLM knows US-GAAP taxonomy from training) and assists the post-
+    extraction LLM mapping step.
     """
     lines: list[str] = []
     for c in target_concepts:
@@ -273,10 +381,9 @@ def _build_concept_prompt_list(target_concepts: list[dict]) -> str:
         concept = c.get("concept", "") or ""
         concept_lc = concept.lower()
         if any(concept_lc.startswith(p) for p in _TAXONOMY_PREFIXES):
-            local = concept.split(":", 1)[1]
-            lines.append(f'  • "{label}"  (GAAP: {local})')
+            lines.append(f'  \u2022 "{label}"  [{concept}]')
         else:
-            lines.append(f'  • "{label}"')
+            lines.append(f'  \u2022 "{label}"')
     return "\n".join(lines)
 
 # Minimum fraction of the largest revenue-like value that a dollar field must
@@ -352,16 +459,21 @@ def _invoke_chunk_with_retry(
     max_retries: int = _CHUNK_MAX_RETRIES,
     detail_callback=None,
     report_chunk=None,
+    provider: str | None = None,
 ) -> "dict[str, Any] | None":
     """Invoke the LLM for one chunk, retrying with a stricter prefix on parse failure.
 
     Each worker creates its own LLM client instance; sharing one instance
     across threads can block intermittently under parallel load.
+
+    ``provider`` overrides the configured LLM_PROVIDER for this chunk only
+    (used by the escalation path to switch to Groq on retry passes).
     """
     if detail_callback is not None:
         set_detail_callback(detail_callback)
 
-    llm = build_llm(format_json=True, request_timeout=_OLLAMA_REQUEST_TIMEOUT)
+    timeout = GROQ_REQUEST_TIMEOUT if provider == "groq" else _OLLAMA_REQUEST_TIMEOUT
+    llm = build_llm(format_json=True, request_timeout=timeout, provider=provider)
     for attempt in range(max_retries + 1):
         if report_chunk is not None:
             report_chunk(chunk_num - 1, "running", attempt + 1)
@@ -381,7 +493,10 @@ def _invoke_chunk_with_retry(
             chunk_num, total_chunks, attempt + 1, ticker,
         )
         try:
-            with _OLLAMA_SEMAPHORE:
+            # The semaphore throttles concurrent local Ollama calls.
+            # Skip it when escalated to Groq (cloud API, no local concurrency limit).
+            _ctx = _OLLAMA_SEMAPHORE if provider != "groq" else _nullcontext()
+            with _ctx:
                 response: str = llm.invoke(prefix + prompt)
             logger.debug(
                 "Chunk %d/%d attempt %d raw response for %s: %r",
@@ -935,6 +1050,17 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     attempt_num = state.get("extraction_attempts", 0) + 1
     logger.info("Extraction pass %d for %s", attempt_num, ticker)
 
+    # Provider escalation: use Groq on attempts 2+ when the default provider
+    # is Ollama and a Groq key is available.  Ollama attempt 1 is cheaper/faster;
+    # Groq retries use the scout model which handles complex layouts better.
+    escalated_provider: str | None = None
+    if attempt_num > 1 and LLM_PROVIDER == "ollama" and GROQ_API_KEY:
+        escalated_provider = "groq"
+        logger.info(
+            "Escalating extraction to Groq for %s (pass %d — Ollama attempt 1 had high-severity findings)",
+            ticker, attempt_num,
+        )
+
     # Pre-scan the full document once for scale and reporting period.
     # Injecting confirmed values into every chunk prompt eliminates the most
     # common class of scaling errors (header only visible in first chunk).
@@ -963,14 +1089,20 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         )
     )
 
+    # Load static human-curated company hints (if any) — injected on every pass.
+    company_hints = _load_company_hints(ticker)
+
     # If the reflection node left guidance from a previous pass, inject it
     # into every chunk prompt so the LLM focuses on what was missed.
     extraction_notes = state.get("extraction_notes") or ""
-    focus_hint = (
-        f"\nAdditional focus from quality review (pass {attempt_num}):\n{extraction_notes}\n"
-        if extraction_notes
-        else ""
-    )
+    focus_hint_parts: list[str] = []
+    if company_hints:
+        focus_hint_parts.append(f"Company-specific extraction hints:\n{company_hints}")
+    if extraction_notes:
+        focus_hint_parts.append(
+            f"Additional focus from quality review (pass {attempt_num}):\n{extraction_notes}"
+        )
+    focus_hint = ("\n" + "\n".join(focus_hint_parts) + "\n") if focus_hint_parts else ""
 
     chunks = _build_section_chunks(
         state.get("raw_sections"),
@@ -1064,6 +1196,7 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
                     _CHUNK_MAX_RETRIES,
                     detail_callback,
                     _report_chunk,
+                    escalated_provider,
                 ): i
                 for i, prompt in enumerate(prompts)
             }
@@ -1090,6 +1223,7 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
                 _CHUNK_MAX_RETRIES,
                 detail_callback,
                 _report_chunk,
+                escalated_provider,
             )
 
     chunk_results: list[dict[str, Any]] = []
@@ -1115,20 +1249,73 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     # When running in targeted mode (normalize_data), build concept_metrics:
     # a dict mapping concept_id → value for direct upsert into
     # normalize_data.concept_values_quarterly.
+    #
+    # Mapping strategy (two-tier):
+    #   Tier 1 — Deterministic: exact label match, then normalised (lowercase +
+    #             collapsed whitespace) match.  Zero latency, zero hallucination risk.
+    #   Tier 2 — Semantic LLM: for concepts still unmapped after Tier 1, call the
+    #             LLM with the extracted keys + remaining concept list and ask it to
+    #             match semantically.  The LLM can only pick from the supplied keys
+    #             (no hallucination) and must return null for no-match.
     concept_metrics: dict[str, float] | None = None
     if target_concepts:
-        label_to_id = {c["label"]: c["_id"] for c in target_concepts}
-        concept_metrics = {
-            label_to_id[label]: float(value)
-            for label, value in metrics.items()
-            if label in label_to_id and isinstance(value, (int, float))
+        # ── Tier 1: deterministic label matching ────────────────────────────
+        def _norm_label(s: str) -> str:
+            import re as _re
+            return _re.sub(r"\s+", " ", s).strip().lower()
+
+        exact_label_to_id: dict[str, str] = {c["label"]: c["_id"] for c in target_concepts}
+        norm_label_to_id: dict[str, str] = {
+            _norm_label(c["label"]): c["_id"] for c in target_concepts
         }
+        concept_metrics = {}
+        for key, value in metrics.items():
+            if not isinstance(value, (int, float)):
+                continue
+            if key in exact_label_to_id:
+                concept_metrics[exact_label_to_id[key]] = float(value)
+            elif _norm_label(key) in norm_label_to_id:
+                concept_metrics[norm_label_to_id[_norm_label(key)]] = float(value)
+
+        # ── Tier 2: LLM semantic mapping for residual unmapped concepts ─────
+        mapped_ids = set(concept_metrics.keys())
+        unmapped_concepts = [c for c in target_concepts if c["_id"] not in mapped_ids]
+        numeric_keys = [k for k, v in metrics.items() if isinstance(v, (int, float))]
+        if unmapped_concepts and numeric_keys:
+            logger.info(
+                "Targeted mode: %d concept(s) unmatched after label lookup for %s "
+                "— running LLM semantic mapping",
+                len(unmapped_concepts), ticker,
+            )
+            map_timeout = GROQ_REQUEST_TIMEOUT if escalated_provider == "groq" else _OLLAMA_REQUEST_TIMEOUT
+            map_llm = build_llm(format_json=True, request_timeout=map_timeout, provider=escalated_provider)
+            llm_matches = _llm_map_concepts(numeric_keys, unmapped_concepts, map_llm)
+            for concept_id, matched_key in llm_matches.items():
+                value = metrics.get(matched_key)
+                if isinstance(value, (int, float)):
+                    concept_metrics[concept_id] = float(value)
+                    logger.debug(
+                        "LLM semantic mapping: %r → concept_id %s for %s",
+                        matched_key, concept_id, ticker,
+                    )
+
         logger.info(
             "Targeted mode: mapped %d/%d concept(s) to concept_id for %s",
             len(concept_metrics),
             len(target_concepts),
             ticker,
         )
+        # Diagnostic: show which target concepts remain unmapped.
+        final_mapped_ids = set(concept_metrics.keys())
+        absent_from_response = sorted(
+            c["label"] for c in target_concepts
+            if c["_id"] not in final_mapped_ids
+        )
+        if absent_from_response:
+            logger.debug(
+                "Targeted mode: %d concept(s) not extracted (null or not in press release) for %s: %s",
+                len(absent_from_response), ticker, absent_from_response,
+            )
 
     new_state: EarningsAgentState = {
         **state,

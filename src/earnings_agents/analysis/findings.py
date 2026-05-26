@@ -353,19 +353,31 @@ def check_gaap_nongaap_leakage(metrics: dict[str, Any]) -> list[Finding]:
 # Composite / synonym-list key detection.
 # -----------------------------------------------------------------------------
 
-# A legitimate metric key never contains " / " or ", " between two recognisable
-# financial concepts. When the LLM copies the synonym list from the prompt
-# verbatim it produces keys like
-# "Diluted earnings per share, Diluted EPS, Diluted net income per share"
-# or "Cost of revenue / Cost of goods sold".
-_COMPOSITE_KEY_RE = re.compile(
-    # Comma- or slash-separated synonyms that each look like a metric label.
-    # Heuristic: the key contains " / " or matches two comma-separated
-    # phrase chunks that both contain finance-ish words.
-    r"(?:diluted|basic|revenue|income|cost|expense|profit|earnings|shares|loss)"
+# Detect keys that are LLM-generated synonym lists rather than real document labels.
+# Two patterns — kept separate because the rules differ:
+#
+# SLASH pattern: " / " never appears in legitimate GAAP labels, so any key that
+# matches "<finance_word> ... / ... <finance_word>" is always a composite.
+# Example: "Cost of revenue / Cost of goods sold"
+#
+# COMMA pattern: commas DO appear in real GAAP labels ("Earnings Per Share, Basic",
+# "Income (Loss) from Continuing Operations, Net of Tax, Attributable to Parent").
+# We only flag a comma-joined key when the SAME financial keyword appears both
+# before AND after the comma — the hallmark of an LLM copying a synonym bullet.
+# Example: "Diluted earnings per share, Diluted EPS" → "diluted" on both sides.
+_COMPOSITE_SLASH_RE = re.compile(
+    r"(?:diluted|basic|revenue|income|cost|expense|profit|earnings|shares|loss|eps)\b"
     r".{1,60}"
-    r"(?:,\s+|\s+/\s+)"
+    r"\s+/\s+"
     r"(?:diluted|basic|revenue|income|cost|expense|profit|earnings|shares|loss|eps|net|per\s+share)",
+    re.IGNORECASE,
+)
+
+_COMPOSITE_COMMA_RE = re.compile(
+    r"\b(diluted|basic|revenue|income|cost|expense|profit|earnings|shares|loss|eps)\b"
+    r"[^,]{1,80}"
+    r",\s+"
+    r"[^,]*\b\1\b",
     re.IGNORECASE,
 )
 
@@ -377,7 +389,10 @@ def check_composite_keys(metrics: dict[str, Any]) -> list[Finding]:
     as a key name (e.g. ``"Diluted earnings per share, Diluted EPS, ..."``).
     Severity is ``"low"``; cleanup drops them deterministically.
     """
-    bad = [k for k in metrics if _COMPOSITE_KEY_RE.search(k)]
+    bad = [
+        k for k in metrics
+        if _COMPOSITE_SLASH_RE.search(k) or _COMPOSITE_COMMA_RE.search(k)
+    ]
     if not bad:
         return []
     return [

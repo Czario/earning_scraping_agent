@@ -59,8 +59,6 @@ from earnings_agents.config import (  # noqa: E402
     MONGODB_URI,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
-    OPENAI_API_KEY,
-    OPENAI_MODEL,
 )
 from earnings_agents.nodes.detect_document_type import detect_document_type_node  # noqa: E402
 from earnings_agents.workflow import build_graph  # noqa: E402
@@ -115,10 +113,6 @@ def _check_ollama() -> tuple[bool, str]:
 
 def _check_llm() -> tuple[bool, str]:
     """Return (ok, detail) for the selected LLM provider configuration."""
-    if LLM_PROVIDER == "openai":
-        if not OPENAI_API_KEY:
-            return False, "OpenAI API key missing (set OPENAI_API_KEY in .env)"
-        return True, f"OpenAI configured — model '{OPENAI_MODEL}'"
     if LLM_PROVIDER == "groq":
         if not GROQ_API_KEY:
             return False, "Groq API key missing (set GROQ_API_KEY in .env)"
@@ -316,8 +310,6 @@ def _dry_run_company(
                 printer(
                     "  Action  : Start Ollama and pull the required model (see OLLAMA_MODEL in .env)"
                 )
-            elif LLM_PROVIDER == "openai":
-                printer("  Action  : Set OPENAI_API_KEY (and optionally OPENAI_MODEL) in .env")
             else:
                 printer("  Action  : Set GROQ_API_KEY (and optionally GROQ_MODEL) in .env")
         if not mongo_ok:

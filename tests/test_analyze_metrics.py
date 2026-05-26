@@ -349,6 +349,20 @@ def test_composite_key_clean_metrics_returns_empty():
     assert check_composite_keys(metrics) == []
 
 
+@pytest.mark.parametrize("key", [
+    "Earnings Per Share, Basic",
+    "Earnings Per Share, Diluted",
+    "Weighted Average Number of Shares Outstanding, Basic",
+    "Weighted Average Number of Shares Outstanding, Diluted",
+    "Income (Loss) from Continuing Operations, Net of Tax, Attributable to Parent",
+    "Other Comprehensive Income (Loss), Net of Tax, Portion Attributable to Parent",
+    "Other Comprehensive Income (Loss), Cash Flow Hedge, Gain (Loss), after Reclassification and Tax",
+])
+def test_composite_key_does_not_flag_real_gaap_labels(key):
+    """Legitimate GAAP labels with commas must not be treated as synonym lists."""
+    assert check_composite_keys({key: 1.23}) == []
+
+
 def test_composite_key_recorded_by_analyze_node_no_reextract():
     m = _full_metrics()
     m["Diluted earnings per share, Diluted EPS, Diluted net income per share"] = 1.59

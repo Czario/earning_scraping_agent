@@ -68,7 +68,23 @@ _CONCEPT_PREFIX_RX = re.compile(r"(?:us-gaap|system|ifrs-full|dei|srt):", re.IGN
 _MEMBER_RX = re.compile(
     r"(?:us-gaap|system|ifrs-full|dei|srt):([A-Za-z0-9_]+)", re.IGNORECASE
 )
+_FULL_MEMBER_RX = re.compile(
+    r"((?:us-gaap|ifrs-full|dei|srt):[A-Za-z0-9_]+Member)", re.IGNORECASE
+)
 _CAMEL_SPLIT_RX = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def _extract_member_tag(raw: str) -> str:
+    """Return the full XBRL member concept tag from a raw label string.
+
+    Raw dimensional labels look like::
+
+        "Net sales\\n\\n\\nus-gaap:ProductMember"
+
+    Returns the full tag (e.g. ``"us-gaap:ProductMember"``) or ``""``.
+    """
+    m = _FULL_MEMBER_RX.search(raw)
+    return m.group(1) if m else ""
 
 
 def _clean_label(raw: str) -> tuple[str, str]:
@@ -118,7 +134,13 @@ def get_statement_concepts(
 
     Each returned dict has keys: ``_id`` (str), ``concept`` (GAAP name),
     ``label`` (cleaned, disambiguated only when needed), ``path``,
-    ``statement_type``.
+    ``statement_type``, ``taxonomy_key`` (stable XBRL identity used as the
+    JSON key in the extraction prompt and as the mapping key back to
+    ``concept_id``).
+
+    ``system:``-prefixed concepts (``calculated: True``) are excluded — they
+    are derived metrics owned by the downstream normaliser, not values that
+    appear in an earnings press release.
 
     Rows whose ``label`` is empty after cleanup are dropped with a debug log.
     When two rows in the same statement collapse to the same base label, the
@@ -143,22 +165,47 @@ def get_statement_concepts(
             "label": 1,
             "path": 1,
             "statement_type": 1,
+            "calculated": 1,
         },
     ).sort("path", 1)
 
     # First pass: collect rows with cleaned labels.
-    parsed: list[tuple[dict[str, Any], str, str]] = []
+    parsed: list[tuple[dict[str, Any], str, str, str]] = []  # (doc, head, member, member_tag)
     base_counts: dict[tuple[str, str], int] = {}
     for d in cursor:
-        head, member = _clean_label(d.get("label", ""))
+        concept = d.get("concept", "") or ""
+        # Skip system:/calculated rows — derived metrics owned by the downstream
+        # normaliser; not present in earnings press releases.
+        calculated = d.get("calculated")
+        if concept.lower().startswith("system:") or calculated in (True, "True", "true"):
+            logger.debug(
+                "get_statement_concepts: skipping calculated/system concept %r "
+                "(cik=%s)",
+                concept, cik,
+            )
+            continue
+        raw_label = d.get("label", "")
+        head, member = _clean_label(raw_label)
         if not head:
             logger.debug(
                 "get_statement_concepts: dropping concept with empty label "
                 "(cik=%s concept=%s raw_label=%r)",
-                cik, d.get("concept"), d.get("label"),
+                cik, concept, raw_label,
             )
             continue
-        parsed.append((d, head, member))
+        # Skip XBRL axis/dimension definition rows — these are structural
+        # taxonomy labels (e.g. "AOCI Attributable to Parent [Member]",
+        # "Gift Card Programs [Member]") that never carry reportable values
+        # in an earnings press release and only add noise to the LLM prompt.
+        if head.endswith((" [Member]", " [Axis]", " [Domain]", " [Table]", " [Line Items]")):
+            logger.debug(
+                "get_statement_concepts: skipping XBRL structural label %r "
+                "(cik=%s concept=%s)",
+                head, cik, concept,
+            )
+            continue
+        member_tag = _extract_member_tag(raw_label)
+        parsed.append((d, head, member, member_tag))
         key = (d.get("statement_type", ""), head.lower())
         base_counts[key] = base_counts.get(key, 0) + 1
 
@@ -166,7 +213,8 @@ def get_statement_concepts(
     # row in the same statement; emit dedup_key to drop exact duplicates.
     out: list[dict[str, Any]] = []
     seen_final: set[tuple[str, str]] = set()
-    for d, head, member in parsed:
+    for d, head, member, member_tag in parsed:
+        concept = d.get("concept", "") or ""
         base_key = (d.get("statement_type", ""), head.lower())
         if base_counts[base_key] > 1 and member:
             final_label = f"{head} ({member})"
@@ -177,17 +225,21 @@ def get_statement_concepts(
             logger.debug(
                 "get_statement_concepts: dropping duplicate label %r "
                 "(cik=%s concept=%s)",
-                final_label, cik, d.get("concept"),
+                final_label, cik, concept,
             )
             continue
         seen_final.add(final_key)
+        # Build stable XBRL taxonomy key: base concept alone, or
+        # base|member for dimensional rows sharing the same GAAP tag.
+        taxonomy_key = f"{concept}|{member_tag}" if member_tag else concept
         out.append(
             {
                 "_id": str(d["_id"]),
-                "concept": d.get("concept", ""),
+                "concept": concept,
                 "label": final_label,
                 "path": d.get("path", ""),
                 "statement_type": d.get("statement_type", ""),
+                "taxonomy_key": taxonomy_key,
             }
         )
     return out
