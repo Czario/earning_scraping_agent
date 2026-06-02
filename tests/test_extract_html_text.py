@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from earnings_agents.nodes.extract_html_text import (
     _classify_table,
     _get_table_context,
+    _llm_classify_other_batch,
 )
 
 
@@ -234,3 +235,76 @@ class TestClassifyFromHTML:
         ctx = _get_table_context(table)
         ttype = _classify_table(table.get_text(" ", strip=True), ctx)
         assert ttype == "non_gaap"
+
+
+# ── _llm_classify_other_batch ────────────────────────────────────────────────
+
+
+class _FakeLLM:
+    """Minimal LLM stub: always returns the given JSON string."""
+
+    def __init__(self, response: str) -> None:
+        self._response = response
+
+    def invoke(self, prompt: str) -> str:  # noqa: ARG002
+        return self._response
+
+
+class TestLlmClassifyOtherBatch:
+    def test_all_useful_returns_all_true(self):
+        llm = _FakeLLM('{"0": true, "1": true}')
+        result = _llm_classify_other_batch(
+            [("Revenue 81,615 Cost 20,458", ""), ("Gross profit 61,157", "")],
+            llm,
+        )
+        assert result == [True, True]
+
+    def test_mixed_useful_and_skip(self):
+        llm = _FakeLLM('{"0": true, "1": false}')
+        result = _llm_classify_other_batch(
+            [("Revenue 81,615", ""), ("Toshiya Hari toshiyah@nvidia.com", "")],
+            llm,
+        )
+        assert result == [True, False]
+
+    def test_footnote_table_returns_false(self):
+        llm = _FakeLLM('{"0": false}')
+        result = _llm_classify_other_batch(
+            [("(A) Acquisition-related costs Cost of revenue: 47 R&D: 167", "")],
+            llm,
+        )
+        assert result == [False]
+
+    def test_parse_error_falls_back_to_all_true(self):
+        llm = _FakeLLM("not json at all")
+        result = _llm_classify_other_batch(
+            [("table A", ""), ("table B", "")],
+            llm,
+        )
+        assert result == [True, True]
+
+    def test_missing_index_falls_back_to_true(self):
+        # JSON only has "0", missing "1" → default True for "1"
+        llm = _FakeLLM('{"0": false}')
+        result = _llm_classify_other_batch(
+            [("table A", ""), ("table B", "")],
+            llm,
+        )
+        assert result == [False, True]
+
+    def test_empty_candidates_returns_empty(self):
+        llm = _FakeLLM("{}")
+        assert _llm_classify_other_batch([], llm) == []
+
+    def test_context_and_table_appear_in_prompt(self):
+        received: list[str] = []
+
+        class _CaptureLLM:
+            def invoke(self, prompt: str) -> str:
+                received.append(prompt)
+                return '{"0": true}'
+
+        _llm_classify_other_batch([("TABLE CONTENT", "HEADING TEXT")], _CaptureLLM())
+        assert "TABLE CONTENT" in received[0]
+        assert "HEADING TEXT" in received[0]
+

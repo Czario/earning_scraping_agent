@@ -112,7 +112,9 @@ TABLE PRIORITY — when the same metric appears in multiple tables, prefer this 
   Use the plain metric label from table (1); never prefix keys with "GAAP " or "Non-GAAP ".
 
 Return ONLY a flat JSON object — no markdown fences, no extra text, no nested objects.
-Every value must be a number or null. NEVER produce {{"Key": {{"SubKey": value}}}} — that is
+Every value must be a plain number or null. NEVER produce arithmetic expressions or
+formulas (e.g. do NOT write "15929 - 540 + 102" — use null if you cannot determine
+the exact number). NEVER produce {{"Key": {{"SubKey": value}}}} — that is
 a nested object and is illegal. If a metric has sub-categories, create separate flat keys.
 
 FIRST field must be "__scale__":
@@ -237,11 +239,32 @@ IGNORE — do NOT extract:
   • Balance sheet items, cash flow items, non-GAAP metrics, guidance / forecasts.
   • Any table from a GAAP-to-Non-GAAP reconciliation.
   • Percentage metrics (margins, growth rates).
+  • Values from FOOTNOTES or parenthetical sub-tables (e.g. "Stock-based
+    compensation included in the above", supplementary breakdowns). A genuine
+    income-statement line item is a primary row of the main statement, not a
+    footnote disclosure. If R&D, S&M, or G&A appears both as a primary row
+    AND inside a footnote, take ONLY the primary-row value (the larger one).
 
 TABLE PRIORITY: prefer the primary condensed GAAP income statement. Skip Non-GAAP tables.
 
+PERIOD RULE — CRITICAL when multiple period columns are present:
+  Earnings statements show side-by-side columns (e.g. current quarter | year-ago
+  quarter). Extract numeric values ONLY from the MOST RECENT period column —
+  the column whose header carries the latest date / highest year. NEVER take a
+  value from a prior-year or comparison column. If a metric appears under
+  several columns, use ONLY the value beneath the most-recent column header.
+
+INTERNAL CONSISTENCY — sanity-check before returning:
+  The values you pick from a single column must reconcile:
+    Revenue − Cost of revenue = Gross profit
+  If your chosen Cost of revenue is larger than Revenue, or this subtraction
+  does not match the printed Gross profit, you have taken a value from the
+  WRONG column or the wrong row — re-read the statement and correct it.
+
 Return ONLY a flat JSON object — no markdown fences, no extra text.
-Every value must be a number or null.
+Every value must be a plain number or null. NEVER write arithmetic expressions or
+formulas as a value (e.g. do NOT write "15929 - 540 + 102" — use null if you cannot
+determine the exact number from the table directly).
 
 FIRST field must be "__scale__":
   "millions", "thousands", "billions", or "as-is" (no table).
@@ -300,6 +323,7 @@ def _llm_map_concepts(
     extracted_keys: list[str],
     unmapped_concepts: list[dict],
     llm: object,
+    already_used_keys: set[str] | None = None,
 ) -> dict[str, str]:
     """Ask the LLM to semantically match *extracted_keys* to *unmapped_concepts*.
 
@@ -309,6 +333,8 @@ def _llm_map_concepts(
     Guardrails:
     - LLM can only pick from the supplied *extracted_keys* list (no hallucination).
     - Each extracted key is used at most once (first assignment wins).
+    - Keys in *already_used_keys* (Tier-1 deterministic matches) are excluded
+      from the pool so the LLM cannot reassign them to a different concept.
     - Non-string or null LLM return values are discarded.
     """
     if not extracted_keys or not unmapped_concepts:
@@ -340,7 +366,7 @@ def _llm_map_concepts(
         return {}
 
     valid_keys = set(extracted_keys)
-    used_keys: set[str] = set()
+    used_keys: set[str] = set(already_used_keys) if already_used_keys else set()
     result: dict[str, str] = {}
     for concept_id, matched_key in mapping.items():
         if not isinstance(matched_key, str):
@@ -576,19 +602,176 @@ _SECTION_CHUNK_LABELS: list[tuple[str, str]] = [
     ("other",            "FINANCIAL DATA"),
 ]
 
+# Reverse map: chunk-header label → section key. Used to recover the source
+# statement of a parsed chunk result so the merge step can prefer the value
+# from a primary GAAP statement over the same key leaking from a supplementary
+# ("other") table.
+_LABEL_TO_SECTION: dict[str, str] = {label: key for key, label in _SECTION_CHUNK_LABELS}
+
+# Merge authority — LOWER number wins. A numeric metric is taken from the
+# highest-authority section that reported it; values from lower-authority
+# sections (e.g. a segment summary in the "other" bucket) are NEVER averaged
+# in. A line item belongs to exactly one primary statement, so 0-2 never
+# collide for the same real key; the decisive gap is GAAP-statement (0-2) vs
+# supplementary/unknown (3-4).
+_SECTION_PRIORITY: dict[str, int] = {
+    "income_statement": 0,
+    "balance_sheet": 1,
+    "cash_flow": 2,
+    "other": 3,
+}
+_UNKNOWN_SECTION_PRIORITY = 4
+
+
+def _section_of_chunk(chunk_text: str) -> str:
+    """Recover the section key from a chunk's ``=== LABEL ===`` header.
+
+    Returns ``"unknown"`` for char-split / PDF chunks that carry no header.
+    """
+    if not chunk_text.startswith("=== "):
+        return "unknown"
+    end = chunk_text.find(" ===", 4)
+    if end == -1:
+        return "unknown"
+    label = chunk_text[4:end].strip()
+    return _LABEL_TO_SECTION.get(label, "unknown")
+
+
+_INCOME_STATEMENT_KEY_RX = re.compile(
+    r"revenue|gross\s+profit|cost\s+of\s+(revenue|sales|goods\s+sold)|"
+    r"operating\s+income|net\s+income|earnings\s+per\s+share|"
+    r"interest\s+(income|expense)|income\s+tax|research\s+and\s+development|"
+    r"selling,\s*general\s+and\s+administrative|operating\s+expenses",
+    re.I,
+)
+_BALANCE_SHEET_KEY_RX = re.compile(
+    r"total\s+assets|assets\b|liabilit|equity|shareholders'\s+equity|"
+    r"stockholders'\s+equity|inventory|accounts\s+receivable|accounts\s+payable",
+    re.I,
+)
+_CASH_FLOW_KEY_RX = re.compile(
+    r"cash\s+flow|net\s+cash|operating\s+activities|investing\s+activities|"
+    r"financing\s+activities|capital\s+expenditures|depreciation",
+    re.I,
+)
+
+
+def _infer_section_for_metric_key(metric_key: str) -> str | None:
+    """Infer likely statement section for a metric key.
+
+    Used only for retry-scoping hints from analysis findings.
+    """
+    if _INCOME_STATEMENT_KEY_RX.search(metric_key):
+        return "income_statement"
+    if _BALANCE_SHEET_KEY_RX.search(metric_key):
+        return "balance_sheet"
+    if _CASH_FLOW_KEY_RX.search(metric_key):
+        return "cash_flow"
+    return None
+
+
+def _find_flagged_chunk_indices(
+    findings: list[dict],
+    chunk_metric_sources: dict[str, list[int]],
+) -> set[int]:
+    """Return absolute chunk indices that produced high-severity flagged metrics.
+
+    Looks up each flagged metric key in *chunk_metric_sources* (metric key →
+    list of absolute chunk indices from the previous pass) to find the exact
+    chunks that contributed wrong values.  Only high/critical findings are
+    considered — medium/low issues do not warrant a targeted re-extract.
+
+    Returns an empty set when no specific chunks can be identified (e.g., all
+    flagged metrics are *missing* rather than wrong — we don't know which chunk
+    should have contained them; the caller falls back to section-level scoping
+    for those).
+    """
+    if not chunk_metric_sources:
+        return set()
+    flagged: set[int] = set()
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        if str(f.get("severity", "")).lower() not in ("high", "critical", "error"):
+            continue
+        for k in (f.get("keys") or []):
+            if isinstance(k, str) and k in chunk_metric_sources:
+                flagged.update(chunk_metric_sources[k])
+    return flagged
+
+
+def _infer_retry_sections(state: EarningsAgentState) -> set[str]:
+    """Infer which statement sections should be re-extracted on retry passes.
+
+    Returns an empty set when no scoped retry can be inferred, signalling that
+    the caller should process all chunks.
+    """
+    sections: set[str] = set()
+    findings = state.get("findings") or []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        if str(f.get("severity", "")).lower() != "high":
+            continue
+
+        finding_type = str(f.get("type", "")).lower()
+        text_blob = " ".join(
+            s
+            for s in [
+                str(f.get("message", "")),
+                str(f.get("suggested_action", "")),
+            ]
+            if s
+        ).lower()
+
+        if finding_type == "identity_violation":
+            if "balance" in text_blob:
+                sections.add("balance_sheet")
+            else:
+                sections.add("income_statement")
+
+        if "income statement" in text_blob:
+            sections.add("income_statement")
+        if "balance sheet" in text_blob:
+            sections.add("balance_sheet")
+        if "cash flow" in text_blob:
+            sections.add("cash_flow")
+
+        for k in f.get("keys") or []:
+            if not isinstance(k, str):
+                continue
+            inferred = _infer_section_for_metric_key(k)
+            if inferred:
+                sections.add(inferred)
+
+    # Fall back to extraction_notes when findings are absent or coarse.
+    notes = str(state.get("extraction_notes") or "").lower()
+    if "income statement" in notes:
+        sections.add("income_statement")
+    if "balance sheet" in notes:
+        sections.add("balance_sheet")
+    if "cash flow" in notes:
+        sections.add("cash_flow")
+
+    return sections
+
 
 def _build_section_chunks(
     raw_sections: dict | None,
     target_concepts: list[dict] | None = None,
 ) -> list[str] | None:
-    """Return one chunk per classified GAAP table, or None if unavailable.
+    """Return chunks of classified GAAP tables, or None if unavailable.
 
     When the HTML extractor has classified tables (``raw_sections`` present),
-    each GAAP table is sent to the LLM as its own chunk \u2014 no char-based
-    splitting, no overlap, no risk of a table row being cut in half between
-    two chunks.  Non-GAAP reconciliation tables are skipped entirely because
-    none of their values map to the GAAP income-statement / balance-sheet /
-    cash-flow registries.
+    tables are assembled in statement order (income → balance → cash → other)
+    and then split by ``_chunk_text`` using the configured ``_CHUNK_SIZE``.
+    This means:
+    - With Groq (CHUNK_SIZE=400 000): all tables in one LLM call — no merge needed.
+    - With Ollama (CHUNK_SIZE=6 000): split into per-table chunks as before.
+
+    Non-GAAP reconciliation tables are skipped entirely because none of their
+    values map to the GAAP income-statement / balance-sheet / cash-flow
+    registries.
 
     When ``target_concepts`` is non-empty (normalize_data mode), only sections
     whose ``statement_type`` matches at least one targeted concept are
@@ -603,9 +786,11 @@ def _build_section_chunks(
     if not raw_sections:
         return None
 
-    allowed_keys: set[str] | None = None
     if target_concepts:
-        allowed_keys = {
+        # Targeted mode (normalize_data): only send sections that match at
+        # least one concept's statement_type.  Always include "other" as a
+        # catch-all for supplementary tables.
+        allowed_keys: set[str] = {
             (c.get("statement_type") or "").strip().lower()
             for c in target_concepts
             if c.get("statement_type")
@@ -613,14 +798,27 @@ def _build_section_chunks(
         allowed_keys.discard("")
         if allowed_keys:
             allowed_keys.add("other")
+    else:
+        # Generic earnings mode: extraction is scoped to income statement only
+        # (balance sheet and cash-flow items are intentionally excluded — see
+        # critical_metrics.py).  "other" is kept as a fallback for documents
+        # where the HTML extractor failed to classify the income statement
+        # (e.g. everything lands in "FINANCIAL DATA").
+        allowed_keys = {"income_statement", "other"}
 
-    chunks: list[str] = []
+    # Assemble all selected table entries into one ordered text block, then
+    # split by _CHUNK_SIZE.  With a large CHUNK_SIZE (Groq) everything lands
+    # in one chunk; with a small CHUNK_SIZE (Ollama) it splits per table.
+    parts: list[str] = []
     for key, label in _SECTION_CHUNK_LABELS:
-        if allowed_keys is not None and key not in allowed_keys:
+        if key not in allowed_keys:
             continue
         for entry in raw_sections.get(key) or []:
-            chunks.append(f"=== {label} ===\n{entry}")
-    return chunks or None
+            parts.append(f"=== {label} ===\n{entry}")
+    if not parts:
+        return None
+    combined = "\n\n".join(parts)
+    return _chunk_text(combined, _CHUNK_SIZE, _CHUNK_OVERLAP)
 
 
 def _prescan_document(raw_text: str) -> tuple[str | None, str | None, str | None]:
@@ -726,59 +924,173 @@ def _parse_llm_response(
     return parsed
 
 
-def _merge_metrics(results: list[dict[str, Any]], source_text: str = "") -> dict[str, Any]:
+def _merge_metrics(
+    results: list[dict[str, Any]],
+    source_text: str = "",
+    target_year: int | None = None,
+    sections: list[str] | None = None,
+) -> dict[str, Any]:
     """Merge per-chunk extraction dicts into one dict of all discovered metrics.
 
     Strategy per key:
-    - Numeric values: median of all non-null chunk values.  Chunks that return
-      an unscaled outlier or a prior-year figure are outvoted by the majority.
-      When values diverge by more than 10 %, a warning is logged.
+    - Numeric values: taken from the **highest-authority statement section**
+      that reported the key, never averaged across sections.  A financial line
+      item belongs to exactly one primary GAAP statement, so a value that
+      appears in both the income-statement chunk and a supplementary
+      ("other"/segment) chunk must come from the income statement — averaging
+      the two corrupts it (the historical "median of two = phantom average"
+      bug).  *sections* is a list parallel to *results* giving each chunk's
+      section key (``"income_statement"``, ``"balance_sheet"``, ``"cash_flow"``,
+      ``"other"`` or ``"unknown"``); when absent (char-split / PDF), all chunks
+      share equal authority and the prior median-of-values behaviour applies.
+      Within the single winning section, the median is used as a defensive
+      tie-breaker if that section was split across multiple chunks.
+    - When *target_year* is supplied (from the SEC submissions API
+      ``reportDate``), chunks whose ``__period__`` field embeds a *different*
+      year are treated as stale (prior-year comparison column) and excluded
+      from numeric merging; a stale value is still a last-resort fallback for
+      keys absent from every on-target chunk.  Chunks with no ``__period__``
+      are treated as on-target so they are never spuriously discarded.
     - String values: longest non-null wins (most descriptive period label,
       narrative text, etc.).
     - Dollar-amount fields that are implausibly small relative to the largest
       revenue-like value are discarded (unscaled table cells) after merging.
     """
-    # Pass 1: collect all non-null values per key across every chunk.
-    numeric_candidates: dict[str, list[float]] = {}
-    string_candidates: dict[str, list[str]] = {}
+    # Per-result section authority (lower = higher authority). Parallel to
+    # *results*; defaults to equal/unknown authority when sections unavailable.
+    if sections is not None and len(sections) == len(results):
+        priorities = [
+            _SECTION_PRIORITY.get(s, _UNKNOWN_SECTION_PRIORITY) for s in sections
+        ]
+    else:
+        priorities = [_UNKNOWN_SECTION_PRIORITY] * len(results)
+    paired: list[tuple[dict[str, Any], int]] = list(zip(results, priorities))
 
-    for result in results:
-        for key, value in result.items():
-            if value is None:
-                continue
-            if isinstance(value, (int, float)):
-                numeric_candidates.setdefault(key, []).append(float(value))
-            elif isinstance(value, str):
-                string_candidates.setdefault(key, []).append(value)
+    # ── Period-year partitioning ──────────────────────────────────────────────
+    # Split chunks into "on-target" (period year matches target_year, or unknown)
+    # and "stale" (period year is a different year, e.g. prior-year column).
+    def _chunk_period_year(chunk: dict[str, Any]) -> int | None:
+        period = chunk.get("__period__")
+        if not isinstance(period, str):
+            return None
+        m = re.search(r"\b(20\d{2}|19\d{2})\b", period)
+        return int(m.group(1)) if m else None
+
+    if target_year is not None:
+        on_target: list[tuple[dict[str, Any], int]] = []
+        stale: list[tuple[dict[str, Any], int]] = []
+        for chunk, prio in paired:
+            cy = _chunk_period_year(chunk)
+            if cy is None or cy == target_year:
+                on_target.append((chunk, prio))
+            else:
+                stale.append((chunk, prio))
+        if stale:
+            logger.info(
+                "_merge_metrics: %d/%d chunk(s) declared stale period year "
+                "(target=%d) — excluded from numeric merge, kept as fallback",
+                len(stale), len(results), target_year,
+            )
+    else:
+        on_target = list(paired)
+        stale = []
+
+    # ── Pass 1: collect non-null values per key ──────────────────────────────
+    # Numeric values are collected as (value, section_priority) pairs so the
+    # merge step can prefer the highest-authority section.
+    def _collect(
+        chunks: list[tuple[dict[str, Any], int]],
+    ) -> tuple[dict[str, list[tuple[float, int]]], dict[str, list[str]]]:
+        num: dict[str, list[tuple[float, int]]] = {}
+        strs: dict[str, list[str]] = {}
+        for result, prio in chunks:
+            for key, value in result.items():
+                if value is None:
+                    continue
+                if isinstance(value, (int, float)):
+                    num.setdefault(key, []).append((float(value), prio))
+                elif isinstance(value, str):
+                    strs.setdefault(key, []).append(value)
+        return num, strs
+
+    num_on, str_on = _collect(on_target)
+    num_stale, str_stale = _collect(stale)
+
+    # Build final candidate sets: on-target wins; stale is fallback only.
+    numeric_candidates: dict[str, list[tuple[float, int]]] = {}
+    for key in set(num_on) | set(num_stale):
+        if key in num_on:
+            numeric_candidates[key] = num_on[key]
+        else:
+            logger.debug(
+                "_merge_metrics: %r only in stale chunk(s) — including as fallback",
+                key,
+            )
+            numeric_candidates[key] = num_stale[key]
+
+    string_candidates: dict[str, list[str]] = {}
+    for key in set(str_on) | set(str_stale):
+        string_candidates[key] = str_on.get(key) or str_stale.get(key, [])
 
     merged: dict[str, Any] = {}
 
-    # Numeric: median of all non-null chunk values — resistant to outlier chunks.
-    for key, values in numeric_candidates.items():
+    # Numeric: take the value from the highest-authority section that reported
+    # the key (income statement > balance sheet > cash flow > other > unknown).
+    # Values from lower-authority sections are NEVER averaged in — a line item
+    # has one true value in one statement. The median is only a tie-breaker
+    # within the single winning section (defends against a split table).
+    for key, pairs in numeric_candidates.items():
+        best_prio = min(p for _, p in pairs)
+        values = [v for v, p in pairs if p == best_prio]
         n = len(values)
         if n == 1:
             merged[key] = values[0]
         else:
             sorted_vals = sorted(values)
-            median = (
-                sorted_vals[n // 2]
-                if n % 2
-                else (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
-            )
             lo, hi = sorted_vals[0], sorted_vals[-1]
             denom = max(abs(lo), abs(hi))
-            if denom > 0 and (hi - lo) / denom > 0.10:
+            # When values differ by ≥5× the smallest, the low value(s) are
+            # almost certainly footnote / amortization-breakdown artifacts
+            # that share a key label with the primary P&L line (e.g. NVDA's
+            # "(A) Acquisition-related costs in Cost of revenue: $47M" vs
+            # the real "Cost of revenue: $20,458M").  Take the maximum.
+            if abs(lo) > 0 and abs(hi) / abs(lo) >= 5.0:
                 logger.warning(
-                    "Metric %r: chunks reported diverging values %s; using median %.6g",
-                    key, sorted_vals, median,
+                    "Metric %r: section authority %d — values differ by %.1fx "
+                    "%s; taking max %.6g (smaller value(s) likely footnote artifacts)",
+                    key, best_prio, abs(hi) / abs(lo), sorted_vals, hi,
                 )
-            merged[key] = median
+                merged[key] = hi
+            else:
+                median = (
+                    sorted_vals[n // 2]
+                    if n % 2
+                    else (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
+                )
+                if denom > 0 and (hi - lo) / denom > 0.10:
+                    logger.warning(
+                        "Metric %r: section authority %d reported diverging values "
+                        "%s; using median %.6g",
+                        key, best_prio, sorted_vals, median,
+                    )
+                merged[key] = median
 
     # String: longest non-null wins (most descriptive wins, e.g. full period name).
     # Never clobbers a numeric result for the same key.
+    # Exception: __period__ prefers the candidate whose embedded year is the
+    # highest (most recent) — "Three Months Ended April 27, 2025" is the
+    # prior-year comparison period and is longer than "First Quarter Fiscal
+    # 2027" but contains a stale year.
+    def _period_year(s: str) -> int:
+        m = re.search(r"\b(20\d{2}|19\d{2})\b", s)
+        return int(m.group(1)) if m else 0
+
     for key, values in string_candidates.items():
         if key not in merged:
-            merged[key] = max(values, key=len)
+            if key == "__period__":
+                merged[key] = max(values, key=_period_year)
+            else:
+                merged[key] = max(values, key=len)
 
     # Sanity check: find the largest "revenue"-labelled value as reference.
     revenue_ref = max(
@@ -824,11 +1136,68 @@ def _merge_metrics(results: list[dict[str, Any]], source_text: str = "") -> dict
             # Non-major metrics below threshold are kept as-is — they can be
             # legitimately small (e.g. $26 M investing item for an $80 B company).
 
+    # ── Case-duplicate dedup (stale-chunk fallback eviction) ─────────────────
+    # When target_year filtering was active, some keys in *merged* came
+    # exclusively from stale (prior-year) chunks as a last-resort fallback.
+    # If a case-duplicate of that key also exists from on-target chunks, the
+    # stale-only variant is wrong and must be dropped so it never reaches
+    # concept mapping in normalize_data.
+    #
+    # Example: "Cost of revenue" = 20.458B (on-target) and
+    #          "Cost of Revenue" = 48B     (stale fallback only)
+    # → drop "Cost of Revenue"; keep "Cost of revenue".
+    #
+    # Rule: for each group of keys that share the same lowercased+collapsed
+    # form, if at least one came from on-target chunks AND at least one came
+    # only from stale chunks, remove the stale-only keys.
+    # When ALL keys in a group are stale-only (the metric genuinely only
+    # appears in the comparison column), they are all retained as-is.
+    if stale:
+        def _nk(s: str) -> str:
+            return re.sub(r"\s+", " ", s).strip().lower()
+
+        # Which numeric keys came from on-target chunks?
+        on_target_keys: set[str] = set(num_on)
+
+        # Build groups: normalized_form → [actual_key, ...]
+        norm_groups: dict[str, list[str]] = {}
+        for k in list(merged):
+            norm_groups.setdefault(_nk(k), []).append(k)
+
+        for group_keys in norm_groups.values():
+            if len(group_keys) <= 1:
+                continue
+            ot = [k for k in group_keys if k in on_target_keys]
+            stale_only = [k for k in group_keys if k not in on_target_keys]
+            if ot and stale_only:
+                for k in stale_only:
+                    logger.debug(
+                        "_merge_metrics: evicting stale-only case-duplicate %r "
+                        "(on-target variant %r = %s retained)",
+                        k, ot[0], merged.get(ot[0]),
+                    )
+                    merged.pop(k, None)
+
     # Drop keys where the final value is None to keep the stored document clean.
     # Note: duplicate / synonym folding is handled downstream by the
     # constrained LLM cleanup_metrics_node, not here. Keys are preserved
     # exactly as the LLM extracted them (matching company wording).
     return {k: v for k, v in merged.items() if v is not None}
+
+
+def _target_year_from_report_date(report_date_str: str | None) -> int | None:
+    """Extract the calendar year from a ``sec_report_date`` ``'YYYY-MM-DD'`` string.
+
+    Returns ``None`` when the string is absent or unparseable, which disables
+    the period-year partition in ``_merge_metrics`` (all chunks treated equally).
+    """
+    if not report_date_str:
+        return None
+    try:
+        from datetime import date as _d
+        return _d.fromisoformat(report_date_str).year
+    except ValueError:
+        return None
 
 
 def _find_first(
@@ -1050,16 +1419,11 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     attempt_num = state.get("extraction_attempts", 0) + 1
     logger.info("Extraction pass %d for %s", attempt_num, ticker)
 
-    # Provider escalation: use Groq on attempts 2+ when the default provider
-    # is Ollama and a Groq key is available.  Ollama attempt 1 is cheaper/faster;
-    # Groq retries use the scout model which handles complex layouts better.
+    # Provider selection: always use the configured LLM_PROVIDER for every
+    # attempt. There is no automatic Ollama→Groq escalation — retries stay on
+    # the same provider. (Escalation was removed because an unfixable identity
+    # violation forced 3 passes onto Groq's free tier and triggered 429s.)
     escalated_provider: str | None = None
-    if attempt_num > 1 and LLM_PROVIDER == "ollama" and GROQ_API_KEY:
-        escalated_provider = "groq"
-        logger.info(
-            "Escalating extraction to Groq for %s (pass %d — Ollama attempt 1 had high-severity findings)",
-            ticker, attempt_num,
-        )
 
     # Pre-scan the full document once for scale and reporting period.
     # Injecting confirmed values into every chunk prompt eliminates the most
@@ -1079,15 +1443,39 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         f"set __scale__ = \"{doc_scale}\" for this chunk.\n"
         if doc_scale else ""
     )
-    period_hint = (
-        f"CONFIRMED PERIOD: current reporting period is \"{doc_period}\" — "
-        f"set __period__ = \"{doc_period}\" and extract values from this column only. "
-        f"Do NOT extract guidance, forecasts, or next-quarter projections.\n"
-        if doc_period else (
-            "IMPORTANT: extract values from the MOST RECENT ACTUAL reported quarter only. "
-            "Do NOT extract guidance, forecasts, or next-quarter projections.\n"
+
+    # Period hint: prefer the authoritative SEC reportDate when present.
+    # The SEC submissions API returns the exact filing period-end date which
+    # is always the current quarter — unlike a prescan hit that can pick up
+    # the prior-year comparison column header instead.
+    sec_report_date_str: str | None = state.get("sec_report_date")  # type: ignore[assignment]
+    if sec_report_date_str:
+        try:
+            from datetime import date as _date
+            _rd = _date.fromisoformat(sec_report_date_str)
+            _formatted = _rd.strftime("%B %-d, %Y")  # e.g. "April 27, 2026"
+            period_hint = (
+                f"CONFIRMED PERIOD: the current reporting period ends {_formatted} "
+                f"(per SEC filing) — extract values from the column with this date. "
+                f"If multiple columns share this end date but cover different durations "
+                f"(e.g. both 'Three Months Ended' and 'Nine Months Ended' end on {_formatted}), "
+                f"always choose the SHORTEST duration — the single-quarter column, "
+                f"NOT the year-to-date column. "
+                f"Do NOT extract guidance, forecasts, or next-quarter projections.\n"
+            )
+        except ValueError:
+            sec_report_date_str = None  # fall through to prescan
+
+    if not sec_report_date_str:
+        period_hint = (
+            f"CONFIRMED PERIOD: current reporting period is \"{doc_period}\" — "
+            f"set __period__ = \"{doc_period}\" and extract values from this column only. "
+            f"Do NOT extract guidance, forecasts, or next-quarter projections.\n"
+            if doc_period else (
+                "IMPORTANT: extract values from the MOST RECENT ACTUAL reported quarter only. "
+                "Do NOT extract guidance, forecasts, or next-quarter projections.\n"
+            )
         )
-    )
 
     # Load static human-curated company hints (if any) — injected on every pass.
     company_hints = _load_company_hints(ticker)
@@ -1099,8 +1487,21 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     if company_hints:
         focus_hint_parts.append(f"Company-specific extraction hints:\n{company_hints}")
     if extraction_notes:
+        # On retry passes, frame the notes explicitly as a correction so the
+        # LLM treats them as high-priority errors to fix, not advisory hints.
         focus_hint_parts.append(
-            f"Additional focus from quality review (pass {attempt_num}):\n{extraction_notes}"
+            f"""⚠  CORRECTION REQUIRED — PASS {attempt_num} RETRY
+
+The previous extraction pass produced values that failed accounting identity
+checks. The analysis below shows EXACTLY what was wrong. Read it carefully
+before extracting values from this chunk — the error is almost always reading
+from the WRONG column (prior-year instead of current-period).
+
+{extraction_notes}
+
+Double-check: after you choose values for Revenue, Cost of revenue and Gross
+profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
+"""
         )
     focus_hint = ("\n" + "\n".join(focus_hint_parts) + "\n") if focus_hint_parts else ""
 
@@ -1113,6 +1514,69 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         chunks = _chunk_text(raw_text)
         chunk_source = "char"
     total = len(chunks)
+    # Section provenance per chunk (parallel to `chunks`). Section chunks carry
+    # a `=== LABEL ===` header identifying their GAAP statement; char/PDF chunks
+    # are "unknown". Threaded into `_merge_metrics` so income-statement values
+    # are never averaged with the same key leaking from a supplementary table.
+    chunk_sections_all = (
+        [_section_of_chunk(c) for c in chunks]
+        if chunk_source == "section"
+        else ["unknown"] * total
+    )
+
+    scoped_retry = False
+    # Track absolute chunk indices (positions in the full _build_section_chunks
+    # output) for each element of `chunks` post-scoping. Used to build
+    # per-metric chunk provenance that is stored in state and consumed by the
+    # next retry pass to target specific chunks rather than whole sections.
+    chunk_abs_indices: list[int] = list(range(total))
+
+    if attempt_num > 1 and chunk_source == "section":
+        # ── Chunk-level scoped retry (most precise) ───────────────────────
+        # Use provenance from the previous pass to target only the specific
+        # chunks that produced flagged metrics.  For metrics that are *missing*
+        # (not in provenance), fall back to section-level scoping so we still
+        # look in the right statement tables.
+        prev_sources: dict[str, list[int]] = state.get("chunk_metric_sources") or {}
+        findings_for_retry: list[dict] = state.get("findings") or []
+        flagged_chunk_ids = _find_flagged_chunk_indices(findings_for_retry, prev_sources)
+
+        retry_sections = _infer_retry_sections(state)
+        # Add section-level chunks for metrics that are missing (not in provenance).
+        section_chunk_ids = {
+            i for i, s in enumerate(chunk_sections_all)
+            if s in retry_sections
+        }
+
+        selected_set = flagged_chunk_ids | section_chunk_ids
+        selected = sorted(selected_set)
+
+        if selected and len(selected) < total:
+            chunks = [chunks[i] for i in selected]
+            chunk_sections_all = [chunk_sections_all[i] for i in selected]
+            chunk_abs_indices = selected
+            total = len(chunks)
+            scoped_retry = True
+            if flagged_chunk_ids and flagged_chunk_ids != section_chunk_ids:
+                logger.info(
+                    "Retry pass %d for %s: chunk-level scope — %d specific chunk(s) "
+                    "%s + %d section chunk(s) from %s = %d total",
+                    attempt_num,
+                    ticker,
+                    len(flagged_chunk_ids),
+                    sorted(flagged_chunk_ids),
+                    len(section_chunk_ids - flagged_chunk_ids),
+                    sorted(retry_sections),
+                    total,
+                )
+            else:
+                logger.info(
+                    "Retry pass %d for %s scoped to section(s) %s: %d chunk(s)",
+                    attempt_num,
+                    ticker,
+                    sorted(retry_sections),
+                    total,
+                )
     logger.info(
         "Extracting metrics for %s across %d %s chunk(s)",
         ticker, total, chunk_source,
@@ -1227,9 +1691,14 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
             )
 
     chunk_results: list[dict[str, Any]] = []
+    chunk_result_sections: list[str] = []
+    # Parallel to chunk_results: absolute chunk index for each successful result.
+    chunk_result_abs_indices: list[int] = []
     for i, result in enumerate(ordered, start=1):
         if result is not None:
             chunk_results.append(result)
+            chunk_result_sections.append(chunk_sections_all[i - 1])
+            chunk_result_abs_indices.append(chunk_abs_indices[i - 1])
             logger.info("Chunk %d/%d extracted for %s: %d metric(s)", i, total, ticker, len(result))
         else:
             logger.warning("Chunk %d/%d could not be parsed for %s after retries", i, total, ticker)
@@ -1242,7 +1711,40 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
             "error": f"All {total} chunk(s) failed to extract metrics for {ticker} (pass {attempt_num})",
         }
 
-    metrics = _merge_metrics(chunk_results, source_text=raw_text)
+    # Build per-metric provenance: metric key → list of absolute chunk indices
+    # that reported a non-null value for it.  Stored in state so the next retry
+    # pass can target specific chunks rather than retrying whole sections.
+    new_metric_sources: dict[str, list[int]] = {}
+    for result, abs_idx in zip(chunk_results, chunk_result_abs_indices):
+        for key, value in result.items():
+            if value is not None and not key.startswith("__"):
+                new_metric_sources.setdefault(key, []).append(abs_idx)
+
+    # On scoped retry: merge with existing provenance (new pass overwrites
+    # provenance for retried keys; untouched keys keep their previous sources).
+    if scoped_retry:
+        prev_sources_for_merge: dict[str, list[int]] = state.get("chunk_metric_sources") or {}
+        chunk_metric_sources_out = {**prev_sources_for_merge, **new_metric_sources}
+    else:
+        chunk_metric_sources_out = new_metric_sources
+
+    metrics = _merge_metrics(
+        chunk_results,
+        source_text=raw_text,
+        target_year=_target_year_from_report_date(sec_report_date_str),
+        sections=chunk_result_sections,
+    )
+
+    # On retry passes, keep untouched metrics from the previous pass and
+    # overwrite only keys returned by the retried chunk(s).  This applies to
+    # both scoped retries (only a subset of chunks re-run) and full retries
+    # (all chunks re-run but some keys the LLM returns as null were already
+    # correct from pass 1).
+    if scoped_retry or attempt_num > 1:
+        prev_metrics = state.get("metrics")
+        if isinstance(prev_metrics, dict):
+            metrics = {**prev_metrics, **metrics}
+
     metrics, identity_warnings = _validate_metrics(metrics)
     logger.info("Merged %d metric(s) for %s: %s", len(metrics), ticker, list(metrics.keys()))
 
@@ -1269,13 +1771,18 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
             _norm_label(c["label"]): c["_id"] for c in target_concepts
         }
         concept_metrics = {}
+        concept_id_to_metric_key: dict[str, str] = {}  # reverse map for mapped_metric_keys
         for key, value in metrics.items():
             if not isinstance(value, (int, float)):
                 continue
             if key in exact_label_to_id:
-                concept_metrics[exact_label_to_id[key]] = float(value)
+                cid = exact_label_to_id[key]
+                concept_metrics[cid] = float(value)
+                concept_id_to_metric_key[cid] = key
             elif _norm_label(key) in norm_label_to_id:
-                concept_metrics[norm_label_to_id[_norm_label(key)]] = float(value)
+                cid = norm_label_to_id[_norm_label(key)]
+                concept_metrics[cid] = float(value)
+                concept_id_to_metric_key[cid] = key
 
         # ── Tier 2: LLM semantic mapping for residual unmapped concepts ─────
         mapped_ids = set(concept_metrics.keys())
@@ -1289,11 +1796,17 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
             )
             map_timeout = GROQ_REQUEST_TIMEOUT if escalated_provider == "groq" else _OLLAMA_REQUEST_TIMEOUT
             map_llm = build_llm(format_json=True, request_timeout=map_timeout, provider=escalated_provider)
-            llm_matches = _llm_map_concepts(numeric_keys, unmapped_concepts, map_llm)
+            llm_matches = _llm_map_concepts(
+                numeric_keys,
+                unmapped_concepts,
+                map_llm,
+                already_used_keys=set(concept_id_to_metric_key.values()),
+            )
             for concept_id, matched_key in llm_matches.items():
                 value = metrics.get(matched_key)
                 if isinstance(value, (int, float)):
                     concept_metrics[concept_id] = float(value)
+                    concept_id_to_metric_key[concept_id] = matched_key
                     logger.debug(
                         "LLM semantic mapping: %r → concept_id %s for %s",
                         matched_key, concept_id, ticker,
@@ -1327,7 +1840,9 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
         # non-empty would leave stale warnings in state and could incorrectly
         # block a save that should succeed.
         "identity_warnings": identity_warnings,
+        "chunk_metric_sources": chunk_metric_sources_out,
     }
     if concept_metrics is not None:
         new_state["concept_metrics"] = concept_metrics
+        new_state["mapped_metric_keys"] = list(concept_id_to_metric_key.values())
     return new_state

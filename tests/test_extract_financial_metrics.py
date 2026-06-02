@@ -114,6 +114,86 @@ def test_extraction_fails_when_no_raw_text():
     assert "No raw text" in result["error"]
 
 
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+def test_first_attempt_runs_all_section_chunks(mock_llm_cls):
+    """When table sections are available, attempt 1 combines income_statement
+    and other sections into a single chunk (balance_sheet and cash_flow are
+    excluded from generic earnings extraction).  With a large CHUNK_SIZE (Groq)
+    all included sections fit in one LLM call.
+    """
+    mock_llm = MagicMock()
+    mock_llm.invoke.side_effect = [
+        '{"Revenues": 1000000000, "Operating expenses": 250000000}',
+    ]
+    mock_llm_cls.return_value = mock_llm
+
+    result = extract_financial_metrics_node(
+        _base_state(
+            file_type="html",
+            raw_sections={
+                "income_statement": ["income table"],
+                "balance_sheet": ["balance table"],   # excluded in generic mode
+                "other": ["supplemental table"],
+            },
+            raw_text="Quarter data",
+        )
+    )
+
+    assert result["status"] == "extracted"
+    # income_statement + other are combined; balance_sheet is excluded.
+    # With CHUNK_SIZE large enough for both sections → 1 LLM call.
+    assert mock_llm.invoke.call_count == 1
+    assert result["metrics"]["Revenues"] == pytest.approx(1_000_000_000)
+    assert result["metrics"]["Operating expenses"] == pytest.approx(250_000_000)
+
+
+@patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+def test_retry_scopes_to_income_statement_and_preserves_other_sections(mock_llm_cls):
+    """Retry passes (attempt_num > 1) carry forward untouched metrics from the
+    previous pass and overwrite only the keys returned by the new extraction.
+    """
+    mock_llm = MagicMock()
+    mock_llm.invoke.return_value = (
+        '{"Revenues": 81615000000, "Cost of Revenue": 20458000000, "Gross Profit": 61157000000}'
+    )
+    mock_llm_cls.return_value = mock_llm
+
+    prev_metrics = {
+        "Cash and cash equivalents": 10_000_000_000,
+        "Cost of Revenue": 10_252_500_000,  # bad prior value to be overwritten
+    }
+    state = _base_state(
+        file_type="html",
+        raw_sections={
+            "income_statement": ["income table"],
+            "other": ["other table"],
+        },
+        raw_text="Quarter data",
+        extraction_attempts=1,  # this call is pass 2
+        metrics=prev_metrics,
+        findings=[
+            {
+                "type": "identity_violation",
+                "severity": "high",
+                "message": "Income-statement identity broken",
+                "keys": ["Revenues", "Cost of Revenue", "Gross Profit"],
+                "suggested_action": "Re-extract from the same current-period income statement column.",
+            }
+        ],
+        extraction_notes="focus on income statement metrics",
+    )
+
+    result = extract_financial_metrics_node(state)
+
+    assert result["status"] == "extracted"
+    # Only income_statement chunk re-run on retry.
+    assert mock_llm.invoke.call_count == 1
+    # Retried section overwrites bad prior value.
+    assert result["metrics"]["Cost of Revenue"] == pytest.approx(20_458_000_000)
+    # Untouched sections preserved from previous pass.
+    assert result["metrics"]["Cash and cash equivalents"] == pytest.approx(10_000_000_000)
+
+
 def test_merge_null_chunks_do_not_block_real_values():
     """Null in one chunk does not prevent a real value in another chunk from being kept."""
     chunks = [
@@ -182,6 +262,248 @@ def test_merge_preserves_synonym_variants_for_llm_cleanup():
     assert merged["Total revenue"] == pytest.approx(82_886_000_000)
     assert merged["Operating Income"] == pytest.approx(38_398_000_000)
     assert merged["Operating income"] == pytest.approx(38_398_000_000)
+
+
+def test_merge_target_year_filters_stale_chunks():
+    """Chunks whose __period__ year doesn't match target_year are excluded from
+    numeric merge. Their values are only used as last-resort fallback for keys
+    that appear nowhere else.
+
+    Mirrors the NVIDIA Q1 FY2027 scenario:
+      - Chunk 3 correctly extracts from the current-year column (April 27, 2026)
+      - Chunk 4 mistakenly extracts from the prior-year column (April 27, 2025)
+    With target_year=2026 only chunk 3's values should be used for Revenue.
+    """
+    chunks = [
+        # on-target chunk: current-year column (period contains 2026)
+        {
+            "__period__": "Three Months Ended April 27, 2026",
+            "Revenue": 44_100_000_000,
+            "Net Income": 18_800_000_000,
+        },
+        # stale chunk: prior-year comparison column (period contains 2025)
+        {
+            "__period__": "Three Months Ended April 27, 2025",
+            "Revenue": 26_000_000_000,   # prior-year figure
+            "Net Income": 14_900_000_000,
+        },
+    ]
+    merged = _merge_metrics(chunks, target_year=2026)
+
+    # On-target chunk wins for keys present in both
+    assert merged["Revenue"] == pytest.approx(44_100_000_000)
+    assert merged["Net Income"] == pytest.approx(18_800_000_000)
+
+
+def test_merge_stale_chunk_value_used_as_fallback_for_unique_key():
+    """A key that only appears in a stale chunk is still included as a fallback
+    (it may be a legitimate metric not repeated in the current-year column).
+    """
+    chunks = [
+        {
+            "__period__": "Three Months Ended April 27, 2026",
+            "Revenue": 44_100_000_000,
+        },
+        {
+            "__period__": "Three Months Ended April 27, 2025",
+            "Revenue": 26_000_000_000,
+            "Prior Year EPS": 0.77,   # only appears in stale chunk
+        },
+    ]
+    merged = _merge_metrics(chunks, target_year=2026)
+
+    assert merged["Revenue"] == pytest.approx(44_100_000_000)
+    # Falls back to stale value since it's the only source
+    assert merged["Prior Year EPS"] == pytest.approx(0.77)
+
+
+def test_merge_no_target_year_unchanged_behaviour():
+    """When target_year=None (IR path, no SEC data) all chunks contribute equally
+    — identical to the pre-filtering behaviour.
+    """
+    chunks = [
+        {
+            "__period__": "Three Months Ended April 27, 2026",
+            "Revenue": 44_100_000_000,
+        },
+        {
+            "__period__": "Three Months Ended April 27, 2025",
+            "Revenue": 26_000_000_000,
+        },
+    ]
+    merged = _merge_metrics(chunks, target_year=None)
+    # Median of [26B, 44.1B] = 35.05B
+    assert merged["Revenue"] == pytest.approx(35_050_000_000)
+
+
+def test_merge_chunk_with_no_period_treated_as_on_target():
+    """Chunks with a null or absent __period__ are treated as on-target so they
+    are never spuriously discarded when target_year filtering is active.
+    """
+    chunks = [
+        # no __period__ — cannot classify → treated as on-target
+        {"Revenue": 44_100_000_000, "Net Income": 18_800_000_000},
+        # stale chunk
+        {
+            "__period__": "Three Months Ended April 27, 2025",
+            "Revenue": 26_000_000_000,
+        },
+    ]
+    merged = _merge_metrics(chunks, target_year=2026)
+
+    # Unclassified chunk is on-target → Revenue = 44.1B (not median with stale)
+    assert merged["Revenue"] == pytest.approx(44_100_000_000)
+    assert merged["Net Income"] == pytest.approx(18_800_000_000)
+
+
+def test_merge_evicts_stale_case_duplicate_keeps_on_target():
+    """When a case-duplicate pair exists where one came from on-target chunks
+    and the other only from stale chunks, the stale-only variant is dropped.
+
+    Mirrors the NVDA scenario:
+      - 'Cost of revenue' = 20.458B from on-target chunk (correct)
+      - 'Cost of Revenue' = 48B from stale chunk only (wrong prior-year value)
+    Expected: only 'Cost of revenue' survives in merged output.
+    """
+    chunks = [
+        # on-target: current-year column
+        {
+            "__period__": "Three Months Ended April 27, 2026",
+            "Revenue": 81_615_000_000,
+            "Cost of revenue": 20_458_000_000,   # correct
+        },
+        # stale: prior-year comparison column
+        {
+            "__period__": "Three Months Ended April 27, 2025",
+            "Revenue": 26_000_000_000,
+            "Cost of Revenue": 48_000_000_000,   # wrong stale-only duplicate
+        },
+    ]
+    merged = _merge_metrics(chunks, target_year=2026)
+
+    # Correct on-target variant retained
+    assert merged["Cost of revenue"] == pytest.approx(20_458_000_000)
+    # Wrong stale-only case-duplicate evicted
+    assert "Cost of Revenue" not in merged
+
+
+def test_merge_keeps_stale_case_duplicate_when_no_on_target_variant():
+    """When both case variants appear only in stale chunks (the metric genuinely
+    only exists in the comparison section), both are retained — no eviction.
+    """
+    chunks = [
+        # on-target: no cost-of-revenue at all
+        {
+            "__period__": "Three Months Ended April 27, 2026",
+            "Revenue": 81_615_000_000,
+        },
+        # stale: both variants only in stale chunks
+        {
+            "__period__": "Three Months Ended April 27, 2025",
+            "Cost of revenue": 20_000_000_000,
+            "Cost of Revenue": 20_000_000_000,
+        },
+    ]
+    merged = _merge_metrics(chunks, target_year=2026)
+
+    # Both kept as fallback — no on-target variant exists to prefer
+    assert "Cost of revenue" in merged or "Cost of Revenue" in merged
+
+
+def test_merge_prefers_authoritative_section_over_other_table():
+    """A numeric metric is taken from its primary GAAP statement, never averaged
+    with the same key leaking from a supplementary ('other') table.
+
+    Mirrors the NVDA phantom-average bug: the income-statement chunk reports
+    Cost of revenue = 20.458B, a segment/'other' chunk reports a different
+    number for the same key. The old median-of-two merge produced their average
+    (a phantom '.5' value). With section provenance, the income-statement value
+    must win outright.
+    """
+    chunks = [
+        {"Cost of revenue": 20_458_000_000},   # income statement
+        {"Cost of revenue": 47_000_000},        # leaked from a segment table
+    ]
+    sections = ["income_statement", "other"]
+    merged = _merge_metrics(chunks, sections=sections)
+
+    # Income-statement value wins outright — NOT the average (10_252_500_000).
+    assert merged["Cost of revenue"] == pytest.approx(20_458_000_000)
+
+
+def test_merge_within_same_section_falls_back_to_median():
+    """When the winning (highest-authority) section is split across multiple
+    chunks that disagree, the median is the defensive tie-breaker within that
+    section only.
+    """
+    chunks = [
+        {"Total Revenue": 80_000_000_000},
+        {"Total Revenue": 80_000_000_000},
+        {"Total Revenue": 80_000},  # unscaled outlier, same section
+    ]
+    sections = ["income_statement", "income_statement", "income_statement"]
+    merged = _merge_metrics(chunks, sections=sections)
+
+    # Median within the income-statement section resists the outlier.
+    assert merged["Total Revenue"] == pytest.approx(80_000_000_000)
+
+
+def test_merge_footnote_artifact_takes_max_when_values_differ_5x():
+    """When same-section values differ by ≥5×, the smaller value(s) are
+    footnote/amortization artifacts; the maximum (real P&L figure) is chosen.
+
+    Mirrors NVDA Q1FY27: R&D appears as $6,321M (income statement) and
+    $167M (footnote amortization breakdown), yielding a bogus median of
+    ~$3,244M without this fix.
+    """
+    chunks = [
+        {"Research and development": 6_321_000_000},  # real P&L line
+        {"Research and development": 167_000_000},    # footnote artifact
+    ]
+    # Both chunks are "other" (same priority) — no section authority to distinguish.
+    sections = ["other", "other"]
+    merged = _merge_metrics(chunks, sections=sections)
+    assert merged["Research and development"] == pytest.approx(6_321_000_000)
+
+
+def test_merge_moderate_divergence_still_uses_median():
+    """When values differ by less than 5×, the median tie-breaker is still used
+    (legitimate rounding / multi-chunk split, not a footnote artifact).
+    """
+    chunks = [
+        {"Operating expenses": 7_500_000_000},
+        {"Operating expenses": 7_700_000_000},
+    ]
+    sections = ["income_statement", "income_statement"]
+    merged = _merge_metrics(chunks, sections=sections)
+    assert merged["Operating expenses"] == pytest.approx(7_600_000_000)
+
+
+def test_merge_without_sections_keeps_median_behaviour():
+    """When no section provenance is supplied (char-split / PDF chunks), all
+    chunks share equal authority and the prior median-of-values behaviour holds.
+    """
+    chunks = [
+        {"Net Income": 30_000_000_000},
+        {"Net Income": 32_000_000_000},
+    ]
+    merged = _merge_metrics(chunks)  # no sections argument
+    assert merged["Net Income"] == pytest.approx(31_000_000_000)
+
+
+def test_targeted_prompt_enforces_column_and_consistency_rules():
+    """Guard: the targeted prompt must keep the Phase-2 column / footnote /
+    consistency rules that prevent prior-year and footnote-value leakage.
+    """
+    from earnings_agents.nodes.extract_financial_metrics import _TARGETED_PROMPT_TEMPLATE
+
+    t = _TARGETED_PROMPT_TEMPLATE
+    # Most-recent-column rule
+    assert "MOST RECENT period column" in t
+    # Footnote / sub-table exclusion
+    assert "FOOTNOTES" in t
+    # Internal-consistency identity
+    assert "Revenue \u2212 Cost of revenue = Gross profit" in t
 
 
 def test_scale_millions_applied_by_python():
@@ -396,15 +718,9 @@ def test_save_gate_blocks_when_identity_warnings_and_strict():
 
 
 def test_save_gate_saves_with_warnings_when_lenient(monkeypatch):
-    """When STRICT_ACCURACY is False the document is upserted with warnings attached."""
+    """When STRICT_ACCURACY is False the node proceeds past the identity gate."""
     import earnings_agents.workflow as wf
 
-    captured: dict = {}
-
-    def _fake_upsert(doc):
-        captured["doc"] = doc
-
-    monkeypatch.setattr(wf, "upsert_earnings", _fake_upsert)
     state = {
         "ticker": "TEST",
         "company_name": "Test Co",
@@ -413,6 +729,7 @@ def test_save_gate_saves_with_warnings_when_lenient(monkeypatch):
         "metrics": {"Revenue": 1},
         "identity_warnings": ["Gross margin drift 5%"],
         "status": "extracted",
+        # No concept_metrics/cik → normalize_data upsert is skipped with a warning
     }
     original = wf.STRICT_ACCURACY
     wf.STRICT_ACCURACY = False
@@ -421,7 +738,6 @@ def test_save_gate_saves_with_warnings_when_lenient(monkeypatch):
     finally:
         wf.STRICT_ACCURACY = original
     assert result["status"] == "saved"
-    assert captured["doc"]["identity_warnings"] == ["Gross margin drift 5%"]
 
 
 # ---------------------------------------------------------------------------
@@ -597,17 +913,17 @@ class TestLoadCompanyHints:
 
 
 # ---------------------------------------------------------------------------
-# Provider escalation
+# Provider selection (escalation removed)
 # ---------------------------------------------------------------------------
 
 class TestProviderEscalation:
-    """Verify that extraction attempt 2+ escalates to Groq when configured."""
+    """Escalation was removed: every attempt uses the configured LLM_PROVIDER."""
 
     @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
     @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
-    def test_attempt_2_escalates_to_groq(self, mock_build_llm):
-        """Second extraction pass passes provider='groq' to build_llm."""
+    def test_attempt_2_does_not_escalate_to_groq(self, mock_build_llm):
+        """Second extraction pass stays on the default provider (provider=None)."""
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = '{"Net income": 5000000000}'
         mock_build_llm.return_value = mock_llm
@@ -616,7 +932,7 @@ class TestProviderEscalation:
         extract_financial_metrics_node(state)
 
         call_kwargs = mock_build_llm.call_args.kwargs
-        assert call_kwargs.get("provider") == "groq"
+        assert call_kwargs.get("provider") is None
 
     @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
     @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
@@ -633,16 +949,16 @@ class TestProviderEscalation:
         call_kwargs = mock_build_llm.call_args.kwargs
         assert call_kwargs.get("provider") is None
 
-    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "")
+    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
     @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
-    def test_no_groq_key_stays_on_ollama(self, mock_build_llm):
-        """Without GROQ_API_KEY, attempt 2 stays on default provider (no escalation)."""
+    def test_attempt_3_does_not_escalate_to_groq(self, mock_build_llm):
+        """Third extraction pass also stays on the default provider."""
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = '{"Net income": 5000000000}'
         mock_build_llm.return_value = mock_llm
 
-        state = _base_state(extraction_attempts=1)
+        state = _base_state(extraction_attempts=2)
         extract_financial_metrics_node(state)
 
         call_kwargs = mock_build_llm.call_args.kwargs
@@ -651,8 +967,8 @@ class TestProviderEscalation:
     @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
     @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "groq")
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
-    def test_groq_primary_does_not_double_escalate(self, mock_build_llm):
-        """When LLM_PROVIDER is already 'groq', no escalation override is applied."""
+    def test_groq_primary_stays_on_default(self, mock_build_llm):
+        """When LLM_PROVIDER is 'groq', no provider override is applied."""
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = '{"Net income": 5000000000}'
         mock_build_llm.return_value = mock_llm
@@ -774,6 +1090,57 @@ class TestTaxonomyKeyMapping:
         # "Net sales" was hallucinated → must NOT be mapped
         cm = result.get("concept_metrics", {})
         assert "aaa111" not in cm
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_mapped_metric_keys_populated_tier1(self, mock_build_llm):
+        """Tier 1 matches must be recorded in mapped_metric_keys."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = (
+            '{"__scale__": "millions", "__period__": null,'
+            ' "Net sales": 5234, "Cost of sales": 3900}'
+        )
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(target_concepts=self._TARGET_CONCEPTS)
+        result = extract_financial_metrics_node(state)
+
+        mapped = result.get("mapped_metric_keys") or []
+        assert "Net sales" in mapped
+        assert "Cost of sales" in mapped
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_mapped_metric_keys_populated_tier2(self, mock_build_llm):
+        """Tier 2 (LLM semantic) matches must also appear in mapped_metric_keys."""
+        extraction_response = (
+            '{"__scale__": "as-is", "__period__": null,'
+            ' "Revenue from operations": 5234000000}'
+        )
+        mapping_response = (
+            '{"aaa111": "Revenue from operations", "bbb222": null, "ccc333": null}'
+        )
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = [extraction_response, mapping_response]
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(target_concepts=self._TARGET_CONCEPTS)
+        result = extract_financial_metrics_node(state)
+
+        mapped = result.get("mapped_metric_keys") or []
+        assert "Revenue from operations" in mapped
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_mapped_metric_keys_absent_when_no_target_concepts(self, mock_build_llm):
+        """Without target_concepts, mapped_metric_keys must not be set."""
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = (
+            '{"__scale__": "as-is", "__period__": null, "Revenue": 5234000000}'
+        )
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(target_concepts=None)
+        result = extract_financial_metrics_node(state)
+
+        assert "mapped_metric_keys" not in result or result.get("mapped_metric_keys") is None
 
 
 # ── _llm_map_concepts unit tests ──────────────────────────────────────────────

@@ -417,9 +417,95 @@ def check_composite_keys(metrics: dict[str, Any]) -> list[Finding]:
 
 _OPEX_TOTAL_RE = re.compile(r"^\s*total\s+operating\s+expenses\b", re.IGNORECASE)
 _OPINC_RE = re.compile(r"^\s*operating\s+income\b", re.IGNORECASE)
-_REVENUE_RE = re.compile(r"^\s*revenue\b", re.IGNORECASE)
-_COGS_RE = re.compile(r"^\s*cost\s+of\s+revenue\b", re.IGNORECASE)
+_REVENUE_RE = re.compile(r"^\s*(total\s+)?revenues?\b", re.IGNORECASE)
+_COGS_RE = re.compile(r"^\s*(total\s+)?cost\s+of\s+(revenue|goods\s+sold|sales)\b", re.IGNORECASE)
+_GROSS_PROFIT_RE = re.compile(r"^\s*gross\s+(profit|margin)\b", re.IGNORECASE)
 _OPEX_SUBTOTAL_RE = re.compile(r"^\s*operating\s+expenses\b", re.IGNORECASE)
+
+
+# -----------------------------------------------------------------------------
+# Income-statement identity:  Revenue − Cost of revenue ≈ Gross profit
+# -----------------------------------------------------------------------------
+
+# Tolerance: 1.5 % of revenue. Wide enough for legitimate rounding when
+# components are reported at different scales, tight enough to catch a
+# mis-extracted column (typically tens of percent off).
+_GP_IDENTITY_TOLERANCE = 0.015
+
+
+def check_gross_profit_identity(metrics: dict[str, Any]) -> list[Finding]:
+    """Flag when Revenue − Cost of revenue ≠ Gross profit (within tolerance).
+
+    This is the single most diagnostic income-statement invariant. When it
+    fails, at least one of the three values was extracted from the wrong
+    column (e.g. a prior-year comparison) or the wrong row. Emitted at
+    ``"high"`` severity so it triggers a targeted re-extract while attempts
+    remain — the model is told exactly which relationship is broken.
+
+    Two distinct failure modes are reported:
+      * ``cost_exceeds_revenue`` — Cost of revenue ≥ Revenue: arithmetically
+        impossible for a going concern; almost always a stale/footnote value.
+      * ``reconciliation_off``  — all three present but they do not sum.
+    """
+    rev_key, rev = _find_metric(metrics, _REVENUE_RE)
+    cogs_key, cogs = _find_metric(metrics, _COGS_RE)
+    gp_key, gp = _find_metric(metrics, _GROSS_PROFIT_RE)
+
+    # Mode 1: Cost of revenue ≥ Revenue — needs only those two values.
+    if rev is not None and cogs is not None and rev > 0 and cogs >= rev:
+        return [
+            Finding(
+                type="identity_violation",
+                severity="high",
+                message=(
+                    f"Cost of revenue ({cogs:,.0f}) ≥ Revenue ({rev:,.0f}); "
+                    f"gross profit would be negative. The value almost certainly "
+                    f"came from a prior-year column or a footnote sub-table."
+                ),
+                keys=tuple(k for k in (rev_key, cogs_key) if k),
+                suggested_action=(
+                    "Re-extract 'Cost of revenue' from the CURRENT-period column "
+                    "of the consolidated income statement only. It must be less "
+                    "than total revenue and satisfy "
+                    "Revenue − Cost of revenue = Gross profit."
+                ),
+                evidence={"revenue": rev, "cost_of_revenue": cogs},
+            )
+        ]
+
+    # Mode 2: full reconciliation — needs all three.
+    if None in (rev, cogs, gp) or rev is None or rev <= 0:
+        return []
+
+    implied_gp = float(rev) - float(cogs)
+    rel_err = abs(implied_gp - float(gp)) / float(rev)
+    if rel_err <= _GP_IDENTITY_TOLERANCE:
+        return []
+
+    return [
+        Finding(
+            type="identity_violation",
+            severity="high",
+            message=(
+                f"Income-statement identity broken: Revenue ({rev:,.0f}) − "
+                f"Cost of revenue ({cogs:,.0f}) = {implied_gp:,.0f}, but reported "
+                f"Gross profit is {gp:,.0f} (off by {rel_err * 100:.1f}% of revenue)."
+            ),
+            keys=tuple(k for k in (rev_key, cogs_key, gp_key) if k),
+            suggested_action=(
+                "Re-extract Revenue, Cost of revenue, and Gross profit from the "
+                "SAME current-period column of the consolidated income statement. "
+                "They must satisfy Revenue − Cost of revenue = Gross profit."
+            ),
+            evidence={
+                "revenue": float(rev),
+                "cost_of_revenue": float(cogs),
+                "gross_profit": float(gp),
+                "implied_gross_profit": implied_gp,
+                "relative_error": rel_err,
+            },
+        )
+    ]
 
 
 def check_opex_label_collision(metrics: dict[str, Any]) -> list[Finding]:

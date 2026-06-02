@@ -9,6 +9,7 @@ from earnings_agents.analysis.findings import (
     check_case_duplicates,
     check_composite_keys,
     check_gaap_nongaap_leakage,
+    check_gross_profit_identity,
     check_presence,
     check_sign_anomalies,
     check_suspect_round,
@@ -187,6 +188,49 @@ def test_balance_sheet_identity_flags_nvda_style_mismatch():
     assert len(findings) == 1
     assert findings[0].type == "identity_violation"
     assert findings[0].severity == "high"
+
+
+# ---------------------------------------------------------------------------
+# Gross-profit income-statement identity checker
+# ---------------------------------------------------------------------------
+
+def test_gross_profit_identity_passes_when_reconciled():
+    m = {
+        "Revenues": 81_615_000_000.0,
+        "Cost of revenue": 20_458_000_000.0,
+        "Gross profit": 61_157_000_000.0,   # 81,615 − 20,458 = 61,157
+    }
+    assert check_gross_profit_identity(m) == []
+
+
+def test_gross_profit_identity_flags_nvda_stale_cost_of_revenue():
+    # The reported defect: Cost of Revenue = 48B (stale), Gross Profit = 59.62B.
+    # 81,615 − 48,000 = 33,615 ≠ 59,620 → identity broken.
+    m = {
+        "Revenues": 81_615_000_000.0,
+        "Cost of Revenue": 48_000_000_000.0,
+        "Gross Profit": 59_620_000_000.0,
+    }
+    findings = check_gross_profit_identity(m)
+    assert len(findings) == 1
+    assert findings[0].type == "identity_violation"
+    assert findings[0].severity == "high"
+
+
+def test_gross_profit_identity_flags_cost_exceeding_revenue():
+    # Cost of revenue ≥ revenue is impossible; reported even without gross profit.
+    m = {
+        "Revenue": 26_000_000_000.0,
+        "Cost of revenue": 48_000_000_000.0,
+    }
+    findings = check_gross_profit_identity(m)
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+    assert "negative" in findings[0].message.lower()
+
+
+def test_gross_profit_identity_silent_when_components_missing():
+    assert check_gross_profit_identity({"Revenues": 81_615_000_000.0}) == []
 
 
 # ---------------------------------------------------------------------------

@@ -1,25 +1,18 @@
 """Load company GAAP concepts from normalize_data before extraction.
 
-This node is always registered in the graph but only performs meaningful work
-when ``EARNINGS_SAVE_TARGET=normalize_data``.  In the default ``earnings_db``
-mode it is a cheap no-op that sets ``target_concepts=[]`` so the generic
-extraction path is used unchanged.
-
-When active, the node:
-1. Looks up the company by ticker in normalize_data.companies.
-2. Fetches income-statement concepts from normalize_data.normalized_concepts_quarterly.
-3. Populates ``company_cik``, ``target_concepts``, and ``fiscal_year_end_month``
-   in state so ``extract_financial_metrics_node`` can build a targeted prompt.
+Looks up the company by ticker in normalize_data.companies, then fetches
+income-statement concepts from normalize_data.normalized_concepts_quarterly.
+Populates ``company_cik``, ``target_concepts``, and ``fiscal_year_end_month``
+in state so ``extract_financial_metrics_node`` can build a targeted prompt.
 
 Failure is always graceful: if the company is not found or the DB is
 unreachable the node falls back to ``target_concepts=[]`` and lets the
-generic extraction proceed.  It never sets ``status=failed``.
+generic income-statement extraction proceed.  It never sets ``status=failed``.
 """
 from __future__ import annotations
 
 import logging
 
-from earnings_agents.config import EARNINGS_SAVE_TARGET
 from earnings_agents.tools.normalize_data_client import (
     get_company_by_ticker,
     get_statement_concepts,
@@ -30,21 +23,12 @@ logger = logging.getLogger(__name__)
 
 
 def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
-    """Conditionally load GAAP concepts for targeted extraction.
+    """Load GAAP concepts for targeted extraction from normalize_data.
 
-    Returns state unchanged (with ``target_concepts=[]``) when
-    ``EARNINGS_SAVE_TARGET`` is not ``"normalize_data"``.
+    Falls back to ``target_concepts=[]`` (generic extraction) when the company
+    is not found in the DB or the DB is unreachable.
     """
     ticker = state["ticker"]
-
-    if EARNINGS_SAVE_TARGET != "normalize_data":
-        return {
-            **state,
-            "target_concepts": [],
-            "company_cik": None,
-            "fiscal_year_end_month": None,
-            "fiscal_year_end_code": None,
-        }
 
     try:
         company = get_company_by_ticker(ticker)

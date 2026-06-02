@@ -321,6 +321,20 @@ def cleanup_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
         )
         remove = [k for k in remove if k not in unjustified]
 
+    # Guardrail 1c: never remove a key that was confirmed mapped to a concept_id.
+    # These keys are verified real document metrics (Tier 1 label match or Tier 2
+    # LLM semantic match against the company's XBRL taxonomy).  The cleanup LLM
+    # has no access to that mapping and cannot be trusted to override it.
+    protected_keys = set(state.get("mapped_metric_keys") or [])
+    if protected_keys:
+        concept_blocked = [k for k in remove if k in protected_keys]
+        if concept_blocked:
+            logger.warning(
+                "Cleanup LLM tried to remove concept-mapped key(s) for %s — blocked: %s",
+                ticker, concept_blocked,
+            )
+            remove = [k for k in remove if k not in protected_keys]
+
     cleaned = {k: v for k, v in metrics.items() if k not in remove}
 
     # Guardrail 2: surviving keys must be byte-identical to inputs.

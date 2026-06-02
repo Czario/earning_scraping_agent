@@ -45,6 +45,17 @@ class EarningsAgentState(TypedDict):
     concept_metrics: NotRequired[Optional[dict]]    # concept_id → float for normalize_data upsert
     fiscal_year_end_month: NotRequired[Optional[int]]
     fiscal_year_end_code: NotRequired[Optional[str]]  # raw MMDD string, e.g. "0130" or "1231"
+    # Keys in metrics{} that were successfully matched to a concept_id during
+    # targeted extraction (Tier 1 exact/normalised label match or Tier 2 LLM
+    # semantic match).  Populated by extract_financial_metrics_node; consumed
+    # by cleanup_metrics_node as a protected set that the LLM cannot remove.
+    mapped_metric_keys: NotRequired[Optional[list[str]]]
+    # ── SEC-derived reporting period ────────────────────────────────────────
+    # ``reportDate`` from the EDGAR submissions API — the period-end date for
+    # the filing as declared to the SEC ("YYYY-MM-DD" string).  Set by the
+    # CLI SEC path; absent (None) on the IR path.  Used as the authoritative
+    # end date for normalize_data upserts and for the extraction period hint.
+    sec_report_date: NotRequired[Optional[str]]
     # ── Table-aware HTML extraction ─────────────────────────────────────────
     # Populated by extract_html_text_node when GAAP tables are classified.
     # Maps section type ('income_statement', 'balance_sheet', 'cash_flow',
@@ -53,3 +64,9 @@ class EarningsAgentState(TypedDict):
     # GAAP table instead of char-based chunking — eliminates chunk divergence
     # on numeric values that straddle char boundaries.
     raw_sections: NotRequired[Optional[dict]]
+    # Per-metric chunk provenance from the most recent extraction pass.
+    # Maps metric key → list of 0-based chunk indices (into the ordered chunk
+    # list) that reported a non-null value for that key.  Used by the scoped
+    # retry logic to re-run only the specific chunk(s) that contributed a
+    # problematic metric, rather than all chunks in a section.
+    chunk_metric_sources: NotRequired[Optional[dict]]  # str → list[int]

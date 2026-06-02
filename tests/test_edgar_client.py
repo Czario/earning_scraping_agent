@@ -13,7 +13,9 @@ def test_normalize_cik():
     assert normalize_cik("0000320193") == "0000320193"
 
 
-def _mock_submissions(forms, items, accessions, primary_docs):
+def _mock_submissions(
+    forms, items, accessions, primary_docs, report_dates=None, filing_dates=None
+):
     return {
         "filings": {
             "recent": {
@@ -21,6 +23,8 @@ def _mock_submissions(forms, items, accessions, primary_docs):
                 "items": items,
                 "accessionNumber": accessions,
                 "primaryDocument": primary_docs,
+                "reportDate": report_dates or [""] * len(forms),
+                "filingDate": filing_dates or [""] * len(forms),
             }
         }
     }
@@ -70,6 +74,7 @@ def test_finds_exhibit_99_from_8k_item_202(mock_get):
         items=["2.02,9.01", ""],
         accessions=["0000320193-26-000011", "0000320193-25-000010"],
         primary_docs=["aapl-20260430.htm", "aapl-10q.htm"],
+        report_dates=["2026-03-29", ""],
     )
 
     index_resp = MagicMock()
@@ -78,11 +83,12 @@ def test_finds_exhibit_99_from_8k_item_202(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url = get_latest_earnings_url("0000320193")
+    url, report_date = get_latest_earnings_url("0000320193")
 
     assert url is not None
     assert "ex991pressrelease.htm" in url
     assert url.startswith("https://www.sec.gov")
+    assert report_date == "2026-03-29"
 
 
 @patch("earnings_agents.tools.edgar_client.requests.get")
@@ -103,7 +109,7 @@ def test_falls_back_to_first_8k_when_no_item_202(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url = get_latest_earnings_url("0000789019")
+    url, report_date = get_latest_earnings_url("0000789019")
     # Falls back to primary doc since no EX-99.1 in index
     assert url is not None
     assert "msft-8k.htm" in url
@@ -122,8 +128,9 @@ def test_returns_none_when_no_8k_filings(mock_get):
     )
     mock_get.return_value = resp
 
-    url = get_latest_earnings_url("0001234567")
+    url, report_date = get_latest_earnings_url("0001234567")
     assert url is None
+    assert report_date is None
 
 
 @patch("earnings_agents.tools.edgar_client.requests.get")
@@ -132,8 +139,9 @@ def test_returns_none_on_submissions_api_error(mock_get):
     import requests as req
     mock_get.side_effect = req.RequestException("timeout")
 
-    url = get_latest_earnings_url("0000320193")
+    url, report_date = get_latest_earnings_url("0000320193")
     assert url is None
+    assert report_date is None
 
 
 @patch("earnings_agents.tools.edgar_client.requests.get")
@@ -149,6 +157,7 @@ def test_falls_back_to_primary_doc_when_index_fails(mock_get):
         items=["2.02,9.01"],
         accessions=["0000320193-26-000011"],
         primary_docs=["aapl-20260430.htm"],
+        report_dates=["2026-03-29"],
     )
 
     # Provide enough RequestExceptions to exhaust all retry attempts, then the
@@ -158,10 +167,73 @@ def test_falls_back_to_primary_doc_when_index_fails(mock_get):
 
     with patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None):
         mock_get.side_effect = [submissions_resp, *index_errors]
-        url = get_latest_earnings_url("0000320193")
+        url, report_date = get_latest_earnings_url("0000320193")
 
     assert url is not None
     assert "aapl-20260430.htm" in url
+    assert report_date == "2026-03-29"
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
+def test_uses_prior_year_10q_for_period_end(mock_get):
+    """When the 8-K reportDate is the earnings announcement date (not the fiscal
+    quarter end), the prior-year same-quarter 10-Q is used to project the
+    correct period end date one year forward.
+
+    Scenario mirrors NVIDIA Q1 FY2027:
+      8-K  filingDate=2026-05-28  reportDate=2026-05-20  (announcement date — wrong)
+      10-Q filingDate=2025-05-29  reportDate=2025-04-27  (prior-year Q1 — correct end)
+    Expected period end: 2025-04-27 + 1 year = 2026-04-27
+    """
+    submissions_resp = MagicMock()
+    submissions_resp.raise_for_status = MagicMock()
+    submissions_resp.json.return_value = _mock_submissions(
+        forms=["8-K", "10-Q"],
+        items=["2.02,9.01", ""],
+        accessions=["0001045810-26-000051", "0001045810-25-000030"],
+        primary_docs=["q1fy27pr.htm", "q1fy26.htm"],
+        report_dates=["2026-05-20", "2025-04-27"],
+        filing_dates=["2026-05-28", "2025-05-29"],
+    )
+
+    index_resp = MagicMock()
+    index_resp.raise_for_status = MagicMock()
+    index_resp.text = _INDEX_HTML_WITH_EX99
+
+    mock_get.side_effect = [submissions_resp, index_resp]
+
+    url, report_date = get_latest_earnings_url("0001045810")
+
+    assert url is not None
+    # Prior-year 10-Q reportDate 2025-04-27 + 1 year → 2026-04-27 (actual quarter end)
+    assert report_date == "2026-04-27"
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
+def test_falls_back_to_raw_report_date_when_no_prior_year_10q(mock_get):
+    """When no matching prior-year 10-Q exists, the raw EDGAR reportDate is used."""
+    submissions_resp = MagicMock()
+    submissions_resp.raise_for_status = MagicMock()
+    submissions_resp.json.return_value = _mock_submissions(
+        forms=["8-K"],
+        items=["2.02,9.01"],
+        accessions=["0000320193-26-000011"],
+        primary_docs=["aapl-20260430.htm"],
+        report_dates=["2026-03-29"],
+        filing_dates=["2026-05-01"],
+    )
+
+    index_resp = MagicMock()
+    index_resp.raise_for_status = MagicMock()
+    index_resp.text = _INDEX_HTML_WITH_EX99
+
+    mock_get.side_effect = [submissions_resp, index_resp]
+
+    url, report_date = get_latest_earnings_url("0000320193")
+
+    assert url is not None
+    # No prior-year 10-Q in mock — raw reportDate returned unchanged
+    assert report_date == "2026-03-29"
 
 
 # ---------------------------------------------------------------------------

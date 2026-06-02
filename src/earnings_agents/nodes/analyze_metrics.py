@@ -25,6 +25,7 @@ from earnings_agents.analysis.findings import (
     check_case_duplicates,
     check_composite_keys,
     check_gaap_nongaap_leakage,
+    check_gross_profit_identity,
     check_opex_label_collision,
     check_presence,
     check_sign_anomalies,
@@ -66,6 +67,38 @@ def _build_extraction_notes(
     )
     for f in high:
         lines.append(f"  - [REQUIRED] {f.message}")
+        if f.suggested_action:
+            lines.append(f"      → {f.suggested_action}")
+        # For income-statement identity violations, tell the LLM exactly
+        # which value it got wrong and what the implied correct value is.
+        # This turns a vague "identity broken" message into a concrete hint:
+        # "look for a Cost of revenue row close to X, not Y".
+        if f.type == "identity_violation":
+            ev = f.evidence or {}
+            rev = ev.get("revenue")
+            cor = ev.get("cost_of_revenue")
+            gp  = ev.get("gross_profit")
+            if (
+                isinstance(rev, (int, float)) and rev
+                and isinstance(gp, (int, float))
+            ):
+                implied_cor = rev - gp
+                lines.append(f"      DIAGNOSIS — your previous extraction returned:")
+                lines.append(f"        Revenue         = {rev:>22,.0f}  (reference)")
+                if isinstance(cor, (int, float)):
+                    lines.append(
+                        f"        Cost of revenue = {cor:>22,.0f}  ← WRONG — taken from wrong column/row"
+                    )
+                lines.append(f"        Gross profit    = {gp:>22,.0f}  (reference)")
+                lines.append(
+                    f"      Revenue − Gross profit = {rev:,.0f} − {gp:,.0f} = {implied_cor:,.0f}"
+                )
+                lines.append(
+                    f"      That means Cost of revenue in the current-period column should be"
+                )
+                lines.append(
+                    f"      approximately {implied_cor:,.0f} — locate that row and use it."
+                )
     if medium:
         lines.append("Also locate these if reported:")
         for f in medium:
@@ -95,6 +128,7 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     findings.extend(check_composite_keys(metrics))
     findings.extend(check_gaap_nongaap_leakage(metrics))
     findings.extend(check_balance_sheet_identity(metrics))
+    findings.extend(check_gross_profit_identity(metrics))
     findings.extend(check_sign_anomalies(metrics))
     findings.extend(check_suspect_round(metrics))
     findings.extend(check_opex_label_collision(metrics))

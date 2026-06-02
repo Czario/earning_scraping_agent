@@ -464,6 +464,7 @@ def upsert_concept_values(
     fiscal_year_end_month: int,
     fiscal_year_end_code: str = "1231",
     statement_type: str = "income_statement",
+    report_date: date | None = None,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
@@ -471,6 +472,13 @@ def upsert_concept_values(
     depending on *period_str*:
       - "Three Months Ended …" / "Thirteen Weeks Ended …" → quarterly
       - "Year Ended …" / "Twelve Months Ended …" / "52/53 Weeks Ended …" → annual
+
+    *report_date*: when provided (sourced from the SEC submissions API
+    ``reportDate`` field), it overrides the end date that would otherwise be
+    parsed from *period_str* via ``parse_period_end_date``.  This ensures the
+    stored ``end_date`` is the exact period-end date declared to the SEC rather
+    than an LLM-extracted approximation.  *period_str* is still used for
+    duration detection (quarterly vs annual, quarter number, start date).
 
     Documents are written to match the existing schema used by the SEC-based
     pipeline, with ``concept_id`` stored as ``ObjectId`` and ``end_date`` as
@@ -483,13 +491,19 @@ def upsert_concept_values(
         logger.debug("upsert_concept_values: empty concept_metrics — nothing to do")
         return 0
 
-    end_date = parse_period_end_date(period_str)
+    # Resolve the period end date: SEC reportDate override takes priority.
+    end_date = report_date or parse_period_end_date(period_str)
     if end_date is None:
         logger.warning(
             "upsert_concept_values: cannot parse period end date from %r — skipping",
             period_str,
         )
         return 0
+    if report_date and report_date != parse_period_end_date(period_str):
+        logger.debug(
+            "upsert_concept_values: using SEC reportDate %s (period_str parsed to %s)",
+            report_date, parse_period_end_date(period_str),
+        )
 
     period_type = detect_period_type(period_str)  # "annual" | "quarterly"
     collection_name = f"concept_values_{period_type}"

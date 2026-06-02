@@ -22,11 +22,6 @@ MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")
 
-# Save target: "earnings_db" (default) saves to the earnings pipeline DB.
-# Set to "normalize_data" to also load company GAAP concepts before extraction
-# and upsert results into the normalize_data.concept_values_quarterly collection.
-EARNINGS_SAVE_TARGET: str = os.getenv("EARNINGS_SAVE_TARGET", "earnings_db").strip().lower()
-
 # Hard-coded IR URLs per company.
 # Only add a company here if you want to use its own IR website for discovery
 # instead of SEC EDGAR. Companies NOT listed here automatically fall back to
@@ -39,11 +34,20 @@ HTTP_TIMEOUT: int = 30
 # Max characters of extracted link list passed to LLM for IR discovery
 IR_PAGE_MAX_CHARS: int = 8_000
 
-# Max characters of raw document text passed to LLM for metric extraction
-EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "40000"))
+# Max characters of raw document text passed to LLM for metric extraction.
+# Groq (llama-4-scout) has a 128K token context (~512K chars) so the effective
+# cap is much higher than for local Ollama (typically 4K–8K tokens).
+_GROQ_PROVIDER = LLM_PROVIDER == "groq"
+EXTRACTION_MAX_CHARS: int = int(
+    os.getenv("EXTRACTION_MAX_CHARS", "400000" if _GROQ_PROVIDER else "40000")
+)
 
-# Chunk size and overlap for splitting raw text before LLM extraction
-CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "6000"))
+# Chunk size and overlap for splitting raw text before LLM extraction.
+# For Groq the default is large enough to fit a full press release in one chunk,
+# eliminating multi-chunk merges and retries for most documents.
+CHUNK_SIZE: int = int(
+    os.getenv("CHUNK_SIZE", "400000" if _GROQ_PROVIDER else "6000")
+)
 CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "300"))
 
 # Maximum concurrent Ollama requests across all parallel company workers.

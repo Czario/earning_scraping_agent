@@ -139,12 +139,94 @@ def normalize_cik(cik: str) -> str:
     return str(int(cik)).zfill(10)
 
 
-def get_latest_earnings_url(cik: str) -> Optional[str]:
-    """Return the URL of the most recent earnings press release (Exhibit 99.1)
-    from an 8-K Item 2.02 filing for the given CIK.
+def _infer_period_end_from_prior_year(
+    recent: dict,
+    target_filing_date_str: str,
+) -> Optional[str]:
+    """Infer the fiscal quarter-end date for an earnings 8-K.
+
+    EDGAR ``reportDate`` on 8-K filings is company-set and may be the
+    earnings *announcement* date rather than the actual fiscal quarter end.
+    A 10-Q filed for the same quarter one year earlier always carries the
+    correct ``reportDate`` = exact fiscal quarter end.  Projecting that
+    date forward one calendar year gives a reliable period-end date without
+    any additional HTTP calls.
+
+    Algorithm:
+    1. Find the 10-Q in *recent* whose ``filingDate`` is closest to
+       ``target_filing_date`` - 1 year, within a ±60-day window.
+    2. Take its ``reportDate`` and add one calendar year.
+    3. Accept only if the result is 14–100 days before ``target_filing_date``
+       (the typical window for quarterly earnings press releases).
+
+    Returns ``"YYYY-MM-DD"`` or ``None`` if no suitable prior-year 10-Q
+    is found or the sanity check fails.
+    """
+    from datetime import date as _d, timedelta
+
+    try:
+        filing_date = _d.fromisoformat(target_filing_date_str)
+    except ValueError:
+        return None
+
+    prior_year_center = filing_date.replace(year=filing_date.year - 1)
+    window = timedelta(days=60)
+
+    forms: list[str] = recent.get("form", [])
+    filing_dates: list[str] = recent.get("filingDate", [])
+    report_dates: list[str] = recent.get("reportDate", [])
+
+    best_rd: Optional[str] = None
+    best_delta = timedelta.max
+
+    for i, form in enumerate(forms):
+        if form != "10-Q":
+            continue
+        fd_str = filing_dates[i] if i < len(filing_dates) else ""
+        rd_str = report_dates[i] if i < len(report_dates) else ""
+        if not fd_str or not rd_str:
+            continue
+        try:
+            fd = _d.fromisoformat(fd_str)
+        except ValueError:
+            continue
+        delta = abs(fd - prior_year_center)
+        if delta <= window and delta < best_delta:
+            best_delta = delta
+            best_rd = rd_str
+
+    if best_rd is None:
+        return None
+
+    try:
+        prior_end = _d.fromisoformat(best_rd)
+        inferred = prior_end.replace(year=prior_end.year + 1)
+    except (ValueError, OverflowError):
+        return None
+
+    # Sanity: inferred date must be 14–100 days before the filing date.
+    days_before = (filing_date - inferred).days
+    if not 14 <= days_before <= 100:
+        logger.debug(
+            "_infer_period_end: rejected inferred=%s (%d days before filing=%s)",
+            inferred, days_before, filing_date,
+        )
+        return None
+
+    return inferred.isoformat()
+
+
+def get_latest_earnings_url(cik: str) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(filing_url, report_date)`` for the most recent earnings press
+    release (Exhibit 99.1) from an 8-K Item 2.02 filing for the given CIK.
+
+    ``report_date`` is the EDGAR ``reportDate`` field (``"YYYY-MM-DD"`` string)
+    — the period-end date for the filing as declared to the SEC.  It is the
+    authoritative source for the reporting period end date and should be
+    preferred over the LLM-extracted ``__period__`` label.
 
     Falls back to the most recent 8-K primary document if no Exhibit 99.1 is found.
-    Returns ``None`` if no 8-K filing is available.
+    Returns ``(None, None)`` if no 8-K filing is available.
     """
     cik_padded = normalize_cik(cik)
     cik_int = str(int(cik_padded))  # no leading zeros for archive paths
@@ -157,13 +239,15 @@ def get_latest_earnings_url(cik: str) -> Optional[str]:
         data = resp.json()
     except requests.RequestException as exc:
         logger.error("EDGAR submissions fetch failed for CIK %s: %s", cik_padded, exc)
-        return None
+        return None, None
 
     recent = data.get("filings", {}).get("recent", {})
     forms: list[str] = recent.get("form", [])
     items_list: list[str] = recent.get("items", [])
     accessions: list[str] = recent.get("accessionNumber", [])
     primary_docs: list[str] = recent.get("primaryDocument", [])
+    report_dates: list[str] = recent.get("reportDate", [])
+    filing_dates: list[str] = recent.get("filingDate", [])
 
     # ── 2. Find latest 8-K with Item 2.02 (earnings results) ─────────────────
     target_idx: Optional[int] = None
@@ -188,23 +272,42 @@ def get_latest_earnings_url(cik: str) -> Optional[str]:
 
     if target_idx is None:
         logger.warning("No 8-K filings found for CIK %s", cik_padded)
-        return None
+        return None, None
 
     acc = accessions[target_idx]       # e.g. "0000320193-26-000011"
     acc_nodash = acc.replace("-", "")  # e.g. "000032019326000011"
+    report_date: Optional[str] = (
+        report_dates[target_idx] if target_idx < len(report_dates) else None
+    )
+    filing_date_str: Optional[str] = (
+        filing_dates[target_idx] if target_idx < len(filing_dates) else None
+    )
+
+    # 8-K ``reportDate`` may be the announcement date rather than the fiscal
+    # quarter end (company-specific behaviour, e.g. NVIDIA).  Attempt to infer
+    # the true period end from the same-quarter 10-Q filed one year earlier —
+    # 10-Q reportDates are always the exact fiscal quarter end.
+    if filing_date_str:
+        inferred = _infer_period_end_from_prior_year(recent, filing_date_str)
+        if inferred:
+            logger.debug(
+                "CIK %s: prior-year-projected period end %s overrides raw 8-K reportDate %s",
+                cik_padded, inferred, report_date,
+            )
+            report_date = inferred
 
     # ── 3. Parse HTML filing index to find Exhibit 99.1 ──────────────────────
     ex99_url = _find_exhibit_99_in_index(cik_int, acc, acc_nodash)
     if ex99_url:
-        return ex99_url
+        return ex99_url, report_date
 
     # ── 4. Last resort: primary document from submissions metadata ────────────
     primary_doc = primary_docs[target_idx] if target_idx < len(primary_docs) else ""
     if primary_doc:
         url = f"{_EDGAR_ARCHIVES_BASE.format(cik_int=cik_int, acc_nodash=acc_nodash)}/{primary_doc}"
         logger.info("EDGAR primary doc fallback for CIK %s: %s", cik_padded, url)
-        return url
+        return url, report_date
 
     logger.warning("Could not resolve document URL for CIK %s accession %s", cik_padded, acc)
-    return None
+    return None, None
 

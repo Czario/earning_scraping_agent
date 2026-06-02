@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
+from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
 
 from earnings_agents.config import HTTP_TIMEOUT
+from earnings_agents.llm_factory import build_llm
 from earnings_agents.workflow_state import EarningsAgentState
 from earnings_agents.tools.playwright_scraper import fetch_page_js
 
@@ -58,6 +61,7 @@ _NON_GAAP_TABLE_RX = re.compile(
     r"|\bfree\s+cash\s+flow\b",
     re.I,
 )
+
 _INCOME_STMT_TABLE_RX = re.compile(
     r"statement[s]?\s+of\s+(?:operations|income|earnings|loss)"
     r"|total\s+revenue[s]?\b"
@@ -108,12 +112,19 @@ def _get_table_context(table, max_chars: int = 400) -> str:
 
 
 def _classify_table(table_text: str, context_text: str) -> str:
-    """Classify a financial table as one of five types.
+    """Classify a financial table using fast keyword regex.
+
+    Returns one of: ``'income_statement'``, ``'balance_sheet'``, ``'cash_flow'``,
+    ``'non_gaap'``, or ``'other'`` (catch-all for tables that don't match any
+    keyword pattern).
 
     ``non_gaap`` is checked against the *full* table text because reconciliation
     tables often have the key phrase ('Adjusted net income') near the bottom.
     Positive GAAP classifications use a shorter probe to avoid false matches on
     non-GAAP tables that share metric names (e.g. 'Net income as reported').
+
+    Tables that fall through to ``'other'`` are subsequently screened by
+    :func:`_llm_classify_other` inside the extraction node.
     """
     full_probe = context_text + " " + table_text
     if _NON_GAAP_TABLE_RX.search(full_probe):
@@ -126,6 +137,55 @@ def _classify_table(table_text: str, context_text: str) -> str:
     if _BALANCE_SHEET_TABLE_RX.search(short_probe):
         return "balance_sheet"
     return "other"
+
+
+_OTHER_FILTER_PROMPT = """\
+You are classifying tables from an earnings press release.
+
+For each table below, decide whether it contains PRIMARY GAAP financial statement
+data worth extracting — rows with numeric values for revenue, cost, expenses,
+income, EPS, or share counts.
+
+Mark useful=true for: primary income-statement rows, condensed GAAP summaries.
+Mark useful=false for:
+- Contact blocks (names, email addresses, phone numbers, job titles)
+- Footnote annotation tables (rows beginning with (A), (B), * etc.)
+- Supplementary stock-based compensation breakdowns
+- Guidance / outlook tables
+- Any other non-primary-statement content
+
+Tables to classify:
+{tables_block}
+
+Return ONLY a JSON object mapping each table index (as a string) to true or false:
+{{"0": true, "1": false, ...}}"""
+
+
+def _llm_classify_other_batch(
+    candidates: list[tuple[str, str]],
+    llm: Any,
+) -> list[bool]:
+    """Classify a batch of 'other' tables in a single LLM call.
+
+    ``candidates`` is a list of ``(table_text, context_text)`` pairs.
+    Returns a parallel list of booleans: ``True`` = keep, ``False`` = skip.
+    Falls back to all-True on any error so no table is silently dropped.
+    """
+    if not candidates:
+        return []
+    blocks: list[str] = []
+    for i, (table_text, context_text) in enumerate(candidates):
+        ctx = context_text[-300:].strip() or "(none)"
+        blocks.append(
+            f"Table {i}\nContext: {ctx}\nContent: {table_text[:600]}"
+        )
+    prompt = _OTHER_FILTER_PROMPT.format(tables_block="\n\n".join(blocks))
+    try:
+        raw = llm.invoke(prompt)
+        data = json.loads(raw)
+        return [bool(data.get(str(i), True)) for i in range(len(candidates))]
+    except Exception:
+        return [True] * len(candidates)  # safe fallback — keep all
 
 
 # Boilerplate section markers that contain no financial data.
@@ -250,16 +310,40 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
         }
         has_gaap_tables = False
 
+        # Pending 'other' tables — classified in one batched LLM call after the loop.
+        # Each entry: (table_markdown_entry, table_text_for_llm)
+        _other_pending: list[tuple[str, str]] = []
+
         for table in list(soup.find_all("table")):
             context = _get_table_context(table)
             table_text = table.get_text(" ", strip=True)
             ttype = _classify_table(table_text, context)
             md = _table_to_markdown(table)
             entry = (f"{context}\n" if context.strip() else "") + md
-            sections[ttype].append(entry)
-            if ttype in ("income_statement", "balance_sheet", "cash_flow"):
-                has_gaap_tables = True
+            if ttype == "other":
+                _other_pending.append((entry, table_text, context))
+            else:
+                sections[ttype].append(entry)
+                if ttype in ("income_statement", "balance_sheet", "cash_flow"):
+                    has_gaap_tables = True
             table.decompose()  # Remove before processing next table
+
+        # Batch-classify all 'other' tables in a single LLM call.
+        if _other_pending:
+            llm = build_llm(format_json=True)
+            candidates = [(t, c) for _, t, c in _other_pending]
+            keep_flags = _llm_classify_other_batch(candidates, llm)
+            skipped = 0
+            for (entry, _, _ctx), keep in zip(_other_pending, keep_flags):
+                if keep:
+                    sections["other"].append(entry)
+                else:
+                    skipped += 1
+            if skipped:
+                logger.debug(
+                    "LLM batch filter: skipped %d/%d 'other' table(s) for %s",
+                    skipped, len(_other_pending), ticker,
+                )
 
         # Prose text with all tables removed
         prose = soup.get_text(separator="\n", strip=True)

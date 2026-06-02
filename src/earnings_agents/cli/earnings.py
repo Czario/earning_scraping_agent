@@ -203,7 +203,7 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
 
     # source == "sec" (default)
     printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
-    filing_url = get_latest_earnings_url(cik)
+    filing_url, sec_report_date = get_latest_earnings_url(cik)
     if not filing_url:
         return {
             **_base,
@@ -216,6 +216,7 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
         **_base,
         "ir_url": "",
         "discovered_file_url": filing_url,
+        "sec_report_date": sec_report_date,  # authoritative period-end date from SEC
         # Skip IR discovery — jump straight to file-type detection
         "status": "discovered",
     }

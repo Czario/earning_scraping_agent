@@ -121,6 +121,59 @@ def test_cleanup_reverts_when_removal_breaks_sanity(mock_build_llm):
     assert "Weighted average shares outstanding: Diluted" not in result["metrics"]
 
 
+@patch("earnings_agents.nodes.cleanup_metrics.build_llm")
+def test_cleanup_protects_concept_mapped_keys(mock_build_llm):
+    """LLM tries to remove a key that is in mapped_metric_keys — must be blocked."""
+    metrics = {
+        "Net sales": 5_529_145_000,
+        "Membership fee income": 132_355_000,
+        "Total revenues": 5_661_500_000,
+        "Net income": 2_000_000_000,
+    }
+    state = _base_state(metrics)
+    state["mapped_metric_keys"] = ["Net sales", "Membership fee income"]
+
+    mock_llm = MagicMock()
+    mock_llm.invoke.return_value = (
+        '{"remove": ["Net sales", "Membership fee income"], '
+        '"reasons": {'
+        '"Net sales": "Rule A: duplicate of Total revenues", '
+        '"Membership fee income": "Malformed value (likely mis-scaled)"'
+        '}}'
+    )
+    mock_build_llm.return_value = mock_llm
+
+    result = cleanup_metrics_node(state)
+
+    assert "Net sales" in result["metrics"], "concept-mapped key must not be removed"
+    assert "Membership fee income" in result["metrics"], "concept-mapped key must not be removed"
+    assert result["metrics"]["Net sales"] == 5_529_145_000
+    assert result["metrics"]["Membership fee income"] == 132_355_000
+
+
+@patch("earnings_agents.nodes.cleanup_metrics.build_llm")
+def test_cleanup_still_removes_non_protected_duplicate(mock_build_llm):
+    """Keys NOT in mapped_metric_keys can still be removed by the LLM."""
+    metrics = {
+        "Revenue": 82_886_000_000,
+        "GAAP Revenue": 82_886_000_000,  # true duplicate, not concept-mapped
+    }
+    state = _base_state(metrics)
+    state["mapped_metric_keys"] = ["Revenue"]  # only "Revenue" is protected
+
+    mock_llm = MagicMock()
+    mock_llm.invoke.return_value = (
+        '{"remove": ["GAAP Revenue"], '
+        '"reasons": {"GAAP Revenue": "Rule A: duplicate of Revenue"}}'
+    )
+    mock_build_llm.return_value = mock_llm
+
+    result = cleanup_metrics_node(state)
+
+    assert "GAAP Revenue" not in result["metrics"]
+    assert result["metrics"]["Revenue"] == 82_886_000_000
+
+
 def test_cleanup_disabled_returns_state_unchanged(monkeypatch):
     """When CLEANUP_METRICS=False, the node is a no-op."""
     import earnings_agents.nodes.cleanup_metrics as cm
