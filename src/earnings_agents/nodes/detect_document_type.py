@@ -4,20 +4,12 @@ import logging
 
 import requests
 
-from earnings_agents.config import HTTP_TIMEOUT
+from earnings_agents.tools.http_client import head as _http_head
 from earnings_agents.workflow_state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
 
 _PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/x-pdf"})
-
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
 
 
 def detect_document_type_node(state: EarningsAgentState) -> EarningsAgentState:
@@ -41,9 +33,7 @@ def detect_document_type_node(state: EarningsAgentState) -> EarningsAgentState:
 
     # Fallback: HEAD request
     try:
-        response = requests.head(
-            url, headers=_HEADERS, timeout=HTTP_TIMEOUT, allow_redirects=True
-        )
+        response = _http_head(url)
         content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
         file_type = "pdf" if content_type in _PDF_CONTENT_TYPES else "html"
         logger.info("File type (Content-Type %s): %s — %s", content_type, file_type, url)

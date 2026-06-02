@@ -10,6 +10,25 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from earnings_agents.analysis.metric_patterns import (
+    BS_ASSETS_RE as _BS_ASSETS_RE,
+    BS_EQUITY_RE as _BS_EQUITY_RE,
+    BS_LIAB_RE as _BS_LIAB_RE,
+    COGS_RE as _COGS_RE,
+    COMPOSITE_COMMA_RE as _COMPOSITE_COMMA_RE,
+    COMPOSITE_SLASH_RE as _COMPOSITE_SLASH_RE,
+    GAAP_NONGAAP_RE as _GAAP_NONGAAP_RE,
+    GROSS_PROFIT_RE as _GROSS_PROFIT_RE,
+    NEVER_ROUND_RE as _NEVER_ROUND_RE,
+    OPINC_RE as _OPINC_RE,
+    OPEX_SUBTOTAL_RE as _OPEX_SUBTOTAL_RE,
+    OPEX_TOTAL_RE as _OPEX_TOTAL_RE,
+    REVENUE_RE as _REVENUE_RE,
+    ROUND_MAX as _ROUND_MAX,
+    ROUND_MIN as _ROUND_MIN,
+    ROUND_UNIT as _ROUND_UNIT,
+)
+
 # Severity drives routing decisions in analyze_metrics_node:
 #   "high"   → triggers a re-extract loop (if attempts remain)
 #   "medium" → adds a hint to extraction_notes only when a "high" already triggers
@@ -153,11 +172,7 @@ def _find_metric(
 # Balance-sheet identity:  Total Assets ≈ Total Liabilities + Total Equity
 # -----------------------------------------------------------------------------
 
-_BS_ASSETS_RE = re.compile(r"^\s*total assets\b", re.IGNORECASE)
-_BS_LIAB_RE = re.compile(r"^\s*total liabilities\s*$", re.IGNORECASE)
-_BS_EQUITY_RE = re.compile(
-    r"total\s+(stockholders'?|shareholders'?)\s*equity", re.IGNORECASE
-)
+# Balance-sheet patterns imported from metric_patterns; alias kept for reader context.
 # Tolerance: 1 % accommodates rounding when components are reported in
 # millions but totals in thousands (rare but documented).
 _BS_IDENTITY_TOLERANCE = 0.01
@@ -263,16 +278,7 @@ def check_sign_anomalies(metrics: dict[str, Any]) -> list[Finding]:
 # narrative prose ("debt of about $1 billion") rather than a financial
 # table. Larger values (e.g. "1.0 trillion") and small values (EPS,
 # percentages, share counts) are exempt.
-_ROUND_UNIT = 100_000_000   # $100M
-_ROUND_MIN = 100_000_000    # ignore tiny numbers
-_ROUND_MAX = 100_000_000_000  # ignore megacaps where round totals are common
-
-# Concept guards — never flag these as suspect-round even when the value
-# happens to be an exact multiple.
-_NEVER_ROUND_RE = re.compile(
-    r"per share|eps|margin|ratio|rate|shares|weighted|%|percent",
-    re.IGNORECASE,
-)
+# Suspect-round constants + guard imported from metric_patterns.
 
 
 def check_suspect_round(metrics: dict[str, Any]) -> list[Finding]:
@@ -308,17 +314,7 @@ def check_suspect_round(metrics: dict[str, Any]) -> list[Finding]:
 # GAAP / Non-GAAP reconciliation table leakage.
 # -----------------------------------------------------------------------------
 
-# Keys matching any of these patterns came from a reconciliation or Non-GAAP
-# table, not the primary GAAP income statement. They should be dropped.
-_GAAP_NONGAAP_RE = re.compile(
-    r"^(GAAP|Non-GAAP)\s+"         # prefixed with "GAAP " or "Non-GAAP "
-    r"|non-gaap"                    # mid-key occurrence
-    r"|\badjusted\b"               # "Adjusted operating income", etc.
-    r"|\breconciliation\b"         # reconciliation table headers
-    r"|impact of\b"                # "Total impact of non-GAAP adjustments"
-    r"|\btax impact\b",
-    re.IGNORECASE,
-)
+# GAAP/Non-GAAP pattern imported from metric_patterns.
 
 
 def check_gaap_nongaap_leakage(metrics: dict[str, Any]) -> list[Finding]:
@@ -365,21 +361,7 @@ def check_gaap_nongaap_leakage(metrics: dict[str, Any]) -> list[Finding]:
 # We only flag a comma-joined key when the SAME financial keyword appears both
 # before AND after the comma — the hallmark of an LLM copying a synonym bullet.
 # Example: "Diluted earnings per share, Diluted EPS" → "diluted" on both sides.
-_COMPOSITE_SLASH_RE = re.compile(
-    r"(?:diluted|basic|revenue|income|cost|expense|profit|earnings|shares|loss|eps)\b"
-    r".{1,60}"
-    r"\s+/\s+"
-    r"(?:diluted|basic|revenue|income|cost|expense|profit|earnings|shares|loss|eps|net|per\s+share)",
-    re.IGNORECASE,
-)
-
-_COMPOSITE_COMMA_RE = re.compile(
-    r"\b(diluted|basic|revenue|income|cost|expense|profit|earnings|shares|loss|eps)\b"
-    r"[^,]{1,80}"
-    r",\s+"
-    r"[^,]*\b\1\b",
-    re.IGNORECASE,
-)
+# Composite-key patterns imported from metric_patterns.
 
 
 def check_composite_keys(metrics: dict[str, Any]) -> list[Finding]:
@@ -415,12 +397,7 @@ def check_composite_keys(metrics: dict[str, Any]) -> list[Finding]:
 # Opex-label collision: Total operating expenses ≡ Operating income / Revenue.
 # -----------------------------------------------------------------------------
 
-_OPEX_TOTAL_RE = re.compile(r"^\s*total\s+operating\s+expenses\b", re.IGNORECASE)
-_OPINC_RE = re.compile(r"^\s*operating\s+income\b", re.IGNORECASE)
-_REVENUE_RE = re.compile(r"^\s*(total\s+)?revenues?\b", re.IGNORECASE)
-_COGS_RE = re.compile(r"^\s*(total\s+)?cost\s+of\s+(revenue|goods\s+sold|sales)\b", re.IGNORECASE)
-_GROSS_PROFIT_RE = re.compile(r"^\s*gross\s+(profit|margin)\b", re.IGNORECASE)
-_OPEX_SUBTOTAL_RE = re.compile(r"^\s*operating\s+expenses\b", re.IGNORECASE)
+# Income-statement patterns imported from metric_patterns.
 
 
 # -----------------------------------------------------------------------------
@@ -576,3 +553,33 @@ def derive_corrected_total_opex(
     if cogs is None or opex_sub is None:
         return None, None
     return opex_key, cogs + opex_sub
+
+
+# ---------------------------------------------------------------------------
+# Checker registry
+#
+# The ordered list of every pure-observer checker.  ``analyze_metrics_node``
+# iterates this list rather than hard-coding a call sequence, so adding a new
+# checker only requires writing the function and appending it here.
+#
+# Rules for registry members:
+#   - Signature: (metrics: dict[str, Any]) -> list[Finding]
+#   - Must not mutate *metrics*.
+#   - ``check_presence`` is NOT in this list because it requires the pre-computed
+#     *presence* summary from ``critical_metrics.check_presence`` as a second
+#     argument.  It is called explicitly before the registry loop.
+#
+# Correctors (``derive_corrected_total_opex``) are also excluded — they return
+# ``(key, value)`` not ``list[Finding]`` and are handled in a separate post-pass
+# inside the node (ADR-0003).
+# ---------------------------------------------------------------------------
+CHECKER_REGISTRY: list = [
+    check_case_duplicates,
+    check_composite_keys,
+    check_gaap_nongaap_leakage,
+    check_balance_sheet_identity,
+    check_gross_profit_identity,
+    check_sign_anomalies,
+    check_suspect_round,
+    check_opex_label_collision,
+]

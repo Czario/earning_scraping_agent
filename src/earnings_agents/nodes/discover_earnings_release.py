@@ -1,27 +1,15 @@
 from __future__ import annotations
 
-import json
 import logging
 
 from earnings_agents.config import IR_PAGE_MAX_CHARS
 from earnings_agents.llm_factory import build_llm
 from earnings_agents.workflow_state import EarningsAgentState
+from earnings_agents.tools.llm_link_picker import DISCOVERY_SCHEMA, pick_earnings_url
 from earnings_agents.tools.playwright_scraper import fetch_page_js
 from earnings_agents.tools.static_scraper import extract_links, fetch_page
 
 logger = logging.getLogger(__name__)
-
-# JSON schema enforced by Ollama at the model level; used as a json_object hint
-# for Groq. Guarantees the LLM returns {"url": "...", "reason": "..."} without
-# markdown fences or extra fields.
-_DISCOVERY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "url": {"type": "string"},
-        "reason": {"type": "string"},
-    },
-    "required": ["url", "reason"],
-}
 
 
 def _is_valid_url(url: str) -> bool:
@@ -84,51 +72,17 @@ def discover_earnings_release_node(state: EarningsAgentState) -> EarningsAgentSt
     ]
     links_text = "\n".join(link_lines)[:IR_PAGE_MAX_CHARS]
 
-    company_name = state["company_name"]
-    prompt = (
-        f"You are a financial data assistant.\n"
-        f"Below is a list of links from the investor relations (IR) page of "
-        f"{company_name} ({ticker}).\n\n"
-        f"Task: identify the single link that points to the most recent quarterly "
-        f"earnings press release or earnings results document (PDF or webpage). "
-        f"Prefer PDF links. Ignore annual reports, proxy statements, ESG reports, "
-        f"and investor presentations unless no press release exists.\n\n"
-        f"Respond with ONLY a JSON object — no markdown, no extra text:\n"
-        f'  {{"url": "<full URL>", "reason": "<one sentence>"}}\n\n'
-        f"Links:\n{links_text}"
-    )
-
     # ── 4. Ask LLM ───────────────────────────────────────────────────────────
-    # Ollama enforces _DISCOVERY_SCHEMA at model level; Groq uses json_object mode.
-    # Neither wraps output in markdown fences, so no stripping is needed.
-    llm = build_llm(json_schema=_DISCOVERY_SCHEMA)
+    llm = build_llm(json_schema=DISCOVERY_SCHEMA)
     try:
-        response: str = llm.invoke(prompt)
-        result = json.loads(response.strip())
-        file_url: str = result.get("url", "").strip()
-
-        # Validate the URL; retry once with a stricter instruction if the model
-        # returned a placeholder or relative path despite the schema.
-        if not _is_valid_url(file_url):
-            logger.warning(
-                "LLM returned invalid URL %r for %s — retrying with stricter prompt",
-                file_url,
-                ticker,
-            )
-            strict_prefix = (
-                "IMPORTANT: You MUST return a valid URL starting with http:// or https://. "
-                "Do not return placeholder text, relative paths, or an empty string.\n\n"
-            )
-            response = llm.invoke(strict_prefix + prompt)
-            result = json.loads(response.strip())
-            file_url = result.get("url", "").strip()
-
-        if not _is_valid_url(file_url):
-            raise ValueError(f"LLM returned invalid URL after retry: {file_url!r}")
-
-        logger.info("IR discovery for %s → %s (reason: %s)", ticker, file_url, result.get("reason"))
+        file_url = pick_earnings_url(
+            links_text=links_text,
+            company_name=state["company_name"],
+            ticker=ticker,
+            llm=llm,
+        )
         return {**state, "discovered_file_url": file_url, "status": "discovered"}
-    except (json.JSONDecodeError, ValueError, KeyError) as exc:
+    except (ValueError, KeyError) as exc:
         return {
             **state,
             "status": "failed",

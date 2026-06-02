@@ -21,7 +21,7 @@ from typing import Any
 
 from earnings_agents.config import CLEANUP_METRICS
 from earnings_agents.llm_factory import build_llm
-from earnings_agents.nodes.extract_financial_metrics import _validate_metrics
+from earnings_agents.analysis.validators import validate_metrics
 from earnings_agents.workflow_state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
@@ -58,15 +58,15 @@ def _build_compact_metrics(metrics: dict) -> dict:
     return {k: _compact_value(v) for k, v in metrics.items()}
 
 
-def _needs_cleanup(metrics: dict) -> bool:
-    """Cheap Python pre-check: any plausible Rule A / Rule B / case-dup candidate?
+def needs_cleanup(metrics: dict) -> bool:
+    """Return True when *metrics* contains any plausible cleanup candidate.
 
-    Returns False when the metrics are obviously clean, letting us skip the LLM
-    call entirely. Heuristics (any triggers a call):
+    A cheap Python pre-check that avoids an LLM call on already-clean dicts.
+    Heuristics (any one triggers a call):
 
-      - Two keys whose numeric values are equal within 0.1%.
+      - Two keys whose numeric values are equal within 0.1 %.
       - Two keys that differ only by case.
-      - Any 'per share' / 'EPS' value above $10,000 (Rule B).
+      - Any ``per share`` / ``EPS`` value above $10,000 (scale Rule B).
     """
     numeric_items = [
         (k, float(v)) for k, v in metrics.items()
@@ -95,6 +95,38 @@ def _needs_cleanup(metrics: dict) -> bool:
             return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Public guardrail helpers
+#
+# Named so they can be imported and unit-tested independently.  The node uses
+# them sequentially; each returning False causes the LLM pass to be rejected.
+# They mirror the three contracts stated in the module docstring (a, b, c).
+# ---------------------------------------------------------------------------
+
+def guardrail_keys_are_subset(remove: list[str], metrics: dict) -> bool:
+    """Guardrail a: every proposed removal key exists in *metrics*."""
+    return all(k in metrics for k in remove)
+
+
+def guardrail_values_unchanged(cleaned: dict, original: dict) -> bool:
+    """Guardrail b: every surviving value is byte-identical to the original."""
+    return all(_values_equal(v, original[k]) for k, v in cleaned.items())
+
+
+def guardrail_no_new_warnings(
+    cleaned: dict, before_warnings: list[str]
+) -> tuple[bool, list[str]]:
+    """Guardrail c: cleanup must not introduce new identity/sanity warnings.
+
+    Returns ``(passes, after_warnings)`` where *after_warnings* is the full
+    list from ``validate_metrics`` (used to update ``identity_warnings`` in
+    state when the pass is accepted).
+    """
+    _, after_warnings = validate_metrics(cleaned)
+    new_failures = [w for w in after_warnings if w not in before_warnings]
+    return not new_failures, after_warnings
 
 
 def _build_prompt(metrics: dict) -> str:
@@ -277,7 +309,7 @@ def cleanup_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     # Fix 2: skip the LLM call entirely when there are no plausible cleanup
     # candidates (no near-equal values, no case dupes, no implausible per-share).
     # Saves ~3.5K tokens / ~3 s on already-clean documents.
-    if not _needs_cleanup(metrics):
+    if not needs_cleanup(metrics):
         logger.info(
             "Cleanup skipped for %s — no duplicate / scale candidates detected", ticker,
         )
@@ -302,7 +334,7 @@ def cleanup_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
         logger.warning("Cleanup 'remove' is not a list for %s — keeping current metrics", ticker)
         return _finalize(state, metrics, removed)
 
-    # Guardrail 1: every requested removal must reference an existing key.
+    # Guardrail a: every requested removal must reference an existing key.
     unknown = [k for k in remove if k not in metrics]
     if unknown:
         logger.warning(
@@ -337,17 +369,16 @@ def cleanup_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
     cleaned = {k: v for k, v in metrics.items() if k not in remove}
 
-    # Guardrail 2: surviving keys must be byte-identical to inputs.
-    for k, v in cleaned.items():
-        if not _values_equal(v, metrics[k]):
-            logger.warning("Cleanup mutated value for %r — skipping LLM pass", k)
-            return _finalize(state, metrics, removed)
+    # Guardrail b: surviving keys must be byte-identical to inputs.
+    if not guardrail_values_unchanged(cleaned, metrics):
+        logger.warning("Cleanup mutated value — skipping LLM pass")
+        return _finalize(state, metrics, removed)
 
-    # Guardrail 3: cleanup must not introduce NEW identity / sanity failures.
+    # Guardrail c: cleanup must not introduce NEW identity / sanity failures.
     before_warnings = state.get("identity_warnings") or []
-    _, after_warnings = _validate_metrics(cleaned)
-    new_failures = [w for w in after_warnings if w not in before_warnings]
-    if new_failures:
+    passes, after_warnings = guardrail_no_new_warnings(cleaned, before_warnings)
+    if not passes:
+        new_failures = [w for w in after_warnings if w not in before_warnings]
         logger.warning(
             "Cleanup LLM introduced %d new identity warning(s) for %s — skipping LLM pass: %s",
             len(new_failures), ticker, new_failures,

@@ -6,18 +6,10 @@ import logging
 import pdfplumber
 import requests
 
-from earnings_agents.config import HTTP_TIMEOUT
+from earnings_agents.tools.http_client import get as _http_get
 from earnings_agents.workflow_state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
-
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
 
 
 def extract_pdf_text_node(state: EarningsAgentState) -> EarningsAgentState:
@@ -26,7 +18,7 @@ def extract_pdf_text_node(state: EarningsAgentState) -> EarningsAgentState:
     ticker = state["ticker"]
 
     try:
-        response = requests.get(url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
+        response = _http_get(url)
         response.raise_for_status()
 
         pages_text: list[str] = []

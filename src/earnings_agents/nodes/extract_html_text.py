@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any
-
-import requests
 from bs4 import BeautifulSoup
 
-from earnings_agents.config import HTTP_TIMEOUT
 from earnings_agents.llm_factory import build_llm
+from earnings_agents.tools.http_client import SEC_HEADERS as _SEC_HEADERS
+from earnings_agents.tools.http_client import BROWSER_HEADERS as _BROWSER_HEADERS
+from earnings_agents.tools.http_client import get as _http_get
+from earnings_agents.tools.llm_table_classifier import classify_other_tables_batch as _classify_other_tables_batch
 from earnings_agents.workflow_state import EarningsAgentState
 from earnings_agents.tools.playwright_scraper import fetch_page_js
 
@@ -19,20 +19,6 @@ logger = logging.getLogger(__name__)
 _NOISE_TAGS = frozenset(
     {"script", "style", "nav", "footer", "header", "aside", "noscript", "svg", "form"}
 )
-
-# SEC EDGAR programmatic access requires a non-browser User-Agent with contact info
-_SEC_HEADERS = {
-    "User-Agent": "earning-agents data-pipeline@truegrids.com",
-    "Accept-Encoding": "gzip, deflate",
-}
-
-_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
 
 # Minimum meaningful content length; below this we assume JS rendering is needed
 _MIN_CONTENT_CHARS = 300
@@ -139,53 +125,15 @@ def _classify_table(table_text: str, context_text: str) -> str:
     return "other"
 
 
-_OTHER_FILTER_PROMPT = """\
-You are classifying tables from an earnings press release.
-
-For each table below, decide whether it contains PRIMARY GAAP financial statement
-data worth extracting — rows with numeric values for revenue, cost, expenses,
-income, EPS, or share counts.
-
-Mark useful=true for: primary income-statement rows, condensed GAAP summaries.
-Mark useful=false for:
-- Contact blocks (names, email addresses, phone numbers, job titles)
-- Footnote annotation tables (rows beginning with (A), (B), * etc.)
-- Supplementary stock-based compensation breakdowns
-- Guidance / outlook tables
-- Any other non-primary-statement content
-
-Tables to classify:
-{tables_block}
-
-Return ONLY a JSON object mapping each table index (as a string) to true or false:
-{{"0": true, "1": false, ...}}"""
+_OTHER_FILTER_PROMPT = """(moved to tools/llm_table_classifier)"""
 
 
 def _llm_classify_other_batch(
     candidates: list[tuple[str, str]],
     llm: Any,
 ) -> list[bool]:
-    """Classify a batch of 'other' tables in a single LLM call.
-
-    ``candidates`` is a list of ``(table_text, context_text)`` pairs.
-    Returns a parallel list of booleans: ``True`` = keep, ``False`` = skip.
-    Falls back to all-True on any error so no table is silently dropped.
-    """
-    if not candidates:
-        return []
-    blocks: list[str] = []
-    for i, (table_text, context_text) in enumerate(candidates):
-        ctx = context_text[-300:].strip() or "(none)"
-        blocks.append(
-            f"Table {i}\nContext: {ctx}\nContent: {table_text[:600]}"
-        )
-    prompt = _OTHER_FILTER_PROMPT.format(tables_block="\n\n".join(blocks))
-    try:
-        raw = llm.invoke(prompt)
-        data = json.loads(raw)
-        return [bool(data.get(str(i), True)) for i in range(len(candidates))]
-    except Exception:
-        return [True] * len(candidates)  # safe fallback — keep all
+    """Backward-compatible wrapper — delegates to tools.llm_table_classifier."""
+    return _classify_other_tables_batch(candidates, llm)
 
 
 # Boilerplate section markers that contain no financial data.
@@ -274,8 +222,8 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
     ticker = state["ticker"]
 
     try:
-        headers = _pick_headers(url)
-        response = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        is_sec = "sec.gov" in url
+        response = _http_get(url, sec=is_sec)
         html = response.text
 
         # Unwrap EDGAR SGML envelope before parsing

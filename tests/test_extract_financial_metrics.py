@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from earnings_agents.nodes.extract_financial_metrics import (
-    _HINTS_DIR,
     _chunk_text,
     _llm_map_concepts,
     _load_company_hints,
@@ -15,6 +14,7 @@ from earnings_agents.nodes.extract_financial_metrics import (
     _prescan_document,
     extract_financial_metrics_node,
 )
+from earnings_agents.tools.company_hints_loader import _HINTS_DIR
 
 
 def _base_state(**overrides):
@@ -641,7 +641,7 @@ def test_extraction_fails_when_no_raw_text():
 
 def test_validate_metrics_passes_consistent_income_statement():
     """A self-consistent income statement produces no identity warnings."""
-    from earnings_agents.nodes.extract_financial_metrics import _validate_metrics
+    from earnings_agents.analysis.validators import validate_metrics
 
     metrics = {
         "Revenue": 82_886_000_000,
@@ -658,14 +658,14 @@ def test_validate_metrics_passes_consistent_income_statement():
         "Diluted Earnings per Share": 4.27,
         "Weighted average shares outstanding: Diluted": 7_445_000_000,
     }
-    cleaned, warnings = _validate_metrics(metrics)
+    cleaned, warnings = validate_metrics(metrics)
     assert warnings == []
     assert cleaned["Net income"] == 31_778_000_000
 
 
 def test_validate_metrics_flags_broken_identity():
     """A bad Net income that breaks the EPS × shares sanity check is blocking."""
-    from earnings_agents.nodes.extract_financial_metrics import _validate_metrics
+    from earnings_agents.analysis.validators import validate_metrics
 
     # EPS 4.27 × Diluted shares 7.445B ≈ $31.8B Net income.
     # Asserting a Net income of $12.3B trips the universal EPS sanity check.
@@ -674,14 +674,14 @@ def test_validate_metrics_flags_broken_identity():
         "Diluted Earnings per Share": 4.27,
         "Weighted average shares outstanding: Diluted": 7_445_000_000,
     }
-    _, warnings = _validate_metrics(metrics)
+    _, warnings = validate_metrics(metrics)
     assert warnings, "expected EPS sanity warning for broken Net income"
     assert any("EPS" in w for w in warnings)
 
 
 def test_validate_metrics_advisory_only_for_structural_drift():
     """Structural decomposition drift (e.g. Net income = Pre-tax − Tax) is advisory only."""
-    from earnings_agents.nodes.extract_financial_metrics import _validate_metrics
+    from earnings_agents.analysis.validators import validate_metrics
 
     # Pre-tax 39.34B − Tax 7.56B = 31.78B, but reported Net income is 12.3B.
     # Without EPS / shares to cross-check, this is logged as advisory only.
@@ -690,7 +690,7 @@ def test_validate_metrics_advisory_only_for_structural_drift():
         "Provision for income taxes": 7_562_000_000,
         "Net income": 12_345_000_000,
     }
-    _, warnings = _validate_metrics(metrics)
+    _, warnings = validate_metrics(metrics)
     assert warnings == [], "structural decomposition mismatches must not block"
 
 
@@ -840,7 +840,7 @@ class TestLoadCompanyHints:
     def test_returns_empty_when_no_file(self, tmp_path, monkeypatch):
         """Missing hint file returns empty string."""
         monkeypatch.setattr(
-            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
         )
         assert _load_company_hints("AAPL") == ""
 
@@ -848,7 +848,7 @@ class TestLoadCompanyHints:
         """Existing hint file returns its stripped content."""
         (tmp_path / "AAPL.md").write_text("  Report shares in thousands.\n", encoding="utf-8")
         monkeypatch.setattr(
-            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
         )
         assert _load_company_hints("AAPL") == "Report shares in thousands."
 
@@ -856,7 +856,7 @@ class TestLoadCompanyHints:
         """Ticker is upper-cased so 'aapl' finds AAPL.md."""
         (tmp_path / "AAPL.md").write_text("hint content", encoding="utf-8")
         monkeypatch.setattr(
-            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
         )
         assert _load_company_hints("aapl") == "hint content"
 
@@ -864,7 +864,7 @@ class TestLoadCompanyHints:
         """An all-whitespace hint file is treated as absent."""
         (tmp_path / "MSFT.md").write_text("   \n\n  ", encoding="utf-8")
         monkeypatch.setattr(
-            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
         )
         assert _load_company_hints("MSFT") == ""
 
@@ -873,7 +873,7 @@ class TestLoadCompanyHints:
         """Company hint text appears in the LLM prompt when a hint file is present."""
         (tmp_path / "AAPL.md").write_text("Always look for segment revenue.", encoding="utf-8")
         monkeypatch.setattr(
-            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
         )
         captured_prompts: list[str] = []
 
@@ -894,7 +894,7 @@ class TestLoadCompanyHints:
     def test_no_hint_file_does_not_alter_prompt(self, mock_build_llm, tmp_path, monkeypatch):
         """When no hint file exists the prompt is unchanged (no hint section)."""
         monkeypatch.setattr(
-            "earnings_agents.nodes.extract_financial_metrics._HINTS_DIR", tmp_path
+            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
         )
         captured_prompts: list[str] = []
 
@@ -919,8 +919,6 @@ class TestLoadCompanyHints:
 class TestProviderEscalation:
     """Escalation was removed: every attempt uses the configured LLM_PROVIDER."""
 
-    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
-    @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
     def test_attempt_2_does_not_escalate_to_groq(self, mock_build_llm):
         """Second extraction pass stays on the default provider (provider=None)."""
@@ -934,8 +932,6 @@ class TestProviderEscalation:
         call_kwargs = mock_build_llm.call_args.kwargs
         assert call_kwargs.get("provider") is None
 
-    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
-    @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
     def test_attempt_1_uses_default_provider(self, mock_build_llm):
         """First extraction pass leaves provider=None (uses configured default)."""
@@ -949,8 +945,6 @@ class TestProviderEscalation:
         call_kwargs = mock_build_llm.call_args.kwargs
         assert call_kwargs.get("provider") is None
 
-    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
-    @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "ollama")
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
     def test_attempt_3_does_not_escalate_to_groq(self, mock_build_llm):
         """Third extraction pass also stays on the default provider."""
@@ -964,8 +958,6 @@ class TestProviderEscalation:
         call_kwargs = mock_build_llm.call_args.kwargs
         assert call_kwargs.get("provider") is None
 
-    @patch("earnings_agents.nodes.extract_financial_metrics.GROQ_API_KEY", "test-key")
-    @patch("earnings_agents.nodes.extract_financial_metrics.LLM_PROVIDER", "groq")
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
     def test_groq_primary_stays_on_default(self, mock_build_llm):
         """When LLM_PROVIDER is 'groq', no provider override is applied."""

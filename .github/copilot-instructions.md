@@ -37,6 +37,31 @@ Shared harness principles live in `.github/instructions/agent-harness.instructio
 ## Agent Development Principles
 - See `.github/instructions/agent-harness.instructions.md` for the full harness-engineering principles applied in this repo.
 
+## Domain language
+- `CONTEXT.md` at the repo root is the canonical domain glossary. Use its terminology in variable names, test descriptions, log messages, and commit messages.
+- Before making changes to nodes, analysis checkers, or routing logic, read `CONTEXT.md` to align vocabulary.
+
+## Architecture decisions
+- Settled architectural decisions live in `docs/adr/`. Read the relevant ADR before proposing a refactor that touches its subject area.
+- ADRs are numbered sequentially (`NNNN-slug.md`). Current ADRs:
+  - `0001` — `needs_reextract` as the sole routing signal for the extract↔analyze loop
+  - `0002` — Metric keys preserved verbatim (no normalisation at extraction time)
+  - `0003` — `analysis/validators.py` (correctors) kept separate from `analysis/findings.py` (checkers)
+  - `0004` — MongoDB document ID format: `{TICKER}_{YEAR}_latest`
+  - `0005` — `MAX_EXTRACTION_ATTEMPTS` hard cap; no infinite retry paths
+
+## Available skills
+Skills live in `.github/skills/` and should be invoked by name when the situation calls for them:
+
+| Skill | When to use |
+|---|---|
+| `/diagnose` | A node fails unexpectedly, metrics are wrong/missing, or the extract↔analyze loop gets stuck. Runs reproduce→minimise→hypothesise→instrument→fix→regression-test. |
+| `/handoff` | End of a long session, switching context, or handing off to another agent. Produces a structured resume document. |
+| `/grill-with-docs` | Before adding a new node, changing routing, or modifying the analysis loop. Stress-tests the plan against `CONTEXT.md` and ADRs. |
+| `/improve-codebase-architecture` | When nodes feel tangled, analysis logic is hard to test in isolation, or routing helpers are accreting special cases. |
+| `/zoom-out` | Unfamiliar with a node or area; need to understand how it fits in the LangGraph graph and which state fields it touches. |
+| `/tdd` | Building new behavior or fixing bugs test-first (red-green-refactor). |
+
 ## Data and persistence
 - MongoDB upsert id format must remain: `{TICKER}_{YEAR}_latest`.
 - `YEAR` is the 4-digit fiscal year from the source document and `TICKER` is uppercase (example: `MSFT_2024_latest`).

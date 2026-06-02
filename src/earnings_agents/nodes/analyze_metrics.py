@@ -20,17 +20,10 @@ from typing import Any
 
 from earnings_agents.analysis.critical_metrics import check_presence as presence_summary
 from earnings_agents.analysis.findings import (
+    CHECKER_REGISTRY,
     Finding,
-    check_balance_sheet_identity,
-    check_case_duplicates,
-    check_composite_keys,
-    check_gaap_nongaap_leakage,
-    check_gross_profit_identity,
-    check_opex_label_collision,
-    check_presence,
-    check_sign_anomalies,
-    check_suspect_round,
     derive_corrected_total_opex,
+    check_presence,
 )
 from earnings_agents.config import MAX_EXTRACTION_ATTEMPTS
 from earnings_agents.workflow_state import EarningsAgentState
@@ -124,18 +117,14 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     presence = presence_summary(metrics.keys())
     findings: list[Finding] = []
     findings.extend(check_presence(metrics, presence))
-    findings.extend(check_case_duplicates(metrics))
-    findings.extend(check_composite_keys(metrics))
-    findings.extend(check_gaap_nongaap_leakage(metrics))
-    findings.extend(check_balance_sheet_identity(metrics))
-    findings.extend(check_gross_profit_identity(metrics))
-    findings.extend(check_sign_anomalies(metrics))
-    findings.extend(check_suspect_round(metrics))
-    findings.extend(check_opex_label_collision(metrics))
 
-    # Deterministic correction: when Total operating expenses collided with
-    # Operating income, derive the correct value from Cost of revenue +
-    # Operating expenses (the opex-line-items subtotal) if both are present.
+    # Registry loop — pure observers only (ADR-0003). check_presence is called
+    # separately above because it requires a pre-computed presence summary.
+    for checker in CHECKER_REGISTRY:
+        findings.extend(checker(metrics))
+
+    # Corrector post-pass — kept explicitly separate from the observer loop so
+    # it is easy to audit: only derive_corrected_total_opex mutates metrics.
     opex_collision = any(
         f.type == "suspect_value"
         and any("total operating expenses" in k.lower() for k in (f.keys or ()))

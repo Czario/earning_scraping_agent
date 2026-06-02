@@ -23,10 +23,19 @@ logger = logging.getLogger(__name__)
 
 # ── Routing helpers ──────────────────────────────────────────────────────────
 
+def _fail_or(state: EarningsAgentState, next_node: str) -> str:
+    """Return ``next_node`` unless the state signals a failure, in which case END.
+
+    Used to collapse guard-only routing helpers (those that only check
+    ``status == "failed"``) into a single reusable primitive.
+    """
+    return "__end__" if state.get("status") == "failed" else next_node
+
+
 def _route_after_discovery(
     state: EarningsAgentState,
 ) -> Literal["load_company_concepts", "__end__"]:
-    return "__end__" if state.get("status") == "failed" else "load_company_concepts"
+    return _fail_or(state, "load_company_concepts")  # type: ignore[return-value]
 
 
 def _route_by_file_type(
@@ -40,7 +49,7 @@ def _route_by_file_type(
 def _route_after_extraction(
     state: EarningsAgentState,
 ) -> Literal["analyze_metrics", "__end__"]:
-    return "__end__" if state.get("status") == "failed" else "analyze_metrics"
+    return _fail_or(state, "analyze_metrics")  # type: ignore[return-value]
 
 
 def _route_after_analysis(
