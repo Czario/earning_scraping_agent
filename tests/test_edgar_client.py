@@ -299,3 +299,138 @@ def test_edgar_get_retries_on_connection_error_then_succeeds(mock_sleep, mock_ge
     assert resp.status_code == 200
     assert mock_sleep.call_count == 1
 
+
+# ── get_next_8k_status ────────────────────────────────────────────────────────
+
+from earnings_agents.tools.edgar_client import get_next_8k_status  # noqa: E402
+
+
+def _next_submissions(forms, items, report_dates, filing_dates, accessions=None, primary_docs=None):
+    n = len(forms)
+    return {
+        "filings": {
+            "recent": {
+                "form": forms,
+                "items": items,
+                "accessionNumber": accessions or ["0000320193-26-000011"] * n,
+                "primaryDocument": primary_docs or ["doc.htm"] * n,
+                "reportDate": report_dates,
+                "filingDate": filing_dates,
+            }
+        }
+    }
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
+def test_get_next_8k_status_available_when_newer_filing_exists(mock_get):
+    """Returns available=True when SEC has an 8-K with report_date after last_stored."""
+    submissions = _next_submissions(
+        forms=["8-K"],
+        items=["2.02"],
+        report_dates=["2025-12-31"],
+        filing_dates=["2026-01-28"],
+    )
+    submissions_resp = MagicMock(status_code=200)
+    submissions_resp.json.return_value = submissions
+
+    # Suppress the index HTML call for Exhibit 99.1
+    index_resp = MagicMock(status_code=200)
+    index_resp.text = _INDEX_HTML_NO_EX99
+
+    mock_get.side_effect = [submissions_resp, index_resp]
+
+    result = get_next_8k_status("0000320193", "2025-09-30")
+
+    assert result["available"] is True
+    assert result["sec_report_date"] == "2025-12-31"
+    assert result["filing_url"] is not None
+    assert result["latest_edgar_report_date"] == "2025-12-31"
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
+def test_get_next_8k_status_ignores_current_quarter_announcement(mock_get):
+    """An 8-K announcement date that falls *shortly after* the stored period end
+    belongs to the already-stored quarter and must NOT be returned as available.
+
+    Real-world example: last_stored=2026-03-31 (Q1 end), EDGAR has the Q1
+    earnings announcement with report_date=2026-04-29 (~29 days later).
+    The next quarter (Q2) ends 2026-06-30 and has not been filed yet.
+    """
+    submissions = _next_submissions(
+        forms=["8-K"],
+        items=["2.02"],
+        report_dates=["2026-04-29"],   # Q1 announcement, NOT Q2
+        filing_dates=["2026-04-29"],
+    )
+    submissions_resp = MagicMock(status_code=200)
+    submissions_resp.json.return_value = submissions
+    mock_get.return_value = submissions_resp
+
+    result = get_next_8k_status("0000320193", "2026-03-31")
+
+    assert result["available"] is False, (
+        "A filing 29 days after period end is the current quarter's announcement "
+        "and should not be treated as the next quarter being available."
+    )
+    assert result["sec_report_date"] is None
+    # latest_edgar_report_date should capture the actual EDGAR date even though
+    # it didn't clear the next-period threshold.
+    assert result["latest_edgar_report_date"] == "2026-04-29"
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
+def test_get_next_8k_status_not_yet(mock_get):
+    """Returns available=False when the only 8-K on SEC is the already-stored one."""
+    submissions = _next_submissions(
+        forms=["8-K"],
+        items=["2.02"],
+        report_dates=["2025-09-30"],
+        filing_dates=["2025-10-28"],
+    )
+    submissions_resp = MagicMock(status_code=200)
+    submissions_resp.json.return_value = submissions
+    mock_get.return_value = submissions_resp
+
+    result = get_next_8k_status("0000320193", "2025-09-30")
+
+    assert result["available"] is False
+    assert result["sec_report_date"] is None
+    assert result["filing_url"] is None
+    # latest_edgar_report_date == last_stored → coverage display will show
+    # "already stored" note, signalling a re-run will skip.
+    assert result["latest_edgar_report_date"] == "2025-09-30"
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
+def test_get_next_8k_status_latest_edgar_matches_stored(mock_get):
+    """latest_edgar_report_date == last_stored signals the coverage display that
+    the current period is already stored and a re-run will skip.
+    Uses an 8-K with no Item 2.02 tag to cover the fallback path (e.g. HD)."""
+    submissions = _next_submissions(
+        forms=["8-K"],
+        items=[""],           # no Item 2.02 tag — fallback path
+        report_dates=["2026-05-04"],   # period already in normalize_data
+        filing_dates=["2026-06-03"],
+    )
+    submissions_resp = MagicMock(status_code=200)
+    submissions_resp.json.return_value = submissions
+    mock_get.return_value = submissions_resp
+
+    result = get_next_8k_status("0000354950", "2026-05-04")
+
+    assert result["available"] is False
+    assert result["latest_edgar_report_date"] == "2026-05-04"
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
+def test_get_next_8k_status_api_error_returns_empty(mock_get):
+    """Returns all-None dict when the EDGAR submissions API fails."""
+    import requests as req
+    mock_get.side_effect = req.RequestException("connection refused")
+
+    result = get_next_8k_status("0000320193", "2025-09-30")
+
+    assert result["available"] is False
+    assert result["sec_report_date"] is None
+    assert result["filing_url"] is None
+

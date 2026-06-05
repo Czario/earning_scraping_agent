@@ -1,6 +1,7 @@
 # Earning Agents
 
 LangGraph-based earnings scraping pipeline with two discovery modes:
+
 - SEC EDGAR mode: finds latest 8-K Item 2.02 Exhibit 99.1
 - IR mode: discovers earnings release link from a company IR page
 
@@ -30,7 +31,9 @@ uv run earnings --ticker AAPL MSFT GOOGL NVDA          # 4 parallel workers (def
 uv run earnings --ticker AAPL MSFT GOOGL --max-workers 2
 
 uv run earnings --ticker MSFT -v
+
 # or
+
 uv run earnings --ticker MSFT --verbose
 
 uv run earnings --ticker MSFT          # strict — refuses to save bad data
@@ -118,3 +121,8 @@ uv run pytest tests/test_company_registry.py -q
 
 - Extracted metric keys are kept as-is from company documents.
 - Results are upserted into MongoDB with keys like `TICKER_YEAR_latest`.
+
+
+note : 
+
+1. **`scheduler.py`** — poll the *global* feed every few minutes, filter entries by CIK against your watched tickers, and auto-trigger the pipeline the moment a new 8-K appears. This is the high-value use: zero manual polling, pipeline fires as soon as the filing lands.

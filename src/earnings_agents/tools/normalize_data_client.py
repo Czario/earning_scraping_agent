@@ -121,8 +121,13 @@ def _clean_label(raw: str) -> tuple[str, str]:
 def get_statement_concepts(
     cik: str,
     statement_types: list[str] | None = None,
+    period_type: str = "quarterly",
 ) -> list[dict[str, Any]]:
     """Return sorted concept dicts for *cik* and *statement_types*.
+
+    *period_type* selects the source collection:
+      - ``"quarterly"`` (default) → ``normalized_concepts_quarterly``
+      - ``"annual"``              → ``normalized_concepts_annual``
 
     Filters out abstract, hidden, and inactive rows.  Dimensional value rows
     (``dimension: true``) and axis/dimension definition rows
@@ -150,8 +155,13 @@ def get_statement_concepts(
     """
     if statement_types is None:
         statement_types = ["income_statement"]
+    collection_name = (
+        "normalized_concepts_annual"
+        if period_type == "annual"
+        else "normalized_concepts_quarterly"
+    )
     db = _get_client()[_NORMALIZE_DB]
-    cursor = db["normalized_concepts_quarterly"].find(
+    cursor = db[collection_name].find(
         {
             "company_cik": cik,
             "statement_type": {"$in": statement_types},
@@ -454,6 +464,52 @@ def parse_period_start_date(period_str: str, end_date: date) -> date | None:
     return date(start_y, start_m, 1)
 
 
+# ── Latest period lookup ─────────────────────────────────────────────────────
+
+def get_latest_period(cik: str) -> dict[str, Any] | None:
+    """Return the most recently stored period for *cik* across both collections.
+
+    Queries ``concept_values_annual`` and ``concept_values_quarterly`` and
+    returns the record with the latest ``reporting_period.end_date``.
+
+    Returned dict has keys:
+      ``period_type``  — ``"annual"`` or ``"quarterly"``
+      ``fiscal_year``  — int
+      ``quarter``      — int | None  (None for annual)
+      ``end_date``     — ``datetime`` (UTC)
+
+    Returns ``None`` when no data exists for *cik* in either collection.
+    """
+    db = _get_client()[_NORMALIZE_DB]
+    best: dict[str, Any] | None = None
+    best_end: datetime | None = None
+
+    for period_type in ("quarterly", "annual"):
+        col = db[f"concept_values_{period_type}"]
+        doc = col.find_one(
+            {"company_cik": cik},
+            {"reporting_period.end_date": 1, "reporting_period.fiscal_year": 1,
+             "reporting_period.quarter": 1},
+            sort=[("reporting_period.end_date", -1)],
+        )
+        if doc is None:
+            continue
+        rp = doc.get("reporting_period", {})
+        end_dt: datetime | None = rp.get("end_date")
+        if end_dt is None:
+            continue
+        if best_end is None or end_dt > best_end:
+            best_end = end_dt
+            best = {
+                "period_type": period_type,
+                "fiscal_year": rp.get("fiscal_year"),
+                "quarter": rp.get("quarter"),  # None for annual
+                "end_date": end_dt,
+            }
+
+    return best
+
+
 # ── Upsert ───────────────────────────────────────────────────────────────────
 
 def upsert_concept_values(
@@ -541,14 +597,14 @@ def upsert_concept_values(
             "company_name": company_name,
             "unit": "USD",
         }
-        if start_date is not None:
-            period_doc["start_date"] = datetime(
-                start_date.year, start_date.month, start_date.day,
-                tzinfo=timezone.utc,
-            )
-        # Annual periods have no quarter dimension; quarterly periods do.
+        # Annual periods have no quarter dimension and no start_date; quarterly do.
         if period_type == "quarterly":
             period_doc["quarter"] = quarter
+            if start_date is not None:
+                period_doc["start_date"] = datetime(
+                    start_date.year, start_date.month, start_date.day,
+                    tzinfo=timezone.utc,
+                )
 
         doc: dict[str, Any] = {
             "concept_id": concept_oid,
@@ -557,16 +613,22 @@ def upsert_concept_values(
             "form_type": form_type,
             "reporting_period": period_doc,
             "value": value,
+            "earning_data": True,
             "created_at": now,
             "dimension_value": False,
             "calculated": False,
         }
+        filter_doc: dict[str, Any] = {
+            "concept_id": concept_oid,
+            "reporting_period.end_date": end_datetime,
+            "reporting_period.form_type": form_type,
+        }
+        if period_type == "quarterly":
+            filter_doc["reporting_period.quarter"] = quarter
+
         ops.append(
             UpdateOne(
-                {
-                    "concept_id": concept_oid,
-                    "reporting_period.end_date": end_datetime,
-                },
+                filter_doc,
                 {"$set": doc},
                 upsert=True,
             )

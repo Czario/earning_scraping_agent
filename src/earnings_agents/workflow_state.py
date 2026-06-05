@@ -70,3 +70,9 @@ class EarningsAgentState(TypedDict):
     # retry logic to re-run only the specific chunk(s) that contributed a
     # problematic metric, rather than all chunks in a section.
     chunk_metric_sources: NotRequired[Optional[dict]]  # str → list[int]
+    # ── Period type (annual vs quarterly) ───────────────────────────────────
+    # Inferred at concept-load time from sec_report_date + fiscal_year_end_month.
+    # ``"annual"`` when the report period ends in the fiscal year-end month;
+    # ``"quarterly"`` otherwise (default).  Drives which normalized_concepts_*
+    # collection is queried for targeted extraction.
+    detected_period_type: NotRequired[Optional[str]]  # "annual" | "quarterly"

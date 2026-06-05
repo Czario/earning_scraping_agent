@@ -66,7 +66,11 @@ def _route_after_analysis(
 # ── MongoDB save node ────────────────────────────────────────────────────────
 
 def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
-    """Upsert extracted concept metrics into normalize_data.concept_values_quarterly.
+    """Upsert extracted concept metrics into normalize_data.
+
+    Routes to ``concept_values_quarterly`` or ``concept_values_annual``
+    based on the ``__period__`` string extracted from the filing (via
+    ``upsert_concept_values`` → ``detect_period_type``).
 
     Refuses to save when accounting identity checks failed and
     ``STRICT_ACCURACY`` is enabled (default).

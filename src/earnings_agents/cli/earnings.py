@@ -63,7 +63,7 @@ from earnings_agents.config import (  # noqa: E402
 from earnings_agents.nodes.detect_document_type import detect_document_type_node  # noqa: E402
 from earnings_agents.workflow import build_graph  # noqa: E402
 from earnings_agents.company_registry import lookup_by_cik, lookup_by_ticker  # noqa: E402
-from earnings_agents.tools.edgar_client import get_latest_earnings_url  # noqa: E402
+from earnings_agents.tools.edgar_client import get_latest_earnings_url, get_next_8k_status  # noqa: E402
 from earnings_agents.hooks import set_detail_callback, set_node_callback  # noqa: E402
 
 SEP = "=" * 64
@@ -132,6 +132,90 @@ def _check_mongodb() -> tuple[bool, str]:
         return False, f"MongoDB unreachable: {exc}"
 
 
+def _print_latest_data_status(companies: list[dict], printer=print) -> None:
+    """For each company, show the last stored period and which period is needed next.
+
+    Queries ``concept_values_annual`` and ``concept_values_quarterly`` to find
+    the most recent period already in normalize_data, then infers the next
+    expected period so the operator knows which 8-K to target.
+    """
+    try:
+        from earnings_agents.tools.normalize_data_client import (
+            get_company_by_ticker,
+            get_latest_period,
+        )
+    except Exception as exc:  # noqa: BLE001
+        printer(f"[WARN] Could not import normalize_data_client: {exc}")
+        return
+
+    printer("")
+    printer("── normalize_data coverage ──────────────────────────────────────")
+    for info in companies:
+        ticker = info.get("ticker") or ""
+        name = info.get("company_name", ticker)
+        label = f"{ticker or name}"
+
+        try:
+            company = get_company_by_ticker(ticker) if ticker else None
+        except Exception:  # noqa: BLE001
+            company = None
+
+        if company is None:
+            printer(f"  {label:<12}  not in normalize_data.companies — targeted extraction disabled")
+            continue
+
+        cik = company["cik"]
+        fy_end_month = company["fiscal_year_end_month"]
+        fy_end_code = company.get("fiscal_year_end_code") or f"{fy_end_month:02d}??"
+
+        try:
+            latest = get_latest_period(cik)
+        except Exception as exc:  # noqa: BLE001
+            printer(f"  {label:<12}  DB error: {exc}")
+            continue
+
+        if latest is None:
+            printer(f"  {label:<12}  no data yet  →  fetch any available 8-K")
+            continue
+
+        pt = latest["period_type"]
+        fy = latest["fiscal_year"]
+        q = latest["quarter"]
+        end_dt = latest["end_date"].strftime("%Y-%m-%d") if latest["end_date"] else "?"
+
+        if pt == "annual":
+            last_str = f"FY{fy} annual  (end {end_dt})"
+            # Annual filing covers Q4 + full year; next needed is Q1 of the next fiscal year.
+            next_str = f"FY{fy + 1} Q1 8-K"
+        else:
+            last_str = f"FY{fy} Q{q}  (end {end_dt})"
+            if (q or 0) >= 3:
+                # Q3 is the last standalone quarterly 8-K.
+                # The annual 8-K covers Q4 + full year — there is no Q4-only 8-K.
+                next_str = f"FY{fy} Annual 8-K  (fiscal year-end {fy_end_code})"
+            else:
+                next_str = f"FY{fy} Q{(q or 0) + 1} 8-K"
+
+        # Cross-check SEC EDGAR: is the next needed 8-K already filed?
+        sec_status = get_next_8k_status(cik, end_dt)
+        if sec_status["available"]:
+            sec_note = f"[SEC ✓ filed  report {sec_status['sec_report_date']}]"
+        elif sec_status.get("latest_edgar_report_date"):
+            # EDGAR has a recent 8-K but it didn't clear the next-period threshold —
+            # it's the already-stored period's filing. No new 8-K has landed yet.
+            sec_note = "[✓ already stored — re-run will skip, no new 8-K on SEC yet]"
+        else:
+            sec_note = "[SEC ⏳ not yet]"
+
+        printer(f"  {label:<12}  last stored: {last_str:<36}  need: {next_str}")
+        printer(f"  {'':<12}  {sec_note}")
+
+    printer("─" * 66)
+    printer("")
+
+
+
+
 def _resolve_companies(ciks: list[str], tickers: list[str]) -> list[dict]:
     """Return a list of company dicts ready to feed into the graph."""
     companies: list[dict] = []
@@ -151,6 +235,24 @@ def _resolve_companies(ciks: list[str], tickers: list[str]) -> list[dict]:
         companies.append(info)
 
     return companies
+
+
+def _has_existing_period_data(ticker: str) -> bool:
+    """Return True when normalize_data already has at least one stored period for the ticker."""
+    if not ticker:
+        return False
+    try:
+        from earnings_agents.tools.normalize_data_client import (
+            get_company_by_ticker,
+            get_latest_period,
+        )
+
+        company = get_company_by_ticker(ticker)
+        if company is None:
+            return False
+        return get_latest_period(company["cik"]) is not None
+    except Exception:  # noqa: BLE001 — fail safe: never force a skip on ambiguity
+        return False
 
 
 def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str = "", printer=print) -> dict:
@@ -202,6 +304,18 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
         }
 
     # source == "sec" (default)
+    if not _has_existing_period_data(ticker):
+        printer(
+            f"  [SKIP]   {company_name} ({ticker or cik}) — no existing normalize_data period data; skipping 8-K discovery"
+        )
+        return {
+            **_base,
+            "ir_url": "",
+            "discovered_file_url": None,
+            "status": "skipped",
+            "error": "no existing normalize_data period data found for this company; skipping 8-K path.",
+        }
+
     printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
     filing_url, sec_report_date = get_latest_earnings_url(cik)
     if not filing_url:
@@ -211,6 +325,19 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
             "discovered_file_url": None,
             "status": "failed",
             "error": f"No 8-K earnings filing found on SEC EDGAR for CIK {cik}",
+        }
+    # Guard: skip if this exact period-end date is already stored in normalize_data.
+    if sec_report_date and _is_period_already_stored(ticker, sec_report_date):
+        printer(
+            f"  [UP TO DATE] {company_name} ({ticker or cik}) — "
+            f"period {sec_report_date} already in normalize_data"
+        )
+        return {
+            **_base,
+            "ir_url": "",
+            "discovered_file_url": filing_url,
+            "sec_report_date": sec_report_date,
+            "status": "already_stored",
         }
     return {
         **_base,
@@ -233,6 +360,16 @@ def _run_company(graph, info: dict, source: str = "sec", ir_url_override: str = 
 
     if state["status"] == "failed":
         printer(f"  [SKIP]  {state['error']}")
+        printer(SEP)
+        return state
+
+    if state["status"] == "skipped":
+        printer(f"  [SKIP]  {state['error']}")
+        printer(SEP)
+        return state
+
+    if state["status"] == "already_stored":
+        printer(f"  [UP TO DATE]  period {state.get('sec_report_date', '?')} already in normalize_data — skipping")
         printer(SEP)
         return state
 
@@ -284,12 +421,17 @@ def _dry_run_company(
 
     file_type: str | None = None
     url_blocked = state.get("status") == "failed"
-    if not url_blocked and state.get("discovered_file_url"):
+    already_stored = state.get("status") == "already_stored"
+    if not url_blocked and not already_stored and state.get("discovered_file_url"):
         dt = detect_document_type_node(state)
         file_type = dt.get("file_type")
 
-    if url_blocked:
+    if state.get("status") == "skipped":
+        verdict = "skipped"
+    elif url_blocked:
         verdict = "blocked"
+    elif already_stored:
+        verdict = "already_stored"
     elif not llm_ok or not mongo_ok:
         verdict = "warning"
     else:
@@ -305,6 +447,12 @@ def _dry_run_company(
     printer(f"  Verdict : {verdict.upper()}")
     if verdict == "blocked":
         printer(f"  Reason  : {state.get('error', 'URL resolution failed')}")
+    elif verdict == "skipped":
+        printer(f"  Reason  : {state.get('error', 'No existing normalize_data period data found')}")
+        printer("  Action  : Skipping SEC 8-K discovery because no prior normalize_data period exists")
+    elif verdict == "already_stored":
+        printer(f"  Reason  : period {state.get('sec_report_date', '?')} already stored in normalize_data")
+        printer("  Action  : No action needed — data is up to date")
     elif verdict == "warning":
         if not llm_ok:
             if LLM_PROVIDER == "ollama":
@@ -333,6 +481,35 @@ def _is_already_saved(ticker: str) -> bool:
     try:
         return get_collection().count_documents({"_id": doc_id}, limit=1) > 0
     except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_period_already_stored(ticker: str, sec_report_date_str: str | None) -> bool:
+    """Return True when *sec_report_date_str* is already the latest period in normalize_data.
+
+    Compares the EDGAR-reported period-end date against the most recently
+    stored ``end_date`` in ``concept_values_quarterly`` or
+    ``concept_values_annual`` for *ticker*'s CIK.  Returns False on any DB
+    error or missing data (fail-safe: never skips on ambiguity).
+    """
+    if not sec_report_date_str or not ticker:
+        return False
+    try:
+        from datetime import date
+        from earnings_agents.tools.normalize_data_client import (
+            get_company_by_ticker,
+            get_latest_period,
+        )
+        company = get_company_by_ticker(ticker)
+        if company is None:
+            return False
+        latest = get_latest_period(company["cik"])
+        if latest is None:
+            return False
+        report_date = date.fromisoformat(sec_report_date_str)
+        stored_end = latest["end_date"].date()
+        return stored_end == report_date
+    except Exception:  # noqa: BLE001 — fail safe: never skip on ambiguity
         return False
 
 
@@ -436,6 +613,8 @@ def _run_company_parallel(args: tuple) -> dict:
         desc = f"[green]{name}[/]  saved \u2713"
     elif status == "failed":
         desc = f"[red]{name}[/]  failed \u2717"
+    elif status == "already_stored":
+        desc = f"[cyan]{name}[/]  already up to date \u2713"
     else:
         desc = f"[yellow]{name}[/]  {status}"
     progress.update(company_task, total=1, completed=1, description=desc)
@@ -458,9 +637,10 @@ def _dry_run_company_parallel(args: tuple) -> dict:
     result = _dry_run_company(info, source=source, ir_url_override=ir_url_override,
                               printer=lambda _: None)
     verdict = result.get("_dry_run_verdict", "?")
-    color = {"ready": "green", "warning": "yellow", "blocked": "red"}.get(verdict, "white")
+    color = {"ready": "green", "warning": "yellow", "blocked": "red", "already_stored": "cyan"}.get(verdict, "white")
+    verdict_label = {"already_stored": "up to date"}.get(verdict, verdict)
     progress.update(company_task, total=1, completed=1,
-                    description=f"[{color}]{name}[/]  {verdict}")
+                    description=f"[{color}]{name}[/]  {verdict_label}")
     progress.update(overall_task, advance=1)
     return result
 
@@ -607,6 +787,7 @@ def main() -> None:
     _progress.console.print(f"[bold cyan]LLM[/]      : {llm_label}")
 
     if args.dry_run:
+        _print_latest_data_status(companies, printer=_progress.console.print)
         total = len(companies)
         with _progress as progress:
             overall_task = progress.add_task("[bold]Dry-run[/]", total=total)
@@ -626,11 +807,23 @@ def main() -> None:
 
         blocked = sum(1 for r in results if r.get("_dry_run_verdict") == "blocked")
         warnings = sum(1 for r in results if r.get("_dry_run_verdict") == "warning")
-        ready = total - blocked - warnings
-        print(f"Dry-run: {total} companies \u2014 {ready} ready, {warnings} warning, {blocked} blocked.")
+        skipped = sum(1 for r in results if r.get("_dry_run_verdict") == "skipped")
+        up_to_date_count = sum(1 for r in results if r.get("_dry_run_verdict") == "already_stored")
+        ready = total - blocked - warnings - skipped - up_to_date_count
+        parts = [f"{ready} ready"]
+        if up_to_date_count:
+            parts.append(f"{up_to_date_count} up to date")
+        if skipped:
+            parts.append(f"{skipped} skipped")
+        if warnings:
+            parts.append(f"{warnings} warning")
+        if blocked:
+            parts.append(f"{blocked} blocked")
+        print(f"Dry-run: {total} companies \u2014 {', '.join(parts)}.")
         sys.exit(1 if blocked else 0)
 
     # Live run
+    _print_latest_data_status(companies, printer=_progress.console.print)
     graph = build_graph()
     total = len(companies)
     with _progress as progress:
@@ -651,10 +844,13 @@ def main() -> None:
 
     saved = [r for r in results if r.get("status") == "saved"]
     skipped = [r for r in results if r.get("status") == "skipped"]
-    failed = [r for r in results if r.get("status") not in ("saved", "skipped")]
+    up_to_date = [r for r in results if r.get("status") == "already_stored"]
+    failed = [r for r in results if r.get("status") not in ("saved", "skipped", "already_stored")]
     summary = f"Done: {len(saved)}/{total} saved"
     if skipped:
         summary += f", {len(skipped)} skipped"
+    if up_to_date:
+        summary += f", {len(up_to_date)} already up to date"
     if failed:
         summary += f", {len(failed)} failed"
     print(summary + ".")
