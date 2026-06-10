@@ -143,24 +143,31 @@ def _infer_period_end_from_prior_year(
     recent: dict,
     target_filing_date_str: str,
 ) -> Optional[str]:
-    """Infer the fiscal quarter-end date for an earnings 8-K.
+    """Infer the fiscal period-end date for an earnings 8-K.
 
     EDGAR ``reportDate`` on 8-K filings is company-set and may be the
-    earnings *announcement* date rather than the actual fiscal quarter end.
-    A 10-Q filed for the same quarter one year earlier always carries the
-    correct ``reportDate`` = exact fiscal quarter end.  Projecting that
-    date forward one calendar year gives a reliable period-end date without
-    any additional HTTP calls.
+    earnings *announcement* date rather than the actual fiscal period end.
+    A 10-Q (quarterly) or 10-K (annual) filed for the same period one year
+    earlier always carries the correct ``reportDate`` = exact fiscal period
+    end.  Projecting that date forward one calendar year gives a reliable
+    period-end date without any additional HTTP calls.
+
+    Both 10-Q and 10-K are considered so that annual / fourth-quarter
+    earnings releases (which have no same-period 10-Q) anchor on the prior
+    year's 10-K instead.  When several periodic filings fall inside the
+    window, the one whose ``filingDate`` is closest to one year before the
+    target wins, which naturally selects the 10-Q for quarterly releases and
+    the 10-K for annual releases.
 
     Algorithm:
-    1. Find the 10-Q in *recent* whose ``filingDate`` is closest to
+    1. Find the 10-Q or 10-K in *recent* whose ``filingDate`` is closest to
        ``target_filing_date`` - 1 year, within a ±60-day window.
     2. Take its ``reportDate`` and add one calendar year.
     3. Accept only if the result is 14–100 days before ``target_filing_date``
-       (the typical window for quarterly earnings press releases).
+       (the typical window for earnings press releases).
 
-    Returns ``"YYYY-MM-DD"`` or ``None`` if no suitable prior-year 10-Q
-    is found or the sanity check fails.
+    Returns ``"YYYY-MM-DD"`` or ``None`` if no suitable prior-year periodic
+    filing is found or the sanity check fails.
     """
     from datetime import date as _d, timedelta
 
@@ -180,7 +187,7 @@ def _infer_period_end_from_prior_year(
     best_delta = timedelta.max
 
     for i, form in enumerate(forms):
-        if form != "10-Q":
+        if form not in ("10-Q", "10-K"):
             continue
         fd_str = filing_dates[i] if i < len(filing_dates) else ""
         rd_str = report_dates[i] if i < len(report_dates) else ""

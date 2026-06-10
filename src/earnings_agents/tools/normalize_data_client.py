@@ -524,8 +524,11 @@ def upsert_concept_values(
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
-    Routes to ``concept_values_quarterly`` or ``concept_values_annual``
-    depending on *period_str*:
+    Routes to ``concept_values_quarterly`` or ``concept_values_annual``.
+    The company's *fiscal_year_end_month* (from the normalize_data
+    ``companies`` collection) is the authoritative signal: when the resolved
+    period-end month equals it, the filing is annual.  Otherwise the duration
+    keywords in *period_str* decide:
       - "Three Months Ended …" / "Thirteen Weeks Ended …" → quarterly
       - "Year Ended …" / "Twelve Months Ended …" / "52/53 Weeks Ended …" → annual
 
@@ -561,7 +564,16 @@ def upsert_concept_values(
             report_date, parse_period_end_date(period_str),
         )
 
-    period_type = detect_period_type(period_str)  # "annual" | "quarterly"
+    # Annual vs quarterly routing.  The company's fiscal year-end month (from
+    # the normalize_data ``companies`` collection, e.g. "0430" → April) is the
+    # authoritative signal: when the resolved period-end month equals the
+    # fiscal year-end month, this is the full-year (annual) filing — regardless
+    # of how the LLM labelled ``__period__``.  Otherwise fall back to the
+    # duration keywords in *period_str*.
+    if end_date.month == fiscal_year_end_month:
+        period_type = "annual"
+    else:
+        period_type = detect_period_type(period_str)  # "annual" | "quarterly"
     collection_name = f"concept_values_{period_type}"
     form_type = "10-K" if period_type == "annual" else "10-Q"
 

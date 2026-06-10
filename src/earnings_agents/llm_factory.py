@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
+import time
+from collections import deque
 from typing import Any
 
 from earnings_agents.config import (
@@ -20,6 +23,8 @@ from earnings_agents.config import (
     GROQ_BASE_URL,
     GROQ_MODEL,
     GROQ_REQUEST_TIMEOUT,
+    GROQ_RPM,
+    GROQ_TPM,
     LLM_CACHE_DIR,
     LLM_CACHE_ENABLED,
     LLM_PROVIDER,
@@ -29,6 +34,85 @@ from earnings_agents.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _GroqRateLimiter:
+    """Thread-safe sliding-window rate limiter for Groq API (RPM + TPM budgets).
+
+    Enforces two independent 60-second sliding-window budgets:
+    * ``rpm`` — maximum requests per minute.
+    * ``tpm`` — maximum tokens per minute (input + output combined).
+
+    Call :meth:`acquire` *before* each request.  It blocks until both budgets
+    allow the request through, then records the reservation.  After the API
+    returns the real token count, call :meth:`update_actual` so the running
+    token total stays accurate for subsequent requests.
+    """
+
+    _WINDOW: float = 60.0  # sliding window in seconds
+
+    def __init__(self, rpm: int, tpm: int) -> None:
+        self._rpm = rpm
+        self._tpm = tpm
+        self._lock = threading.Lock()
+        self._req_times: deque[float] = deque()      # request timestamps
+        self._tok_log: list[list] = []               # mutable [timestamp, token_count] pairs
+
+    def _expire(self, now: float) -> None:
+        """Drop entries older than the sliding window."""
+        cutoff = now - self._WINDOW
+        while self._req_times and self._req_times[0] < cutoff:
+            self._req_times.popleft()
+        self._tok_log = [e for e in self._tok_log if e[0] >= cutoff]
+
+    def acquire(self, estimated_tokens: int) -> list:
+        """Block until the RPM and TPM budgets allow a new request.
+
+        Returns a mutable ``[timestamp, token_count]`` entry that can be
+        corrected later via :meth:`update_actual`.
+        """
+        entry: list = [0.0, estimated_tokens]
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._expire(now)
+                current_rpm = len(self._req_times)
+                current_tpm = sum(e[1] for e in self._tok_log)
+                rpm_ok = current_rpm < self._rpm
+                tpm_ok = current_tpm + estimated_tokens <= self._tpm
+                if rpm_ok and tpm_ok:
+                    entry[0] = now
+                    self._req_times.append(now)
+                    self._tok_log.append(entry)
+                    return entry
+                # Calculate minimum sleep to free up budget
+                wait = 0.1
+                if not rpm_ok and self._req_times:
+                    wait = max(wait, self._WINDOW - (now - self._req_times[0]) + 0.1)
+                if not tpm_ok:
+                    need = current_tpm + estimated_tokens - self._tpm
+                    drained = 0
+                    for e in self._tok_log:
+                        drained += e[1]
+                        if drained >= need:
+                            wait = max(wait, self._WINDOW - (now - e[0]) + 0.1)
+                            break
+                logger.info(
+                    "Groq rate limit: waiting %.1fs "
+                    "(window=%d req/%d tok, budget=%d rpm/%d tpm)",
+                    wait, current_rpm, current_tpm, self._rpm, self._tpm,
+                )
+            time.sleep(wait)
+
+    def update_actual(self, entry: list, actual_tokens: int) -> None:
+        """Replace the estimated token count in *entry* with the real API count."""
+        with self._lock:
+            entry[1] = actual_tokens
+
+
+# Module-level singleton — shared across all _GroqInvokeAdapter instances so
+# concurrent calls from parallel ticker workers respect the same budget.
+_groq_rate_limiter = _GroqRateLimiter(rpm=GROQ_RPM, tpm=GROQ_TPM)
 
 
 class _CachedLLM:
@@ -64,14 +148,23 @@ class _CachedLLM:
 
 
 class _GroqInvokeAdapter:
-    """Groq adapter with token-usage logging."""
+    """Groq adapter with rate limiting and token-usage logging."""
 
     def __init__(self, chat_model: Any) -> None:
         self._chat = chat_model
 
     def invoke(self, prompt: str) -> str:
-        msg = self._chat.invoke(prompt)
-        # Log token usage from Groq response metadata (OpenAI-compatible format).
+        # Estimate token cost: chars→tokens (÷4) plus a conservative output budget.
+        # The real count corrects the reservation once the API responds.
+        estimated_tokens = len(prompt) // 4 + 800
+        token_entry = _groq_rate_limiter.acquire(estimated_tokens)
+        try:
+            msg = self._chat.invoke(prompt)
+        except Exception:
+            # Release the reservation on error so the budget isn't permanently consumed.
+            _groq_rate_limiter.update_actual(token_entry, 0)
+            raise
+        # Log and correct token budget with actual usage.
         usage = getattr(msg, "response_metadata", {}).get("token_usage") or {}
         if usage:
             logger.debug(
@@ -80,6 +173,8 @@ class _GroqInvokeAdapter:
                 usage.get("completion_tokens", "?"),
                 usage.get("total_tokens", "?"),
             )
+            actual_tokens = usage.get("total_tokens", estimated_tokens)
+            _groq_rate_limiter.update_actual(token_entry, actual_tokens)
         content = getattr(msg, "content", msg)
         return content if isinstance(content, str) else str(content)
 

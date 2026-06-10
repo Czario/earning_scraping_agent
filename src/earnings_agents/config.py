@@ -18,6 +18,9 @@ GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 GROQ_REQUEST_TIMEOUT: float = float(os.getenv("GROQ_REQUEST_TIMEOUT", "60"))
+# Groq rate-limit budgets (free-tier defaults; override via env vars for paid plans).
+GROQ_RPM: int = int(os.getenv("GROQ_RPM", "30"))       # requests per minute
+GROQ_TPM: int = int(os.getenv("GROQ_TPM", "12000"))    # tokens per minute
 MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")
@@ -43,10 +46,11 @@ EXTRACTION_MAX_CHARS: int = int(
 )
 
 # Chunk size and overlap for splitting raw text before LLM extraction.
-# For Groq the default is large enough to fit a full press release in one chunk,
-# eliminating multi-chunk merges and retries for most documents.
+# For Groq, default to 8 000 chars (~2 000 input tokens) so each request stays
+# well within the 12 K TPM free-tier budget (leaving headroom for output tokens
+# and retries).  Operators on paid plans can raise this via CHUNK_SIZE.
 CHUNK_SIZE: int = int(
-    os.getenv("CHUNK_SIZE", "400000" if _GROQ_PROVIDER else "6000")
+    os.getenv("CHUNK_SIZE", "8000" if _GROQ_PROVIDER else "6000")
 )
 CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "300"))
 
