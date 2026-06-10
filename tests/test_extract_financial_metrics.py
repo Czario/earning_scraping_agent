@@ -14,6 +14,7 @@ from earnings_agents.nodes.extract_financial_metrics import (
     _prescan_document,
     extract_financial_metrics_node,
 )
+from earnings_agents.extraction.chunker import _build_period_hint
 from earnings_agents.tools.company_hints_loader import _HINTS_DIR
 
 
@@ -518,6 +519,45 @@ def test_scale_millions_applied_by_python():
     assert result["Diluted EPS"] == pytest.approx(4.27)   # EPS not multiplied
 
 
+def test_scale_thousands_large_annual_values_still_scaled():
+    """Thousands-scale multi-billion annual figures must all be scaled consistently.
+
+    Regression: CASY FY2026 annual press release in thousands. Revenue
+    (17,561,101) and Cost of revenue (13,240,060) exceed the old fixed
+    _TABLE_RAW_MAX guard (10 M) and were left unscaled, while Gross profit
+    (4,321,041 < 10 M) was scaled — breaking the income-statement identity.
+    All three must be multiplied by 1_000.
+    """
+    from earnings_agents.nodes.extract_financial_metrics import _parse_llm_response
+
+    raw = (
+        '{"__scale__": "thousands", '
+        '"Revenues": 17561101, '
+        '"Cost of goods sold": 13240060, '
+        '"Gross Profit": 4321041}'
+    )
+    result = _parse_llm_response(raw)
+    assert result is not None
+    assert result["Revenues"] == pytest.approx(17_561_101_000)
+    assert result["Cost of goods sold"] == pytest.approx(13_240_060_000)
+    assert result["Gross Profit"] == pytest.approx(4_321_041_000)
+    # Identity holds after scaling: Revenue − Cost == Gross profit
+    assert result["Revenues"] - result["Cost of goods sold"] == pytest.approx(
+        result["Gross Profit"]
+    )
+
+
+def test_scale_thousands_already_full_usd_not_rescaled():
+    """A thousands-scale cell already at full USD ($10T+) is not re-multiplied."""
+    from earnings_agents.nodes.extract_financial_metrics import _parse_llm_response
+
+    raw = '{"__scale__": "thousands", "Total Revenue": 20000000000000}'
+    result = _parse_llm_response(raw)
+    assert result is not None
+    # Above the ~$10T absolute ceiling -> treated as already full USD.
+    assert result["Total Revenue"] == pytest.approx(20_000_000_000_000)
+
+
 def test_scale_as_is_no_multiplication():
     """__scale__:as-is leaves full-USD narrative values untouched."""
     from earnings_agents.nodes.extract_financial_metrics import _parse_llm_response
@@ -527,6 +567,52 @@ def test_scale_as_is_no_multiplication():
     assert result is not None
     assert result["Total Revenue"] == pytest.approx(82_886_000_000)
     assert result["Diluted EPS"] == pytest.approx(4.27)
+
+
+@pytest.mark.parametrize(
+    "scale, multiplier, rev_raw, cost_raw, gross_raw",
+    [
+        # thousands: raw Revenue/Cost > 10 M (old fixed cap) but Gross < 10 M —
+        # the exact straddle that broke CASY. Identity: 17,561,101−13,240,060.
+        ("thousands", 1_000, 17_561_101, 13_240_060, 4_321_041),
+        # millions: typical large-cap statement. Identity: 17,561−13,240.
+        ("millions", 1_000_000, 17_561, 13_240, 4_321),
+        # billions: values are small raw numbers. Identity: 176−132.
+        ("billions", 1_000_000_000, 176, 132, 44),
+    ],
+)
+def test_scale_invariant_uniform_across_all_scales(
+    scale, multiplier, rev_raw, cost_raw, gross_raw
+):
+    """Generality guard: every dollar line item in one statement scales uniformly.
+
+    The wrong-scaling bug (CASY) happened because a fixed raw cap let some
+    values cross the threshold (skipped) while others did not (scaled),
+    breaking the income-statement identity. This locks the invariant for all
+    three scales: each value is multiplied by the same factor and the
+    income-statement identity (Revenue − Cost == Gross Profit) survives scaling.
+    """
+    from earnings_agents.nodes.extract_financial_metrics import _parse_llm_response
+
+    # Sanity: the chosen raw triple already satisfies the identity.
+    assert rev_raw - cost_raw == gross_raw
+
+    raw = (
+        f'{{"__scale__": "{scale}", '
+        f'"Revenues": {rev_raw}, '
+        f'"Cost of goods sold": {cost_raw}, '
+        f'"Gross Profit": {gross_raw}}}'
+    )
+    result = _parse_llm_response(raw)
+    assert result is not None
+    # Every value scaled by the SAME factor.
+    assert result["Revenues"] == pytest.approx(rev_raw * multiplier)
+    assert result["Cost of goods sold"] == pytest.approx(cost_raw * multiplier)
+    assert result["Gross Profit"] == pytest.approx(gross_raw * multiplier)
+    # The income-statement identity must hold after scaling, on every scale.
+    assert result["Revenues"] - result["Cost of goods sold"] == pytest.approx(
+        result["Gross Profit"]
+    )
 
 
 
@@ -1176,3 +1262,34 @@ class TestLlmMapConcepts:
         mock_llm = MagicMock()
         assert _llm_map_concepts([], self._CONCEPTS, mock_llm) == {}
         assert _llm_map_concepts(["Revenue"], [], mock_llm) == {}
+
+
+class TestBuildPeriodHint:
+    """Period-hint duration rule must adapt to annual vs quarterly filings."""
+
+    def test_annual_filing_prefers_longest_duration(self):
+        hint = _build_period_hint("2026-04-30", None, is_annual=True)
+        assert "April 30, 2026" in hint
+        assert "LONGEST duration" in hint
+        assert "Twelve Months Ended" in hint
+        assert "SHORTEST" not in hint
+
+    def test_quarterly_filing_prefers_shortest_duration(self):
+        hint = _build_period_hint("2026-01-31", None, is_annual=False)
+        assert "January 31, 2026" in hint
+        assert "SHORTEST duration" in hint
+        assert "single-quarter column" in hint
+        assert "LONGEST" not in hint
+
+    def test_falls_back_to_doc_period_without_sec_date(self):
+        hint = _build_period_hint(None, "Three Months Ended April 30, 2026", is_annual=False)
+        assert "Three Months Ended April 30, 2026" in hint
+        assert "__period__" in hint
+
+    def test_invalid_sec_date_falls_back_to_doc_period(self):
+        hint = _build_period_hint("not-a-date", "Twelve Months Ended April 30, 2026", is_annual=True)
+        assert "Twelve Months Ended April 30, 2026" in hint
+
+    def test_no_signals_returns_generic_hint(self):
+        hint = _build_period_hint(None, None, is_annual=False)
+        assert "MOST RECENT ACTUAL reported quarter" in hint

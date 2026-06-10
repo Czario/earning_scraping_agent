@@ -114,6 +114,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
     fy_end_month: int | None = state.get("fiscal_year_end_month")  # type: ignore[assignment]
     fy_end_code: str = str(state.get("fiscal_year_end_code") or "1231")
     period_str: str = str(metrics.get("__period__") or "")
+    detected_period_type: str | None = state.get("detected_period_type")  # type: ignore[assignment]
 
     if concept_metrics and cik and fy_end_month and (period_str or sec_rd):
         from earnings_agents.tools.normalize_data_client import upsert_concept_values
@@ -126,6 +127,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 fiscal_year_end_month=fy_end_month,
                 fiscal_year_end_code=fy_end_code,
                 report_date=sec_rd,
+                period_type_override=detected_period_type,
             )
             logger.info(
                 "normalize_data: upserted %d concept value(s) for %s", n, ticker

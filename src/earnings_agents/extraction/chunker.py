@@ -167,6 +167,62 @@ def _prescan_document(raw_text: str) -> tuple[str | None, str | None, str | None
     return scale, shares_scale, period
 
 
+def _build_period_hint(
+    sec_report_date_str: str | None,
+    doc_period: str | None,
+    is_annual: bool,
+) -> str:
+    """Build the CONFIRMED PERIOD instruction injected into every chunk prompt.
+
+    Annual (10-K) filings present both the single-quarter (e.g. "Three Months
+    Ended") and the full-year (e.g. "Twelve Months Ended") columns side by
+    side. For these the full-year column is the one we want, so the duration
+    rule flips from "shortest" to "longest". For quarterly (10-Q) filings the
+    single-quarter column is correct.
+    """
+    if sec_report_date_str:
+        try:
+            from datetime import date as _date
+
+            _rd = _date.fromisoformat(sec_report_date_str)
+            _formatted = _rd.strftime("%B %-d, %Y")  # e.g. "April 27, 2026"
+        except ValueError:
+            _formatted = None
+        if _formatted is not None:
+            if is_annual:
+                duration_rule = (
+                    f"If multiple columns share this end date but cover different durations "
+                    f"(e.g. both 'Three Months Ended' and 'Twelve Months Ended' end on {_formatted}), "
+                    f"always choose the LONGEST duration — the full-year column "
+                    f"(e.g. 'Twelve Months Ended'), NOT the single-quarter column. "
+                    f"This is an ANNUAL (full-year) filing. "
+                )
+            else:
+                duration_rule = (
+                    f"If multiple columns share this end date but cover different durations "
+                    f"(e.g. both 'Three Months Ended' and 'Nine Months Ended' end on {_formatted}), "
+                    f"always choose the SHORTEST duration — the single-quarter column, "
+                    f"NOT the year-to-date column. "
+                )
+            return (
+                f"CONFIRMED PERIOD: the current reporting period ends {_formatted} "
+                f"(per SEC filing) — extract values from the column with this date. "
+                f"{duration_rule}"
+                f"Do NOT extract guidance, forecasts, or next-quarter projections.\n"
+            )
+
+    if doc_period:
+        return (
+            f"CONFIRMED PERIOD: current reporting period is \"{doc_period}\" — "
+            f"set __period__ = \"{doc_period}\" and extract values from this column only. "
+            f"Do NOT extract guidance, forecasts, or next-quarter projections.\n"
+        )
+    return (
+        "IMPORTANT: extract values from the MOST RECENT ACTUAL reported quarter only. "
+        "Do NOT extract guidance, forecasts, or next-quarter projections.\n"
+    )
+
+
 def _build_section_chunks(
     raw_sections: dict | None,
     target_concepts: list[dict] | None = None,

@@ -34,6 +34,7 @@ from earnings_agents.extraction.chunker import (
     _SECTION_CHUNK_LABELS,
     _SECTION_PRIORITY,
     _UNKNOWN_SECTION_PRIORITY,
+    _build_period_hint,
     _build_section_chunks,
     _chunk_text,
     _prescan_document,
@@ -390,33 +391,13 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     # is always the current quarter — unlike a prescan hit that can pick up
     # the prior-year comparison column header instead.
     sec_report_date_str: str | None = state.get("sec_report_date")  # type: ignore[assignment]
-    if sec_report_date_str:
-        try:
-            from datetime import date as _date
-            _rd = _date.fromisoformat(sec_report_date_str)
-            _formatted = _rd.strftime("%B %-d, %Y")  # e.g. "April 27, 2026"
-            period_hint = (
-                f"CONFIRMED PERIOD: the current reporting period ends {_formatted} "
-                f"(per SEC filing) — extract values from the column with this date. "
-                f"If multiple columns share this end date but cover different durations "
-                f"(e.g. both 'Three Months Ended' and 'Nine Months Ended' end on {_formatted}), "
-                f"always choose the SHORTEST duration — the single-quarter column, "
-                f"NOT the year-to-date column. "
-                f"Do NOT extract guidance, forecasts, or next-quarter projections.\n"
-            )
-        except ValueError:
-            sec_report_date_str = None  # fall through to prescan
-
-    if not sec_report_date_str:
-        period_hint = (
-            f"CONFIRMED PERIOD: current reporting period is \"{doc_period}\" — "
-            f"set __period__ = \"{doc_period}\" and extract values from this column only. "
-            f"Do NOT extract guidance, forecasts, or next-quarter projections.\n"
-            if doc_period else (
-                "IMPORTANT: extract values from the MOST RECENT ACTUAL reported quarter only. "
-                "Do NOT extract guidance, forecasts, or next-quarter projections.\n"
-            )
-        )
+    # Annual (10-K) filings present both the single-quarter (e.g. "Three Months
+    # Ended") and the full-year (e.g. "Twelve Months Ended") columns side by
+    # side. For these, the full-year column is the one we want — so the
+    # duration instruction must flip from "shortest" to "longest". For
+    # quarterly (10-Q) filings the single-quarter column is correct.
+    is_annual = state.get("detected_period_type") == "annual"
+    period_hint = _build_period_hint(sec_report_date_str, doc_period, is_annual)
 
     # Load static human-curated company hints (if any) — injected on every pass.
     company_hints = _load_company_hints(ticker)

@@ -179,6 +179,27 @@ def test_infer_period_type(sec_report_date, fy_end_month, expected):
     assert _infer_period_type(sec_report_date, fy_end_month) == expected
 
 
+@pytest.mark.parametrize("sec_report_date, fy_end_month, fy_end_code, expected", [
+    # 52/53-week filer (FYE "nearest Jan 31"): year-end drifts into early Feb.
+    ("2026-02-03", 1, "0131", "annual"),
+    # …and into late Jan of the prior calendar month boundary.
+    ("2026-01-28", 1, "0131", "annual"),
+    # 52/53-week filer (FYE "nearest Apr 30"): drift into early May.
+    ("2026-05-02", 4, "0430", "annual"),
+    # Drift just past the 7-day tolerance is NOT annual.
+    ("2026-02-08", 1, "0131", "quarterly"),
+    # A genuine quarter-end (~3 months away) is never caught by proximity.
+    ("2025-10-31", 1, "0131", "quarterly"),
+    # Without a day code, only month-equality applies → drift stays quarterly.
+    ("2026-02-03", 1, None, "quarterly"),
+])
+def test_infer_period_type_52_53_week_drift(
+    sec_report_date, fy_end_month, fy_end_code, expected
+):
+    assert _infer_period_type(sec_report_date, fy_end_month, fy_end_code) == expected
+
+
+
 # ── get_statement_concepts uses correct collection ───────────────────────────
 
 def test_get_statement_concepts_uses_quarterly_collection_by_default():
@@ -291,6 +312,43 @@ def test_upsert_concept_values_uses_annual_collection_for_annual_periods():
     update_doc = state["_doc"]["$set"]
     assert update_doc["earning_data"] is True
     assert "start_date" not in update_doc["reporting_period"]
+
+
+def test_upsert_concept_values_period_type_override_is_authoritative():
+    """An explicit period_type_override wins over month-equality and __period__.
+
+    Guards the single-source-of-truth contract: ``detected_period_type`` from
+    the upstream node routes the save collection so the prompt's column
+    selection and the persisted period type can never diverge.
+    """
+    from datetime import date
+    from earnings_agents.tools import normalize_data_client as ndc
+
+    mock_collection = MagicMock()
+    mock_db = MagicMock()
+    mock_db.__getitem__ = MagicMock(return_value=mock_collection)
+
+    with patch.object(ndc, "_get_client") as mock_client:
+        mock_client.return_value.__getitem__ = MagicMock(return_value=mock_db)
+
+        # period_str/report_date both look quarterly, but the override says annual.
+        ndc.upsert_concept_values(
+            cik="000123",
+            company_name="Example Co",
+            concept_metrics={"507f1f77bcf86cd799439011": 1.23},
+            period_str="Three Months Ended March 31, 2026",
+            fiscal_year_end_month=12,
+            report_date=date(2026, 3, 31),
+            period_type_override="annual",
+        )
+
+    called_collection = mock_db.__getitem__.call_args_list[0][0][0]
+    assert called_collection == "concept_values_annual"
+    ops = mock_collection.bulk_write.call_args[0][0]
+    state = ops[0].__getstate__()[1]
+    assert state["_filter"]["reporting_period.form_type"] == "10-K"
+    assert "reporting_period.quarter" not in state["_filter"]
+
 
 
 def test_get_latest_period_returns_most_recent_across_both_collections():

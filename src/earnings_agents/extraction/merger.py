@@ -52,6 +52,13 @@ _SCALE_MULTIPLIERS: dict[str, int] = {
 # a narrative value like 82_900_000_000) and won't be re-multiplied.
 _TABLE_RAW_MAX = 10_000_000  # 10 M raw -> $10T if x1M -- implausible, so skip
 
+# The implausibility ceiling above is scale-relative: a raw cell is treated as
+# "already full USD" only when multiplying it would exceed roughly $10T. That
+# ceiling equals _TABLE_RAW_MAX * millions-multiplier, so for a thousands-scale
+# document the raw cap is 1000x higher (a $17.5B annual revenue legitimately
+# appears as 17,561,101 in thousands and MUST still be scaled).
+_IMPLAUSIBLE_ABS_USD = _TABLE_RAW_MAX * 1_000_000  # ~$10T absolute ceiling
+
 # Minimum fraction of the largest revenue-like value that a dollar field must
 # have to be considered plausible (filters out residual unscaled cells).
 _MIN_DOLLAR_FRACTION = 0.001   # 0.1 % of revenue
@@ -238,6 +245,11 @@ def _parse_llm_response(
         multiplier = prescan_dollar_multiplier
     else:
         multiplier = _SCALE_MULTIPLIERS.get(scale_str, 1)
+    # Scale-relative raw cap: a cell is "already full USD" only if multiplying
+    # it would breach the ~$10T absolute ceiling. For thousands scale this cap
+    # is 1000x higher than the millions case, so multi-billion annual figures
+    # (e.g. 17,561,101 thousands = $17.5B) are still scaled instead of skipped.
+    table_raw_max = _IMPLAUSIBLE_ABS_USD // multiplier if multiplier > 1 else _TABLE_RAW_MAX
     if multiplier > 1 or shares_multiplier > 1:
         for k, v in list(parsed.items()):
             if v is None or not isinstance(v, (int, float)):
@@ -253,7 +265,7 @@ def _parse_llm_response(
                 not is_share_count
                 and not _PCT_OR_PER_SHARE_PATTERNS.search(k)
                 and multiplier > 1
-                and abs(v) < _TABLE_RAW_MAX   # skip values already at full USD scale
+                and abs(v) < table_raw_max   # skip values already at full USD scale
             ):
                 # Ambiguous 'gross margin' label: percentage (<= 100) vs dollar amount (> 100).
                 # Skip scaling when the value is clearly already a percentage.

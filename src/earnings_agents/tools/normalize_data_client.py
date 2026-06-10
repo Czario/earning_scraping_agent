@@ -521,14 +521,21 @@ def upsert_concept_values(
     fiscal_year_end_code: str = "1231",
     statement_type: str = "income_statement",
     report_date: date | None = None,
+    period_type_override: str | None = None,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
     Routes to ``concept_values_quarterly`` or ``concept_values_annual``.
-    The company's *fiscal_year_end_month* (from the normalize_data
-    ``companies`` collection) is the authoritative signal: when the resolved
-    period-end month equals it, the filing is annual.  Otherwise the duration
-    keywords in *period_str* decide:
+    Routing precedence (highest first):
+
+    1. *period_type_override* — when the caller already resolved the period
+       type upstream (``state["detected_period_type"]`` from
+       ``load_company_concepts_node``), it is authoritative.  This keeps the
+       prompt's period selection and the save collection in lock-step from a
+       single source of truth.
+    2. **Fiscal year-end month** — when the resolved period-end month equals
+       the company's *fiscal_year_end_month*, the filing is annual.
+    3. **Duration keywords** in *period_str* (``detect_period_type``):
       - "Three Months Ended …" / "Thirteen Weeks Ended …" → quarterly
       - "Year Ended …" / "Twelve Months Ended …" / "52/53 Weeks Ended …" → annual
 
@@ -564,13 +571,17 @@ def upsert_concept_values(
             report_date, parse_period_end_date(period_str),
         )
 
-    # Annual vs quarterly routing.  The company's fiscal year-end month (from
-    # the normalize_data ``companies`` collection, e.g. "0430" → April) is the
-    # authoritative signal: when the resolved period-end month equals the
-    # fiscal year-end month, this is the full-year (annual) filing — regardless
-    # of how the LLM labelled ``__period__``.  Otherwise fall back to the
-    # duration keywords in *period_str*.
-    if end_date.month == fiscal_year_end_month:
+    # Annual vs quarterly routing.  An explicit *period_type_override* from the
+    # upstream node (``detected_period_type``) is authoritative — it keeps the
+    # extraction prompt's column selection and the save collection consistent.
+    # Otherwise the company's fiscal year-end month (from the normalize_data
+    # ``companies`` collection, e.g. "0430" → April) decides: when the resolved
+    # period-end month equals the fiscal year-end month, this is the full-year
+    # (annual) filing — regardless of how the LLM labelled ``__period__``.
+    # Failing both, fall back to the duration keywords in *period_str*.
+    if period_type_override in ("annual", "quarterly"):
+        period_type = period_type_override
+    elif end_date.month == fiscal_year_end_month:
         period_type = "annual"
     else:
         period_type = detect_period_type(period_str)  # "annual" | "quarterly"
