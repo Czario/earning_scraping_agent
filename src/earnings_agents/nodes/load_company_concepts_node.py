@@ -24,6 +24,7 @@ import logging
 from datetime import date
 
 from earnings_agents.tools.normalize_data_client import (
+    get_calculated_concepts,
     get_company_by_ticker,
     get_next_period_type,
     get_statement_concepts,
@@ -106,6 +107,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     _fallback = {
         **state,
         "target_concepts": [],
+        "calculated_concepts": [],
         "company_cik": None,
         "fiscal_year_end_month": None,
         "fiscal_year_end_code": None,
@@ -202,6 +204,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
         return {
             **state,
             "target_concepts": [],
+            "calculated_concepts": [],
             "company_cik": cik,
             "fiscal_year_end_month": fy_end_month,
             "fiscal_year_end_code": company.get("fiscal_year_end_code"),
@@ -216,10 +219,31 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
         period_type,
     )
 
+    try:
+        calculated = get_calculated_concepts(
+            cik,
+            statement_types=["income_statement"],
+            period_type=period_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "load_company_concepts: calculated concept query failed for %s CIK=%s (%s) "
+            "— skipping derivation",
+            ticker, cik, exc,
+        )
+        calculated = []
+
+    if calculated:
+        logger.info(
+            "load_company_concepts: loaded %d calculated concept(s) for %s (CIK %s, %s)",
+            len(calculated), ticker, cik, period_type,
+        )
+
     return {
         **state,
         "company_cik": cik,
         "target_concepts": concepts,
+        "calculated_concepts": calculated,
         "fiscal_year_end_month": fy_end_month,
         "fiscal_year_end_code": company.get("fiscal_year_end_code"),
         "detected_period_type": period_type,

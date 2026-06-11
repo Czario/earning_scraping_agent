@@ -255,6 +255,81 @@ def get_statement_concepts(
     return out
 
 
+def get_calculated_concepts(
+    cik: str,
+    statement_types: list[str] | None = None,
+    period_type: str = "quarterly",
+) -> list[dict[str, Any]]:
+    """Return calculated/system concept dicts for *cik*.
+
+    Mirrors ``get_statement_concepts`` but returns ONLY the rows that function
+    excludes — i.e. rows with a ``system:``-prefixed concept name or
+    ``calculated: True``.  These represent metrics that the downstream
+    normaliser derives; they are not present verbatim in earnings press releases
+    but can be computed from extracted values by the derivation engine in
+    ``analysis/calculators.py``.
+
+    Each returned dict has the same shape as ``get_statement_concepts`` output
+    (``_id``, ``concept``, ``label``, ``path``, ``statement_type``) so it can
+    be passed alongside ``target_concepts`` to ``derive_missing_concept_metrics``.
+    """
+    if statement_types is None:
+        statement_types = ["income_statement"]
+    collection_name = (
+        "normalized_concepts_annual"
+        if period_type == "annual"
+        else "normalized_concepts_quarterly"
+    )
+    db = _get_client()[_NORMALIZE_DB]
+    cursor = db[collection_name].find(
+        {
+            "company_cik": cik,
+            "statement_type": {"$in": statement_types},
+            "abstract": {"$ne": True},
+            "hide": {"$ne": True},
+            "active": {"$ne": False},
+            "$or": [
+                {"concept": {"$regex": "^system:", "$options": "i"}},
+                {"calculated": {"$in": [True, "True", "true"]}},
+            ],
+        },
+        {
+            "_id": 1,
+            "concept": 1,
+            "label": 1,
+            "path": 1,
+            "statement_type": 1,
+        },
+    ).sort("path", 1)
+
+    out: list[dict[str, Any]] = []
+    for d in cursor:
+        raw_label = d.get("label", "")
+        head, _ = _clean_label(raw_label)
+        if not head:
+            logger.debug(
+                "get_calculated_concepts: dropping concept with empty label "
+                "(cik=%s concept=%s raw_label=%r)",
+                cik, d.get("concept", ""), raw_label,
+            )
+            continue
+        out.append(
+            {
+                "_id": str(d["_id"]),
+                "concept": d.get("concept", ""),
+                "label": head,
+                "path": d.get("path", ""),
+                "statement_type": d.get("statement_type", ""),
+            }
+        )
+
+    logger.debug(
+        "get_calculated_concepts: found %d calculated concept(s) for cik=%s (%s)",
+        len(out), cik, period_type,
+    )
+    return out
+
+
 # ── Period helpers ───────────────────────────────────────────────────────────
 
 _MONTH_NAME_RE = re.compile(

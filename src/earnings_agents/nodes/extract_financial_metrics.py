@@ -771,23 +771,56 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                         matched_key, concept_id, ticker,
                     )
 
-        logger.info(
-            "Targeted mode: mapped %d/%d concept(s) to concept_id for %s",
-            len(concept_metrics),
-            len(target_concepts),
-            ticker,
-        )
-        # Diagnostic: show which target concepts remain unmapped.
-        final_mapped_ids = set(concept_metrics.keys())
-        absent_from_response = sorted(
+        # ── Tier 3: Derive calculated/system concepts ────────────────────────
+        # For concepts that have ``calculated: True`` or a ``system:`` prefix
+        # (loaded by load_company_concepts_node into state["calculated_concepts"]),
+        # try to compute values from the already-mapped concept_metrics using
+        # standard income-statement arithmetic identities.  Also fills in any
+        # regular target_concepts still unmapped if their value can be derived.
+        calculated_concepts: list = state.get("calculated_concepts") or []  # type: ignore[assignment]
+        derived_concept_ids: set[str] = set()
+        if calculated_concepts or (target_concepts and len(concept_metrics) < len(target_concepts)):
+            from earnings_agents.analysis.calculators import derive_missing_concept_metrics
+            all_for_derivation = (target_concepts or []) + calculated_concepts
+            before_derivation_ids = set(concept_metrics.keys())
+            concept_metrics = derive_missing_concept_metrics(concept_metrics, all_for_derivation)
+            derived_concept_ids = set(concept_metrics.keys()) - before_derivation_ids
+
+        # ── Final summary table ──────────────────────────────────────────────
+        # Build a single id→label lookup covering both regular and calculated
+        # concepts so every row in concept_metrics can be labelled.
+        all_concepts_for_summary = (target_concepts or []) + calculated_concepts
+        id_to_label_summary: dict[str, str] = {
+            c["_id"]: c.get("label", c["_id"]) for c in all_concepts_for_summary
+        }
+        total_concepts = len(target_concepts) + len(calculated_concepts)
+        absent_labels = sorted(
             c["label"] for c in target_concepts
-            if c["_id"] not in final_mapped_ids
+            if c["_id"] not in concept_metrics
         )
-        if absent_from_response:
-            logger.debug(
-                "Targeted mode: %d concept(s) not extracted (null or not in press release) for %s: %s",
-                len(absent_from_response), ticker, absent_from_response,
-            )
+
+        # Build lines: one per mapped concept, sorted by label, derived ones tagged.
+        summary_lines: list[str] = []
+        for cid, value in sorted(concept_metrics.items(), key=lambda kv: id_to_label_summary.get(kv[0], kv[0]).lower()):
+            label = id_to_label_summary.get(cid, cid)
+            tag = " [DERIVED]" if cid in derived_concept_ids else ""
+            summary_lines.append(f"  {label}: {value}{tag}")
+
+        logger.info(
+            "Targeted mode %s: %d/%d concept(s) filled "
+            "(%d from filing, %d derived)\n%s%s",
+            ticker,
+            len(concept_metrics),
+            total_concepts,
+            len(concept_metrics) - len(derived_concept_ids),
+            len(derived_concept_ids),
+            "\n".join(summary_lines),
+            (
+                f"\n  --- not in filing ({len(absent_labels)}): "
+                + ", ".join(absent_labels)
+                if absent_labels else ""
+            ),
+        )
 
     new_state: EarningsAgentState = {
         **state,
@@ -806,4 +839,5 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
     if concept_metrics is not None:
         new_state["concept_metrics"] = concept_metrics
         new_state["mapped_metric_keys"] = list(concept_id_to_metric_key.values())
+        new_state["derived_concept_ids"] = list(derived_concept_ids)
     return new_state

@@ -222,6 +222,63 @@ def _print_latest_data_status(companies: list[dict], printer=print) -> None:
 
 
 
+def _print_insertion_summary(results: list[dict], printer=print) -> None:
+    """Print a clean table of all inserted concept values for every saved result.
+
+    Shown once at the very end of the run so operators can quickly verify what
+    was upserted.  Values computed by the Tier-3 derivation engine are tagged
+    with ``[DERIVED]`` so they are visually distinct from values read directly
+    from the filing.
+    """
+    saved = [r for r in results if r.get("status") == "saved" and r.get("concept_metrics")]
+    if not saved:
+        return
+
+    for result in saved:
+        ticker = result.get("ticker", "?")
+        concept_metrics: dict = result.get("concept_metrics") or {}
+        target_concepts: list = result.get("target_concepts") or []
+        calculated_concepts: list = result.get("calculated_concepts") or []
+        derived_ids: set[str] = set(result.get("derived_concept_ids") or [])
+
+        all_concepts = target_concepts + calculated_concepts
+        id_to_label: dict[str, str] = {
+            c["_id"]: c.get("label", c["_id"]) for c in all_concepts
+        }
+
+        period = result.get("sec_report_date", "")
+        header = f"Inserted concept values for {ticker}"
+        if period:
+            header += f"  ({period})"
+        printer("")
+        printer(f"┌─ {header} {'─' * max(1, 66 - len(header))}")
+
+        rows = sorted(
+            concept_metrics.items(),
+            key=lambda kv: id_to_label.get(kv[0], kv[0]).lower(),
+        )
+        from_filing = [(cid, v) for cid, v in rows if cid not in derived_ids]
+        derived_rows = [(cid, v) for cid, v in rows if cid in derived_ids]
+
+        for cid, value in from_filing:
+            label = id_to_label.get(cid, cid)
+            printer(f"│  {label:<45} {value}")
+
+        if derived_rows:
+            printer(f"├─ Derived ({len(derived_rows)}) ─{'─' * 54}")
+            for cid, value in derived_rows:
+                label = id_to_label.get(cid, cid)
+                printer(f"│  {label:<45} {value}  [DERIVED]")
+
+        absent = sorted(c["label"] for c in target_concepts if c["_id"] not in concept_metrics)
+        if absent:
+            printer(f"├─ Not in filing ({len(absent)}) ─{'─' * 51}")
+            for lbl in absent:
+                printer(f"│  {lbl}")
+
+        printer(f"└{'─' * 68}")
+
+
 def _resolve_companies(ciks: list[str], tickers: list[str]) -> list[dict]:
     """Return a list of company dicts ready to feed into the graph."""
     companies: list[dict] = []
@@ -865,6 +922,12 @@ def main() -> None:
         for r in failed:
             if r.get("error"):
                 print(f"  {r.get('ticker', '?')}: {r['error']}")
+    # Silence MongoDB driver teardown noise (heartbeat/connection-pool debug
+    # messages fired by atexit handlers) so the summary is always the last
+    # thing printed in the terminal.
+    for _log_name in ("pymongo", "mongodb", "bson"):
+        logging.getLogger(_log_name).setLevel(logging.WARNING)
+    _print_insertion_summary(results)
     sys.exit(1 if failed else 0)
 
 
