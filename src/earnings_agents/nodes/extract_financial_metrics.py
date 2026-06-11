@@ -676,6 +676,11 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
     # evidence) so they never pollute the metrics dict (concept mapping,
     # validation, and persistence all operate on real metric keys only).
     merged_source_snippets = metrics.pop("__sources__", None)
+    logger.info(
+        "Source grounding for %s: captured %d snippet(s) from LLM __sources__",
+        ticker,
+        len(merged_source_snippets) if isinstance(merged_source_snippets, dict) else 0,
+    )
 
     # On retry passes, keep untouched metrics from the previous pass and
     # overwrite only keys returned by the retried chunk(s).  This applies to
