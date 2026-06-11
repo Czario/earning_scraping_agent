@@ -45,13 +45,35 @@ _UNKNOWN_SECTION_PRIORITY = 4
 # Detected scale/period are injected as confirmed ground truth into every
 # chunk prompt, eliminating wrong-scale errors that occur when the
 # "(In millions)" table header only appears in the first chunk.
+#
+# Shared prefix for non-parenthesised scale headings. Matches the start of a
+# line (re.MULTILINE) optionally beginning with a currency mark and one finance
+# qualifier word, immediately followed by "in <unit>".  ``[^\S\n]`` matches
+# horizontal whitespace only so the ``^`` anchor stays line-scoped.
+_PRESCAN_HEADING_PREFIX = (
+    r"^[^\S\n]*\$?[^\S\n]*"
+    r"(?:(?:u\.?[^\S\n]?s\.?[^\S\n]+)?(?:dollars|amounts|all[^\S\n]+figures|figures)[^\S\n]+)?"
+    r"in[^\S\n]+"
+)
+
 _PRESCAN_SCALE: list[tuple[re.Pattern, str]] = [
-    # Match "(in millions)" or "(Amounts in millions, except ...)" etc.
+    # Parenthesised table captions take priority — they are the strongest,
+    # least ambiguous scale signal. Match "(in millions)",
+    # "(Amounts in millions, except ...)", "($ in thousands)" etc.
     (re.compile(r"\([^)]{0,30}?\bin millions\b", re.I), "millions"),
-    # Match "(in thousands)" or "(Amounts in thousands, except ...)" etc.
     (re.compile(r"\([^)]{0,30}?\bin thousands\b", re.I), "thousands"),
-    # Match "(in billions)" or "(Amounts in billions, except ...)" etc.
     (re.compile(r"\([^)]{0,30}?\bin billions\b", re.I), "billions"),
+    # Non-parenthesised scale headings that sit on their OWN line above a
+    # table, e.g. "Dollars in thousands", "$ in millions",
+    # "In thousands, except per share data",
+    # "All figures in millions unless otherwise noted".
+    # Anchored at line start (re.MULTILINE) with only finance qualifier words
+    # allowed before "in <unit>", so narrative prose such as
+    # "Revenue was $132.4 million in the quarter" (a number precedes the unit,
+    # and the line does not begin with "in <unit>") never matches.
+    (re.compile(_PRESCAN_HEADING_PREFIX + r"millions\b", re.I | re.M), "millions"),
+    (re.compile(_PRESCAN_HEADING_PREFIX + r"thousands\b", re.I | re.M), "thousands"),
+    (re.compile(_PRESCAN_HEADING_PREFIX + r"billions\b", re.I | re.M), "billions"),
 ]
 
 # Detects when share counts use a DIFFERENT scale than dollar amounts.

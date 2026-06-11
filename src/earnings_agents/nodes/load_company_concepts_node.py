@@ -136,24 +136,41 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     fy_end_code: str | None = company.get("fiscal_year_end_code")
     sec_report_date_str: str | None = state.get("sec_report_date")  # type: ignore[assignment]
 
-    # Two independent period-type signals, combined defensively:
-    #   * date_based    — report-date month vs fiscal year-end month (needs a
-    #                     correct period-end date, which can be wrong for fast
-    #                     reporters or announcement-date 8-Ks).
-    #   * cadence_based — "after Q3 the next release is always the annual
-    #                     report"; derived purely from what we have stored, so
-    #                     it is robust against period-end date errors.
-    # The filing is annual when EITHER signal says annual: cadence catches a
-    # mis-dated annual release, and the date signal catches a DB gap where a
-    # quarter was skipped.
+    # Period-type decision (Option B — cadence drives, date is the safety net):
+    #   * cadence_based — the deterministic filing-cycle state machine derived
+    #                     from the last stored document (Q1→Q2→Q3→annual→Q1…).
+    #                     This is the primary signal because the stored doc
+    #                     already records exactly where the company sits in the
+    #                     cycle — no fragile date arithmetic.
+    #   * date_based    — report-date month vs fiscal year-end month. Used as:
+    #                       (a) BOOTSTRAP when nothing is stored yet (cadence is
+    #                           None), and
+    #                       (b) a SAFETY OVERRIDE: if the period-end lands on the
+    #                           fiscal year-end it is annual even when cadence
+    #                           says quarterly — this covers a DB gap where one
+    #                           or more quarters were skipped.
     date_based = _infer_period_type(sec_report_date_str, fy_end_month, fy_end_code)
     try:
-        cadence_based = get_next_period_type(cik)
+        current_period_end: date | None = None
+        if sec_report_date_str:
+            try:
+                current_period_end = date.fromisoformat(sec_report_date_str)
+            except ValueError:
+                current_period_end = None
+        cadence_based = get_next_period_type(cik, current_period_end)
     except Exception as exc:  # noqa: BLE001 — cadence is best-effort
         logger.debug("load_company_concepts: cadence lookup failed for %s (%s)", ticker, exc)
         cadence_based = None
 
-    period_type = "annual" if (date_based == "annual" or cadence_based == "annual") else "quarterly"
+    if cadence_based is None:
+        # Bootstrap: no stored history → trust the date signal alone.
+        period_type = date_based
+    elif date_based == "annual":
+        # Date safety override: a period-end on the fiscal year-end is annual
+        # even if cadence (working from a gappy DB) says otherwise.
+        period_type = "annual"
+    else:
+        period_type = cadence_based
 
     if cadence_based is not None and cadence_based != date_based:
         logger.warning(

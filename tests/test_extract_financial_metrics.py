@@ -917,6 +917,64 @@ class TestPrescanDocument:
         scale, _, _ = _prescan_document(text)
         assert scale is None
 
+    # -- Non-parenthesised scale headings (scale stated in a heading above the
+    #    table rather than a parenthesised table caption). --------------------
+
+    def test_unparenthesised_dollars_in_thousands(self):
+        """'Dollars in thousands' heading (no parentheses) is detected."""
+        text = "CONSOLIDATED STATEMENTS OF INCOME\nDollars in thousands\nNet sales 5661524\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "thousands"
+
+    def test_unparenthesised_amounts_in_thousands(self):
+        """'Amounts in thousands' heading (no parentheses) is detected."""
+        text = "STATEMENTS OF OPERATIONS\nAmounts in thousands\nNet revenues 5661524\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "thousands"
+
+    def test_unparenthesised_dollar_sign_in_millions(self):
+        """'$ in millions' heading (no parentheses) is detected."""
+        text = "Income Statement\n$ in millions\nRevenue 124300\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "millions"
+
+    def test_unparenthesised_in_thousands_at_line_start(self):
+        """A line beginning 'In thousands, except per share data' is detected."""
+        text = "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS\nIn thousands, except per share data\nRevenue 5661524\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "thousands"
+
+    def test_unparenthesised_all_figures_in_millions(self):
+        """'All figures in millions unless otherwise noted' heading is detected."""
+        text = "Selected Financial Data\nAll figures in millions unless otherwise noted\nRevenue 124300\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "millions"
+
+    def test_unparenthesised_us_dollars_in_millions(self):
+        """'U.S. dollars in millions' heading (no parentheses) is detected."""
+        text = "Statement of Income\nU.S. dollars in millions\nRevenue 124300\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "millions"
+
+    def test_narrative_million_value_not_treated_as_scale(self):
+        """Narrative '$5.2 million in revenue' must NOT be read as a scale heading."""
+        text = (
+            "The company reported $5.2 million in revenue this quarter, "
+            "up from $3.1 million a year ago, and held $40 million in cash.\n"
+        )
+        scale, _, _ = _prescan_document(text)
+        assert scale is None
+
+    def test_parenthesised_scale_takes_priority(self):
+        """When both forms appear, the parenthesised table caption wins."""
+        text = (
+            "Highlights: revenue grew, amounts in thousands of units shipped.\n"
+            "CONSOLIDATED STATEMENTS OF OPERATIONS\n"
+            "(In millions, except per share data)\nRevenue 124300\n"
+        )
+        scale, _, _ = _prescan_document(text)
+        assert scale == "millions"
+
 
 # ---------------------------------------------------------------------------
 # _load_company_hints

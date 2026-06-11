@@ -510,25 +510,65 @@ def get_latest_period(cik: str) -> dict[str, Any] | None:
     return best
 
 
-def get_next_period_type(cik: str) -> str | None:
-    """Return the expected period type of the *next* earnings release for *cik*.
+def get_next_period_type(
+    cik: str, current_period_end: date | None = None
+) -> str | None:
+    """Return the period type implied by the company's filing **cadence**.
 
-    Companies file Q1, Q2 and Q3 quarterly reports and then a single annual
-    report that covers Q4 + the full year — there is no standalone Q4 release.
-    So the next earnings release after the most recently stored period is:
+    A company's filings follow a fixed, deterministic cycle:
 
-      * **annual**    when the last stored period is quarterly Q3 (or later);
-      * **quarterly** otherwise (Q1→Q2, Q2→Q3, annual→Q1 of the next FY).
+        Q1 → Q2 → Q3 → annual (10-K, covers Q4 + full year) → Q1 (next FY) → …
 
-    This cadence signal is derived purely from what we have already stored and
-    is therefore robust against errors in the SEC ``reportDate`` / period-end
-    date inference.  Returns ``None`` when no prior period is stored (the
-    cadence cannot be inferred — e.g. the IR path or a first-time company).
+    There is no standalone Q4 release — the **annual 10-K *is* the Q4 report**.
+    The most recently stored document already records exactly where the company
+    sits in that cycle (its ``period_type`` and ``quarter``), so the *next*
+    release type is a pure state-machine transition off that stored state — no
+    date arithmetic needed:
+
+      * last was quarter **Q3** → next is **annual** (the year is not yet closed)
+      * last was quarter **Q1/Q2** → next is **quarterly**
+      * last was **annual** *or* a legacy **Q4** record → the year is already
+        closed → next is **quarterly** (Q1 of the next fiscal year)
+
+    The Q4-vs-annual equivalence matters because some companies carry a legacy
+    computed ``Q4`` quarterly record (from an older ingestion).  Treating Q4 as
+    "annual still pending" would mislabel the next filing (the new fiscal year's
+    Q1) as annual.  Only an **exact Q3** maps forward to the annual.
+
+    ``current_period_end`` is the period-end date of the filing being processed
+    (the EDGAR-inferred ``sec_report_date``).  It positions the current filing
+    against the stored one:
+
+      * **strictly newer** → advance the cycle (return the *next* type above).
+      * **same or older** (a re-run or stale 8-K) → do *not* advance; return the
+        stored period's own type so re-processing the latest Q3 release stays
+        quarterly instead of being mislabelled annual (which would write a
+        phantom 10-K alongside the real 10-Q — a cross-collection duplicate).
+
+    Returns ``None`` only when no prior period is stored (first-ever filing or
+    the IR path); the caller then falls back to the date-based signal.
     """
     latest = get_latest_period(cik)
     if latest is None:
         return None
-    if latest.get("period_type") == "quarterly" and (latest.get("quarter") or 0) >= 3:
+
+    stored_type = latest.get("period_type")
+
+    # Position the current filing against the stored one.  Same-or-older means
+    # we are not advancing the cycle — report the stored period's own type.
+    if current_period_end is not None:
+        latest_end = latest.get("end_date")
+        if latest_end is not None:
+            stored_end = (
+                latest_end.date() if hasattr(latest_end, "date") else latest_end
+            )
+            if current_period_end <= stored_end:
+                return stored_type
+
+    # Strictly newer (or position unknown): advance the cadence state machine.
+    # Only an exact Q3 maps to the annual — Q4 is itself the annual (year
+    # closed), so a Q4 (or annual) stored period advances to the next FY's Q1.
+    if stored_type == "quarterly" and (latest.get("quarter") or 0) == 3:
         return "annual"
     return "quarterly"
 

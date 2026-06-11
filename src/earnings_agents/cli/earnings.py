@@ -187,9 +187,15 @@ def _print_latest_data_status(companies: list[dict], printer=print) -> None:
             last_str = f"FY{fy} annual  (end {end_dt})"
             # Annual filing covers Q4 + full year; next needed is Q1 of the next fiscal year.
             next_str = f"FY{fy + 1} Q1 8-K"
+        elif (q or 0) >= 4:
+            # A Q4 record is equivalent to the annual — the fiscal year is
+            # already closed (the annual 10-K *is* the Q4 report). The next
+            # needed filing is Q1 of the following fiscal year, NOT "FY annual".
+            last_str = f"FY{fy} Q4 (=annual)  (end {end_dt})"
+            next_str = f"FY{fy + 1} Q1 8-K"
         else:
             last_str = f"FY{fy} Q{q}  (end {end_dt})"
-            if (q or 0) >= 3:
+            if (q or 0) == 3:
                 # Q3 is the last standalone quarterly 8-K.
                 # The annual 8-K covers Q4 + full year — there is no Q4-only 8-K.
                 next_str = f"FY{fy} Annual 8-K  (fiscal year-end {fy_end_code})"

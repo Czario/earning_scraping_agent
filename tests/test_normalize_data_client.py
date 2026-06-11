@@ -262,6 +262,35 @@ def test_load_concepts_quarterly_when_both_signals_agree():
     assert result["detected_period_type"] == "quarterly"
 
 
+def test_load_concepts_after_q4_record_is_next_fy_q1_quarterly():
+    """CRWD-style: last stored Q4 (=annual, year closed) + new FY's Q1 filing.
+
+    The new filing (Q1 of the next fiscal year) must be detected as quarterly,
+    NOT annual — a Q4 record is the closed year, so the next release is Q1.
+    Exercises the REAL cadence (only get_latest_period is mocked).
+    """
+    from datetime import datetime, timezone
+    from earnings_agents.nodes import load_company_concepts_node as node
+    from earnings_agents.tools import normalize_data_client as ndc
+
+    company = {"cik": "0001535527", "fiscal_year_end_month": 1,
+               "fiscal_year_end_code": "0131", "name": "CROWDSTRIKE HOLDINGS, INC."}
+    latest = {
+        "period_type": "quarterly", "fiscal_year": 2026, "quarter": 4,
+        "end_date": datetime(2026, 1, 31, tzinfo=timezone.utc),
+    }
+    state = {"ticker": "CRWD", "sec_report_date": "2026-06-03"}
+
+    with (
+        patch.object(node, "get_company_by_ticker", return_value=company),
+        patch.object(ndc, "get_latest_period", return_value=latest),
+        patch.object(node, "get_statement_concepts", return_value=[]),
+    ):
+        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
+
+    assert result["detected_period_type"] == "quarterly"
+
+
 # ── get_statement_concepts uses correct collection ───────────────────────────
 
 def test_get_statement_concepts_uses_quarterly_collection_by_default():
@@ -477,6 +506,9 @@ def test_get_latest_period_returns_none_when_no_data():
     # Mid-year quarters → the next standalone quarter.
     ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 1}, "quarterly"),
     ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 2}, "quarterly"),
+    # A legacy Q4 record == the annual (year closed) → next is next-FY Q1.
+    # This must NOT resolve to "annual" (that would mislabel the new FY's Q1).
+    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 4}, "quarterly"),
     # After the annual report → Q1 of the next fiscal year.
     ({"period_type": "annual", "fiscal_year": 2025, "quarter": None}, "quarterly"),
     # Defensive: a missing/zero quarter is treated as not-yet-Q3.
@@ -495,6 +527,86 @@ def test_get_next_period_type_returns_none_without_prior_data():
 
     with patch.object(ndc, "get_latest_period", return_value=None):
         assert ndc.get_next_period_type("000123") is None
+
+
+def test_get_next_period_type_gated_skips_non_newer_release():
+    """A non-newer release does NOT advance the cycle — returns the stored type.
+
+    Re-processing the already-stored Q3 release (same or older period-end) must
+    report the stored period's own type ("quarterly") rather than advancing to
+    "annual" — otherwise the Q3 release would be reclassified as annual,
+    duplicating it across the quarterly/annual collections.
+    """
+    from datetime import date, datetime, timezone
+    from earnings_agents.tools import normalize_data_client as ndc
+
+    latest = {
+        "period_type": "quarterly", "fiscal_year": 2026, "quarter": 3,
+        "end_date": datetime(2026, 3, 31, tzinfo=timezone.utc),
+    }
+    with patch.object(ndc, "get_latest_period", return_value=latest):
+        # Exact re-run (same period-end) → no advance → stored type.
+        assert ndc.get_next_period_type("000123", date(2026, 3, 31)) == "quarterly"
+        # Older release → no advance → stored type.
+        assert ndc.get_next_period_type("000123", date(2025, 12, 31)) == "quarterly"
+
+
+def test_get_next_period_type_gated_allows_genuine_next_annual():
+    """A genuinely newer release after Q3 still resolves to annual."""
+    from datetime import date, datetime, timezone
+    from earnings_agents.tools import normalize_data_client as ndc
+
+    latest = {
+        "period_type": "quarterly", "fiscal_year": 2026, "quarter": 3,
+        "end_date": datetime(2026, 3, 31, tzinfo=timezone.utc),
+    }
+    with patch.object(ndc, "get_latest_period", return_value=latest):
+        # New annual period-end (~3 months later) → annual.
+        assert ndc.get_next_period_type("000123", date(2026, 6, 30)) == "annual"
+
+
+def test_get_next_period_type_rerun_of_annual_stays_annual():
+    """Re-processing the stored annual release stays annual (no spurious advance)."""
+    from datetime import date, datetime, timezone
+    from earnings_agents.tools import normalize_data_client as ndc
+
+    latest = {
+        "period_type": "annual", "fiscal_year": 2026, "quarter": None,
+        "end_date": datetime(2026, 5, 31, tzinfo=timezone.utc),
+    }
+    with patch.object(ndc, "get_latest_period", return_value=latest):
+        # Same period-end → no advance → stored type "annual".
+        assert ndc.get_next_period_type("000123", date(2026, 5, 31)) == "annual"
+        # Strictly newer → advance: after annual the next release is Q1.
+        assert ndc.get_next_period_type("000123", date(2026, 8, 31)) == "quarterly"
+
+
+def test_load_concepts_rerun_q3_not_reclassified_as_annual():
+    """Re-running the same Q3 release must stay quarterly, not flip to annual.
+
+    Exercises the REAL cadence gate (only get_latest_period is mocked) to prove
+    the cross-collection duplicate path is closed end-to-end at the node.
+    """
+    from datetime import datetime, timezone
+    from earnings_agents.nodes import load_company_concepts_node as node
+    from earnings_agents.tools import normalize_data_client as ndc
+
+    company = {"cik": "0000789019", "fiscal_year_end_month": 6,
+               "fiscal_year_end_code": "0630", "name": "MICROSOFT CORP"}
+    latest = {
+        "period_type": "quarterly", "fiscal_year": 2026, "quarter": 3,
+        "end_date": datetime(2026, 3, 31, tzinfo=timezone.utc),
+    }
+    state = {"ticker": "MSFT", "sec_report_date": "2026-03-31"}
+
+    with (
+        patch.object(node, "get_company_by_ticker", return_value=company),
+        patch.object(ndc, "get_latest_period", return_value=latest),
+        patch.object(node, "get_statement_concepts", return_value=[]),
+    ):
+        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
+
+    assert result["detected_period_type"] == "quarterly"
 
 
 
