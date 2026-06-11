@@ -171,18 +171,29 @@ def _prescan_document(raw_text: str) -> tuple[str | None, str | None, str | None
     eliminating wrong-scale errors that arise when middle chunks don't see
     the "(In millions)" table header that only appeared in chunk 1.
     """
+    # Normalise horizontal whitespace before matching. HTML earnings releases
+    # routinely separate the words inside a scale caption with non-breaking
+    # spaces (e.g. "(in\xa0thousands)"), narrow/thin spaces, or runs of
+    # ordinary spaces. The scale patterns use a literal space in "in millions",
+    # so without this step those captions are silently missed and the document
+    # scale falls through to the LLM's (sometimes wrong) guess. ``[^\S\n]+``
+    # collapses every horizontal whitespace run — including Unicode spaces —
+    # to a single ASCII space while preserving newlines so the line-anchored
+    # heading patterns (re.MULTILINE) stay line-scoped.
+    text = re.sub(r"[^\S\n]+", " ", raw_text)
+
     scale: str | None = None
     for pattern, scale_name in _PRESCAN_SCALE:
-        if pattern.search(raw_text):
+        if pattern.search(text):
             scale = scale_name
             break
 
     shares_scale: str | None = None
-    if _PRESCAN_SHARES_IN_THOUSANDS_RX.search(raw_text):
+    if _PRESCAN_SHARES_IN_THOUSANDS_RX.search(text):
         shares_scale = "thousands"
 
     period: str | None = None
-    m = _PRESCAN_PERIOD_RX.search(raw_text)
+    m = _PRESCAN_PERIOD_RX.search(text)
     if m:
         period = m.group(0)
 

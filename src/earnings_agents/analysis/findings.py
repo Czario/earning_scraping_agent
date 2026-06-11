@@ -47,6 +47,7 @@ FindingType = Literal[
     "gaap_nongaap_leakage",   # key leaked from a GAAP/Non-GAAP reconciliation table
     "composite_key",          # key is a comma/slash list of synonyms, not a real label
     "auto_corrected",         # value was provably wrong and deterministically fixed
+    "source_unverified",      # value not grounded in any verbatim source snippet
     # Reserved for later steps (not emitted yet):
     "section_mismatch",
 ]
@@ -553,6 +554,97 @@ def derive_corrected_total_opex(
     if cogs is None or opex_sub is None:
         return None, None
     return opex_key, cogs + opex_sub
+
+
+# ---------------------------------------------------------------------------
+# Source grounding ("show me") verification
+# ---------------------------------------------------------------------------
+
+# Strip markdown table/emphasis artifacts so a snippet read from a rendered
+# table chunk still matches the plain source text.
+_GROUNDING_STRIP_RE = re.compile(r"[|*`]")
+_GROUNDING_WS_RE = re.compile(r"\s+")
+# Matches numeric tokens as printed in financial statements, e.g. "82,886",
+# "(1,234)", "$4.27", "-12.5".
+_GROUNDING_NUM_RE = re.compile(r"-?\$?\(?\d[\d,]*\.?\d*\)?")
+
+
+def _normalize_for_grounding(text: str) -> str:
+    """Whitespace/case-normalise text for verbatim substring comparison."""
+    return _GROUNDING_WS_RE.sub(" ", _GROUNDING_STRIP_RE.sub(" ", text)).strip().casefold()
+
+
+def _grounding_numeric_tokens(text: str) -> list[str]:
+    """Extract comma-free digit tokens from *text* (e.g. "82,886" → "82886")."""
+    tokens: list[str] = []
+    for raw in _GROUNDING_NUM_RE.findall(text):
+        digits = re.sub(r"[^\d.]", "", raw).strip(".")
+        if digits and any(c.isdigit() for c in digits):
+            tokens.append(digits)
+    return tokens
+
+
+def check_source_grounding(
+    metrics: dict[str, Any],
+    source_snippets: dict[str, Any] | None,
+    source_text: str,
+) -> list[Finding]:
+    """Verify each extracted value is grounded in a verbatim source snippet.
+
+    Implements the "show me" verification step: the extraction LLM returns, per
+    metric, the exact text snippet it read the value from (``__sources__``). A
+    value is considered grounded when **either** the cited snippet appears
+    (whitespace/case-insensitively) in the source document **or** every numeric
+    token in the snippet appears in the source. A value whose claimed source
+    text *and* numbers are both absent from the document is almost certainly
+    hallucinated and yields a ``high``-severity finding that triggers a
+    re-extract.
+
+    This checker is additive and degrades gracefully: when no snippets are
+    supplied (e.g. an older prompt or a test mock) it returns no findings, so
+    existing behaviour is unchanged.
+    """
+    findings: list[Finding] = []
+    if not source_snippets or not source_text:
+        return findings
+
+    norm_corpus = _normalize_for_grounding(source_text)
+    digit_corpus = norm_corpus.replace(",", "")
+
+    for key, snippet in source_snippets.items():
+        if key.startswith("__"):
+            continue
+        value = metrics.get(key)
+        if value is None or not isinstance(snippet, str) or not snippet.strip():
+            continue
+
+        norm_snip = _normalize_for_grounding(snippet)
+        if norm_snip and norm_snip in norm_corpus:
+            continue  # cited snippet found verbatim
+
+        nums = _grounding_numeric_tokens(snippet)
+        if not nums:
+            continue  # nothing numeric to verify — stay conservative
+        if all(n in digit_corpus for n in nums):
+            continue  # numbers present (snippet merely paraphrased)
+
+        findings.append(
+            Finding(
+                type="source_unverified",
+                severity="high",
+                message=(
+                    f"Value for '{key}' could not be verified against the source "
+                    f"document — the cited snippet and its numbers are absent."
+                ),
+                keys=(key,),
+                suggested_action=(
+                    "Re-read the statement and report only values that appear "
+                    "verbatim in the document; do not infer or compute values."
+                ),
+                evidence={"value": value, "cited_snippet": snippet[:200]},
+            )
+        )
+    return findings
 
 
 # ---------------------------------------------------------------------------

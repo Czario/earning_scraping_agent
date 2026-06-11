@@ -24,6 +24,7 @@ from earnings_agents.analysis.findings import (
     Finding,
     derive_corrected_total_opex,
     check_presence,
+    check_source_grounding,
 )
 from earnings_agents.config import MAX_EXTRACTION_ATTEMPTS
 from earnings_agents.workflow_state import EarningsAgentState
@@ -122,6 +123,18 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     # separately above because it requires a pre-computed presence summary.
     for checker in CHECKER_REGISTRY:
         findings.extend(checker(metrics))
+
+    # Source-grounding ("show me") verification. Called explicitly (not via the
+    # registry) because it needs the per-metric source snippets and the source
+    # text in addition to the metrics dict. Degrades to a no-op when no
+    # snippets were captured.
+    findings.extend(
+        check_source_grounding(
+            metrics,
+            state.get("metric_source_snippets"),
+            state.get("raw_text") or "",
+        )
+    )
 
     # Corrector post-pass — kept explicitly separate from the observer loop so
     # it is easy to audit: only derive_corrected_total_opex mutates metrics.

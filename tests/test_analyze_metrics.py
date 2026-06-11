@@ -12,6 +12,7 @@ from earnings_agents.analysis.findings import (
     check_gross_profit_identity,
     check_presence,
     check_sign_anomalies,
+    check_source_grounding,
     check_suspect_round,
     derive_corrected_total_opex,
 )
@@ -545,6 +546,71 @@ def test_opex_auto_correction_applied_when_components_present():
 
     # Still no re-extract (medium collision + low correction, no high)
     assert out["needs_reextract"] is False
+
+
+# ---------------------------------------------------------------------------
+# Source-grounding ("show me") verification — check_source_grounding
+# ---------------------------------------------------------------------------
+
+_GROUNDING_SOURCE = (
+    "Condensed Consolidated Statements of Operations (in thousands)\n"
+    "Total revenue 1,385,629\n"
+    "Cost of revenue 357,108\n"
+    "Net income 156,837\n"
+)
+
+
+def test_grounding_no_snippets_is_noop():
+    """Absent snippets → no findings (feature degrades gracefully)."""
+    metrics = {"Total revenue": 1_385_629_000}
+    assert check_source_grounding(metrics, None, _GROUNDING_SOURCE) == []
+    assert check_source_grounding(metrics, {}, _GROUNDING_SOURCE) == []
+
+
+def test_grounding_verbatim_snippet_passes():
+    metrics = {"Total revenue": 1_385_629_000}
+    snippets = {"Total revenue": "Total revenue 1,385,629"}
+    assert check_source_grounding(metrics, snippets, _GROUNDING_SOURCE) == []
+
+
+def test_grounding_paraphrased_snippet_with_present_number_passes():
+    """Snippet reworded but its number is in the source → grounded."""
+    metrics = {"Net income": 156_837_000}
+    snippets = {"Net income": "net income of 156,837 for the quarter"}
+    assert check_source_grounding(metrics, snippets, _GROUNDING_SOURCE) == []
+
+
+def test_grounding_fabricated_value_flags_high():
+    """Snippet and its number are both absent → high source_unverified finding."""
+    metrics = {"Operating income": 999_999_000}
+    snippets = {"Operating income": "Operating income 999,999"}
+    out = check_source_grounding(metrics, snippets, _GROUNDING_SOURCE)
+    assert len(out) == 1
+    assert out[0].type == "source_unverified"
+    assert out[0].severity == "high"
+    assert out[0].keys == ("Operating income",)
+
+
+def test_grounding_skips_null_metric_and_reserved_keys():
+    metrics = {"Total revenue": None}
+    snippets = {
+        "Total revenue": "Total revenue 42",          # value is null → skip
+        "__period__": "made up period 4242",          # reserved key → skip
+    }
+    assert check_source_grounding(metrics, snippets, _GROUNDING_SOURCE) == []
+
+
+def test_analyze_node_flags_unverified_source_and_loops():
+    """analyze_metrics_node wires the grounding checker and routes on it."""
+    m = _full_metrics()
+    state = _state(m, attempts=1)
+    state["raw_text"] = _GROUNDING_SOURCE
+    state["metric_source_snippets"] = {
+        "Net income": "Net income 1,234,567,890",   # absent from source
+    }
+    out = analyze_metrics_node(state)
+    assert any(f["type"] == "source_unverified" for f in out["findings"])
+    assert out["needs_reextract"] is True
 
 
 def test_opex_no_correction_when_components_missing():

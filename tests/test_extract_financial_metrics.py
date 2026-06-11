@@ -492,6 +492,37 @@ def test_merge_without_sections_keeps_median_behaviour():
     assert merged["Net Income"] == pytest.approx(31_000_000_000)
 
 
+def test_merge_collects_source_snippets():
+    """__sources__ snippets from chunks are merged under the __sources__ key."""
+    chunks = [
+        {"Revenue": 80_000_000_000, "__sources__": {"Revenue": "Total revenue 80,000"}},
+        {"Net Income": 5_000_000_000, "__sources__": {"Net Income": "Net income 5,000"}},
+    ]
+    merged = _merge_metrics(chunks)
+    assert merged["__sources__"] == {
+        "Revenue": "Total revenue 80,000",
+        "Net Income": "Net income 5,000",
+    }
+
+
+def test_merge_source_snippet_prefers_higher_authority_section():
+    """On label conflict, the snippet from the higher-authority section wins."""
+    chunks = [
+        {"Revenue": 80_000_000_000, "__sources__": {"Revenue": "income statement row"}},
+        {"Revenue": 80_000_000_000, "__sources__": {"Revenue": "segment table row"}},
+    ]
+    sections = ["income_statement", "other"]
+    merged = _merge_metrics(chunks, sections=sections)
+    assert merged["__sources__"]["Revenue"] == "income statement row"
+
+
+def test_merge_omits_sources_key_when_no_snippets():
+    """No __sources__ on any chunk → no __sources__ key in the merged dict."""
+    chunks = [{"Revenue": 80_000_000_000}]
+    merged = _merge_metrics(chunks)
+    assert "__sources__" not in merged
+
+
 def test_targeted_prompt_enforces_column_and_consistency_rules():
     """Guard: the targeted prompt must keep the Phase-2 column / footnote /
     consistency rules that prevent prior-year and footnote-value leakage.
@@ -972,6 +1003,45 @@ class TestPrescanDocument:
             "CONSOLIDATED STATEMENTS OF OPERATIONS\n"
             "(In millions, except per share data)\nRevenue 124300\n"
         )
+        scale, _, _ = _prescan_document(text)
+        assert scale == "millions"
+
+    # -- Non-ASCII whitespace inside the caption (CrowdStrike regression). -----
+    #    HTML earnings releases routinely separate the words of a scale caption
+    #    with a non-breaking space (\xa0) or other Unicode space, which the
+    #    literal-space scale patterns would otherwise miss — leaving the scale
+    #    undetected and the values 1000x too small.
+
+    def test_caption_with_non_breaking_space(self):
+        """'(in\\xa0thousands)' (non-breaking space) is detected as thousands."""
+        text = (
+            "Condensed Consolidated Statements of Operations\n"
+            "(in\xa0thousands, except per share data)\nTotal revenue 1385629\n"
+        )
+        scale, _, _ = _prescan_document(text)
+        assert scale == "thousands"
+
+    def test_caption_with_narrow_no_break_space(self):
+        """'(in\\u202fmillions)' (narrow no-break space) is detected as millions."""
+        text = "Statements of Income\n(in\u202fmillions)\nRevenue 124300\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "millions"
+
+    def test_caption_with_thin_space(self):
+        """'(in\\u2009billions)' (thin space) is detected as billions."""
+        text = "Statements of Income\n(in\u2009billions)\nRevenue 1.24\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "billions"
+
+    def test_caption_with_collapsed_double_space(self):
+        """A caption with a run of spaces ('(in  thousands)') is detected."""
+        text = "Statements of Operations\n(in  thousands)\nRevenue 5661524\n"
+        scale, _, _ = _prescan_document(text)
+        assert scale == "thousands"
+
+    def test_unparenthesised_heading_with_non_breaking_spaces(self):
+        """'Dollars\\xa0in\\xa0millions' heading with nbsp is detected."""
+        text = "CONSOLIDATED STATEMENTS OF INCOME\nDollars\xa0in\xa0millions\nNet sales 124300\n"
         scale, _, _ = _prescan_document(text)
         assert scale == "millions"
 

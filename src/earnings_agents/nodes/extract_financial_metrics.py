@@ -193,8 +193,14 @@ Other rules:
      "lease count", "units".
   7. PERCENTAGE METRICS are never scaled — report as a number 0–100 for any
      key containing: "gross margin", "operating margin", "net margin",
-     "gross margin %", "profit margin", "margin %", "growth rate".
-Text excerpt:
+     "gross margin %", "profit margin", "margin %", "growth rate".LAST field must be "__sources__" (verification / "show me"):
+  A JSON object mapping EACH metric key you returned above to the EXACT
+  verbatim text snippet from the excerpt where you read its value — the row
+  label together with the value as printed (e.g.
+  {{"Net revenue": "Net revenue 82,886"}}).
+  Copy the text character-for-character from the excerpt; do NOT paraphrase,
+  reformat, or invent. If you cannot point to the exact source text for a
+  value, return null for that value instead of guessing.Text excerpt:
 \"\"\"
 {text}
 \"\"\"
@@ -269,6 +275,15 @@ ALL OTHER fields: use EXACTLY the label strings in quotes from the concept list 
 IMPORTANT — report RAW numbers, do NOT scale yourself:
   If the table says "(In millions)" and shows "82,886" → report 82886 (NOT 82886000000).
   EPS values and percentages are always reported as-is regardless of __scale__.
+
+LAST field must be "__sources__" (verification / "show me"):
+  A JSON object mapping EACH metric key you returned above to the EXACT
+  verbatim text snippet from the excerpt where you read its value — the row
+  label together with the value as printed (e.g.
+  {{"Revenue": "Total revenue 82,886"}}).
+  Copy the text character-for-character from the excerpt; do NOT paraphrase,
+  reformat, or invent. If you cannot point to the exact source text for a
+  value, return null for that value instead of guessing.
 
 Text excerpt:
 \"\"\"
@@ -657,6 +672,11 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         sections=chunk_result_sections,
     )
 
+    # Pull out the per-metric source snippets (the "show me" verification
+    # evidence) so they never pollute the metrics dict (concept mapping,
+    # validation, and persistence all operate on real metric keys only).
+    merged_source_snippets = metrics.pop("__sources__", None)
+
     # On retry passes, keep untouched metrics from the previous pass and
     # overwrite only keys returned by the retried chunk(s).  This applies to
     # both scoped retries (only a subset of chunks re-run) and full retries
@@ -666,6 +686,18 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         prev_metrics = state.get("metrics")
         if isinstance(prev_metrics, dict):
             metrics = {**prev_metrics, **metrics}
+
+    # Combine source snippets across passes so verification covers metrics that
+    # were carried over untouched from an earlier pass (parallel to the metrics
+    # carry-over above).
+    if scoped_retry or attempt_num > 1:
+        prev_snippets = state.get("metric_source_snippets") or {}
+        metric_source_snippets_out: dict | None = {
+            **prev_snippets,
+            **(merged_source_snippets or {}),
+        } or None
+    else:
+        metric_source_snippets_out = merged_source_snippets or None
 
     metrics, identity_warnings = validate_metrics(metrics)
     logger.info("Merged %d metric(s) for %s: %s", len(metrics), ticker, list(metrics.keys()))
@@ -764,6 +796,8 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         "identity_warnings": identity_warnings,
         "chunk_metric_sources": chunk_metric_sources_out,
     }
+    if metric_source_snippets_out is not None:
+        new_state["metric_source_snippets"] = metric_source_snippets_out
     if concept_metrics is not None:
         new_state["concept_metrics"] = concept_metrics
         new_state["mapped_metric_keys"] = list(concept_id_to_metric_key.values())

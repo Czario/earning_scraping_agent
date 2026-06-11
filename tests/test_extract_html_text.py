@@ -308,3 +308,158 @@ class TestLlmClassifyOtherBatch:
         assert "TABLE CONTENT" in received[0]
         assert "HEADING TEXT" in received[0]
 
+
+# ── Document-level scale re-attachment (CrowdStrike regression) ──────────────
+
+
+class TestDocumentScaleInjection:
+    """extract_html_text_node re-attaches the document scale caption to GAAP
+    statements when the caption is dropped by boilerplate stripping.
+
+    CrowdStrike prints "(in thousands, except per share amounts)" in a <div>
+    that is neither a table cell nor a direct sibling of the income statement
+    table, and places a "Forward-Looking Statements" boilerplate marker BEFORE
+    the financial statements. The boilerplate stripper then removes the caption
+    from the prose, leaving table values 1000x too small. The node captures the
+    scale from the full document before stripping and re-attaches it.
+    """
+
+    # HTML mirroring CRWD's structure: the scale caption sits in a standalone
+    # <div> that is NOT a direct previous sibling of the income statement table
+    # (the table lives inside its own wrapper <div>), so `_get_table_context`
+    # cannot see it. A "Forward-Looking Statements" marker appears in the second
+    # half before the statements, so `_strip_boilerplate` removes the caption
+    # from the prose. The injection path is the only thing that can re-attach it.
+    _CRWD_LIKE_HTML = (
+        "<html><body>"
+        "<p>CrowdStrike Reports First Quarter Fiscal Year 2027 Results</p>"
+        "<p>Total revenue was $1.39 billion, up 26%.</p>"
+        "<p>Forward-Looking Statements This press release contains "
+        "forward-looking statements within the meaning of the Securities Act.</p>"
+        "<div><font>(in thousands, except per share amounts)</font></div>"
+        "<div>"
+        "<p>Condensed Consolidated Statements of Operations</p>"
+        "<table>"
+        "<tr><td>Total revenue</td><td>1,385,629</td></tr>"
+        "<tr><td>Net income (loss)</td><td>45,966</td></tr>"
+        "</table>"
+        "</div>"
+        "</body></html>"
+    )
+
+    def _run(self, monkeypatch, html: str):
+        import earnings_agents.nodes.extract_html_text as mod
+
+        class _Resp:
+            text = html
+
+        monkeypatch.setattr(mod, "_http_get", lambda url, sec=False: _Resp())
+        return mod.extract_html_text_node(
+            {
+                "discovered_file_url": "https://www.sec.gov/x.htm",
+                "file_type": "html",
+                "status": "fetched",
+                "ticker": "CRWD",
+            }
+        )
+
+    def test_scale_reattached_to_income_statement(self, monkeypatch):
+        out = self._run(monkeypatch, self._CRWD_LIKE_HTML)
+        inc = out["raw_sections"]["income_statement"]
+        assert inc, "income statement section should be populated"
+        assert "(in thousands)" in inc[0]
+        # Caption must survive into raw_text so the downstream prescan fires.
+        assert "thousand" in out["raw_text"].lower()
+
+    def test_downstream_prescan_detects_scale(self, monkeypatch):
+        from earnings_agents.extraction.chunker import _prescan_document
+
+        out = self._run(monkeypatch, self._CRWD_LIKE_HTML)
+        scale, _, _ = _prescan_document(out["raw_text"])
+        assert scale == "thousands"
+
+    def test_existing_table_scale_not_overridden(self, monkeypatch):
+        """When the table already states its own scale, the document scale is
+        NOT injected on top of it (no double caption)."""
+        html = (
+            "<html><body>"
+            "<p>Forward-Looking Statements blah blah blah blah blah blah.</p>"
+            "<p>Statements of Operations</p>"
+            "<div><font>(in thousands)</font></div>"
+            "<p>(In millions)</p>"
+            "<table><tr><td>Total revenue</td><td>1,385</td></tr></table>"
+            "</body></html>"
+        )
+        out = self._run(monkeypatch, html)
+        inc = out["raw_sections"]["income_statement"][0]
+        # The table's own "(In millions)" caption is preserved and we do NOT
+        # prepend a conflicting "(in thousands)" document caption.
+        assert "(In millions)" in inc
+        assert not inc.startswith("(in thousands)")
+
+    def test_scale_caption_nested_several_layers_up(self, monkeypatch):
+        """Caption wrapped in nested spans/divs (not a direct sibling) is still
+        found — structure-agnostic backward search, not direct-sibling only."""
+        html = (
+            "<html><body>"
+            "<p>Forward-Looking Statements aaaa bbbb cccc dddd eeee ffff.</p>"
+            "<div><section><span><font>(in thousands)</font></span></section></div>"
+            "<article><div><p>Statements of Operations</p>"
+            "<table><tr><td>Total revenue</td><td>1,385,629</td></tr></table>"
+            "</div></article>"
+            "</body></html>"
+        )
+        out = self._run(monkeypatch, html)
+        inc = out["raw_sections"]["income_statement"][0]
+        assert "(in thousands)" in inc
+
+    def test_mixed_scale_per_statement(self, monkeypatch):
+        """A filing whose statements use DIFFERENT scales keeps the correct
+        scale on each — the nearest preceding caption wins, not a single
+        document-wide value."""
+        html = (
+            "<html><body>"
+            "<p>Forward-Looking Statements aaaa bbbb cccc dddd eeee ffff gggg.</p>"
+            "<div><font>(in thousands)</font></div>"
+            "<div><p>Condensed Statements of Operations</p>"
+            "<table><tr><td>Total revenue</td><td>1,385,629</td></tr></table>"
+            "</div>"
+            "<div><font>(in millions)</font></div>"
+            "<div><p>Condensed Balance Sheets</p>"
+            "<table><tr><td>Total assets</td><td>7,123</td></tr></table>"
+            "</div>"
+            "</body></html>"
+        )
+        out = self._run(monkeypatch, html)
+        inc = out["raw_sections"]["income_statement"][0]
+        bal = out["raw_sections"]["balance_sheet"][0]
+        assert "(in thousands)" in inc
+        assert "(in millions)" in bal
+
+    def test_no_scale_anywhere_injects_nothing(self, monkeypatch):
+        """A filing with no scale caption anywhere gets no injected caption
+        (values are full dollars / handled by the LLM as-is)."""
+        html = (
+            "<html><body>"
+            "<p>Condensed Statements of Operations</p>"
+            "<table><tr><td>Total revenue</td><td>1385629000</td></tr></table>"
+            "</body></html>"
+        )
+        out = self._run(monkeypatch, html)
+        inc = out["raw_sections"]["income_statement"][0]
+        assert "(in " not in inc.lower()
+
+    def test_narrative_million_not_injected_as_scale(self, monkeypatch):
+        """Narrative '$256 million' before the table must NOT be treated as a
+        scale caption (no spurious '(in millions)' injection)."""
+        html = (
+            "<html><body>"
+            "<p>Achieves record net new ARR of $256 million, up 32%.</p>"
+            "<p>Condensed Statements of Operations</p>"
+            "<table><tr><td>Total revenue</td><td>1385629000</td></tr></table>"
+            "</body></html>"
+        )
+        out = self._run(monkeypatch, html)
+        inc = out["raw_sections"]["income_statement"][0]
+        assert "(in millions)" not in inc.lower()
+

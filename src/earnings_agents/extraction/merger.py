@@ -534,7 +534,30 @@ def _merge_metrics(
     # Note: duplicate / synonym folding is handled downstream by the
     # constrained LLM cleanup_metrics_node, not here. Keys are preserved
     # exactly as the LLM extracted them (matching company wording).
-    return {k: v for k, v in merged.items() if v is not None}
+    cleaned = {k: v for k, v in merged.items() if v is not None}
+
+    # Merge per-metric source snippets (the "show me" verification evidence).
+    # Each chunk may return a ``__sources__`` dict mapping a metric label to the
+    # verbatim text it read the value from. Prefer the snippet from the
+    # highest-authority chunk (lowest priority number); on-target chunks are
+    # iterated before stale ones so an equal-authority on-target snippet wins.
+    source_snippets: dict[str, str] = {}
+    best_snip_prio: dict[str, int] = {}
+    for result, prio in (on_target + stale):
+        raw_sources = result.get("__sources__")
+        if not isinstance(raw_sources, dict):
+            continue
+        for label, snip in raw_sources.items():
+            if not isinstance(snip, str) or not snip.strip():
+                continue
+            if label not in best_snip_prio or prio < best_snip_prio[label]:
+                source_snippets[label] = snip
+                best_snip_prio[label] = prio
+    if source_snippets:
+        cleaned["__sources__"] = source_snippets
+
+    return cleaned
+
 
 
 def _target_year_from_report_date(report_date_str: str | None) -> int | None:

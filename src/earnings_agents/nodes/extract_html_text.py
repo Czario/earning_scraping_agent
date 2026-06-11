@@ -5,6 +5,7 @@ import re
 from typing import Any
 from bs4 import BeautifulSoup
 
+from earnings_agents.extraction.chunker import _prescan_document
 from earnings_agents.llm_factory import build_llm
 from earnings_agents.tools.http_client import SEC_HEADERS as _SEC_HEADERS
 from earnings_agents.tools.http_client import BROWSER_HEADERS as _BROWSER_HEADERS
@@ -67,6 +68,38 @@ _CASH_FLOW_TABLE_RX = re.compile(
     r"|net\s+cash\s+(?:provided|used)\s+by\s+operating",
     re.I,
 )
+
+# Detects whether a table entry already carries its own scale caption, so a
+# document/preceding scale is only injected when the table itself says nothing
+# — never overriding a table that declares its own scale. ``[^\S\n]`` matches
+# horizontal whitespace only, so a caption split by a non-breaking space
+# ("in\xa0thousands") still matches.
+_ENTRY_HAS_SCALE_RX = re.compile(r"\bin[^\S\n]+(?:thousands|millions|billions)\b", re.I)
+
+
+def _find_preceding_scale(table) -> str | None:
+    """Return the scale ("thousands"/"millions"/"billions") of the NEAREST scale
+    caption that appears before *table* anywhere in the document, or ``None``.
+
+    Issuers place the "(in thousands)" caption in wildly different DOM
+    structures: inside a table cell, in a direct sibling ``<div>``, in a
+    ``<font>`` wrapped several layers up, or in a heading block separated from
+    the statement by other elements. ``_get_table_context`` only inspects
+    *direct previous siblings*, so it misses every caption that isn't a direct
+    sibling. This helper is structure-agnostic: it walks backward through the
+    document in reading order (``find_all_previous``) and returns the first
+    (i.e. nearest-preceding) string that matches the chunker's tuned scale
+    patterns. Because tables are decomposed as they are processed, prior table
+    bodies are already gone, so only captions/headings/prose are considered —
+    and the parenthesised/line-start patterns reject narrative phrasing such as
+    "net new ARR of $256 million". Returning the *nearest* caption also keeps
+    the right scale on each statement when a filing mixes scales across tables.
+    """
+    for s in table.find_all_previous(string=True):
+        scale, _, _ = _prescan_document(str(s))
+        if scale:
+            return scale
+    return None
 
 
 def _get_table_context(table, max_chars: int = 400) -> str:
@@ -240,6 +273,20 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
         for tag in soup(_NOISE_TAGS):
             tag.decompose()
 
+        # ── Document-level scale fallback ────────────────────────────────────
+        # Scan the FULL document text for a scale caption (e.g. "(in
+        # thousands)") *before* tables are decomposed and *before* boilerplate
+        # stripping runs. This is the fallback used when a table has no scale
+        # caption anywhere before it (e.g. the caption sits after the table, or
+        # the only caption is far away). Capturing it here matters because some
+        # issuers place a "Forward-Looking Statements" boilerplate marker ahead
+        # of the financial statements, so `_strip_boilerplate` would otherwise
+        # delete the caption before it ever reaches the LLM — leaving values
+        # 1000x too small. Per-table detection (`_find_preceding_scale`) is
+        # preferred over this document-wide value so mixed-scale filings keep
+        # the correct scale on each statement.
+        doc_scale, _, _ = _prescan_document(soup.get_text(" ", strip=True))
+
         # ── Table-aware structured extraction ────────────────────────────────
         # Classify each HTML table by financial statement type, then assemble
         # raw_text so GAAP tables appear first and non-GAAP reconciliation
@@ -268,6 +315,17 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
             ttype = _classify_table(table_text, context)
             md = _table_to_markdown(table)
             entry = (f"{context}\n" if context.strip() else "") + md
+            # Re-attach a scale caption to GAAP statements whose own text says
+            # nothing about scale, so the downstream prescan and the LLM both
+            # see "(in <scale>)". Prefer the nearest scale caption preceding
+            # THIS table (structure-agnostic, correct for mixed-scale filings),
+            # falling back to the document-wide scale. Never overrides a table
+            # that states its own scale (the regex guard); skipped for
+            # non-GAAP / 'other' tables to stay conservative.
+            if ttype in ("income_statement", "balance_sheet", "cash_flow") and not _ENTRY_HAS_SCALE_RX.search(entry):
+                table_scale = _find_preceding_scale(table) or doc_scale
+                if table_scale:
+                    entry = f"(in {table_scale})\n{entry}"
             if ttype == "other":
                 _other_pending.append((entry, table_text, context))
             else:

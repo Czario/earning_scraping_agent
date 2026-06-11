@@ -70,6 +70,12 @@ class EarningsAgentState(TypedDict):
     # retry logic to re-run only the specific chunk(s) that contributed a
     # problematic metric, rather than all chunks in a section.
     chunk_metric_sources: NotRequired[Optional[dict]]  # str → list[int]
+    # Per-metric verbatim source snippets ("show me" verification evidence).
+    # Maps metric key → the exact text the extraction LLM read the value from
+    # (the ``__sources__`` field of the LLM response, merged across chunks).
+    # Consumed by ``check_source_grounding`` in analyze_metrics_node to flag
+    # values that cannot be grounded in the source document.
+    metric_source_snippets: NotRequired[Optional[dict]]  # str → str
     # ── Period type (annual vs quarterly) ───────────────────────────────────
     # Inferred at concept-load time from sec_report_date + fiscal_year_end_month.
     # ``"annual"`` when the report period ends in the fiscal year-end month;
