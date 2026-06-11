@@ -510,6 +510,30 @@ def get_latest_period(cik: str) -> dict[str, Any] | None:
     return best
 
 
+def get_next_period_type(cik: str) -> str | None:
+    """Return the expected period type of the *next* earnings release for *cik*.
+
+    Companies file Q1, Q2 and Q3 quarterly reports and then a single annual
+    report that covers Q4 + the full year — there is no standalone Q4 release.
+    So the next earnings release after the most recently stored period is:
+
+      * **annual**    when the last stored period is quarterly Q3 (or later);
+      * **quarterly** otherwise (Q1→Q2, Q2→Q3, annual→Q1 of the next FY).
+
+    This cadence signal is derived purely from what we have already stored and
+    is therefore robust against errors in the SEC ``reportDate`` / period-end
+    date inference.  Returns ``None`` when no prior period is stored (the
+    cadence cannot be inferred — e.g. the IR path or a first-time company).
+    """
+    latest = get_latest_period(cik)
+    if latest is None:
+        return None
+    if latest.get("period_type") == "quarterly" and (latest.get("quarter") or 0) >= 3:
+        return "annual"
+    return "quarterly"
+
+
+
 # ── Upsert ───────────────────────────────────────────────────────────────────
 
 def upsert_concept_values(

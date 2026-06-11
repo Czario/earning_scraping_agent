@@ -210,6 +210,41 @@ def test_uses_prior_year_10q_for_period_end(mock_get):
 
 
 @patch("earnings_agents.tools.edgar_client.requests.get")
+def test_uses_prior_year_10k_for_fast_annual_reporter(mock_get):
+    """Fast annual reporters (e.g. Oracle) announce only ~10 days after the
+    fiscal year-end, so the prior-year 10-K projection must still be accepted.
+
+    Scenario mirrors Oracle FY2026 (fiscal year ends May 31):
+      8-K  filingDate=2026-06-10  reportDate=2026-06-10  (announcement date — wrong)
+      10-K filingDate=2025-06-18  reportDate=2025-05-31  (prior-year FYE — correct end)
+    Expected period end: 2025-05-31 + 1 year = 2026-05-31  (10 days before filing)
+    """
+    submissions_resp = MagicMock()
+    submissions_resp.raise_for_status = MagicMock()
+    submissions_resp.json.return_value = _mock_submissions(
+        forms=["8-K", "10-K"],
+        items=["2.02,9.01", ""],
+        accessions=["0001341439-26-000070", "0001341439-25-000045"],
+        primary_docs=["orclq4fy26pr.htm", "orcl-20250531.htm"],
+        report_dates=["2026-06-10", "2025-05-31"],
+        filing_dates=["2026-06-10", "2025-06-18"],
+    )
+
+    index_resp = MagicMock()
+    index_resp.raise_for_status = MagicMock()
+    index_resp.text = _INDEX_HTML_WITH_EX99
+
+    mock_get.side_effect = [submissions_resp, index_resp]
+
+    url, report_date = get_latest_earnings_url("0001341439")
+
+    assert url is not None
+    # Prior-year 10-K reportDate 2025-05-31 + 1 year → 2026-05-31 (actual FYE),
+    # even though it is only 10 days before the 2026-06-10 filing date.
+    assert report_date == "2026-05-31"
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
 def test_falls_back_to_raw_report_date_when_no_prior_year_10q(mock_get):
     """When no matching prior-year 10-Q exists, the raw EDGAR reportDate is used."""
     submissions_resp = MagicMock()

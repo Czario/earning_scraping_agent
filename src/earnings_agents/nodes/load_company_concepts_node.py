@@ -25,6 +25,7 @@ from datetime import date
 
 from earnings_agents.tools.normalize_data_client import (
     get_company_by_ticker,
+    get_next_period_type,
     get_statement_concepts,
 )
 from earnings_agents.workflow_state import EarningsAgentState
@@ -134,12 +135,37 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     fy_end_month: int = company["fiscal_year_end_month"]
     fy_end_code: str | None = company.get("fiscal_year_end_code")
     sec_report_date_str: str | None = state.get("sec_report_date")  # type: ignore[assignment]
-    period_type = _infer_period_type(sec_report_date_str, fy_end_month, fy_end_code)
+
+    # Two independent period-type signals, combined defensively:
+    #   * date_based    — report-date month vs fiscal year-end month (needs a
+    #                     correct period-end date, which can be wrong for fast
+    #                     reporters or announcement-date 8-Ks).
+    #   * cadence_based — "after Q3 the next release is always the annual
+    #                     report"; derived purely from what we have stored, so
+    #                     it is robust against period-end date errors.
+    # The filing is annual when EITHER signal says annual: cadence catches a
+    # mis-dated annual release, and the date signal catches a DB gap where a
+    # quarter was skipped.
+    date_based = _infer_period_type(sec_report_date_str, fy_end_month, fy_end_code)
+    try:
+        cadence_based = get_next_period_type(cik)
+    except Exception as exc:  # noqa: BLE001 — cadence is best-effort
+        logger.debug("load_company_concepts: cadence lookup failed for %s (%s)", ticker, exc)
+        cadence_based = None
+
+    period_type = "annual" if (date_based == "annual" or cadence_based == "annual") else "quarterly"
+
+    if cadence_based is not None and cadence_based != date_based:
+        logger.warning(
+            "load_company_concepts: period-type signals diverge for %s — "
+            "cadence=%s date=%s → using %s",
+            ticker, cadence_based, date_based, period_type,
+        )
 
     logger.info(
         "load_company_concepts: %s (CIK %s) — detected period_type=%s "
-        "(sec_report_date=%s, fy_end_month=%s)",
-        ticker, cik, period_type, sec_report_date_str, fy_end_month,
+        "(sec_report_date=%s, fy_end_month=%s, cadence=%s)",
+        ticker, cik, period_type, sec_report_date_str, fy_end_month, cadence_based,
     )
 
     try:

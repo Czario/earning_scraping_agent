@@ -199,6 +199,68 @@ def test_infer_period_type_52_53_week_drift(
     assert _infer_period_type(sec_report_date, fy_end_month, fy_end_code) == expected
 
 
+# ── load_company_concepts_node period-type signal combination ────────────────
+
+def test_load_concepts_cadence_overrides_wrong_date_signal():
+    """Cadence (last stored = Q3 → annual) fixes a mis-dated annual release.
+
+    Mirrors the Oracle failure: the 8-K announcement date (June 10, one month
+    past the May-31 fiscal year-end) makes the date signal say "quarterly", but
+    the last stored period is Q3, so the next release must be annual.
+    """
+    from earnings_agents.nodes import load_company_concepts_node as node
+
+    company = {"cik": "0001341439", "fiscal_year_end_month": 5,
+               "fiscal_year_end_code": "0531", "name": "ORACLE CORP"}
+    state = {"ticker": "ORCL", "sec_report_date": "2026-06-10"}
+
+    with (
+        patch.object(node, "get_company_by_ticker", return_value=company),
+        patch.object(node, "get_next_period_type", return_value="annual"),
+        patch.object(node, "get_statement_concepts", return_value=[]),
+    ):
+        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
+
+    assert result["detected_period_type"] == "annual"
+
+
+def test_load_concepts_date_signal_catches_db_gap():
+    """When a quarter was skipped (cadence says quarterly) but the date lands on
+    the fiscal year-end, the date signal still classifies the release as annual."""
+    from earnings_agents.nodes import load_company_concepts_node as node
+
+    company = {"cik": "000123", "fiscal_year_end_month": 12,
+               "fiscal_year_end_code": "1231", "name": "Example Co"}
+    state = {"ticker": "EXMP", "sec_report_date": "2025-12-31"}
+
+    with (
+        patch.object(node, "get_company_by_ticker", return_value=company),
+        # Cadence thinks the next release is a quarter (e.g. last stored was Q1).
+        patch.object(node, "get_next_period_type", return_value="quarterly"),
+        patch.object(node, "get_statement_concepts", return_value=[]),
+    ):
+        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
+
+    assert result["detected_period_type"] == "annual"
+
+
+def test_load_concepts_quarterly_when_both_signals_agree():
+    """A genuine mid-year quarter stays quarterly when neither signal says annual."""
+    from earnings_agents.nodes import load_company_concepts_node as node
+
+    company = {"cik": "000123", "fiscal_year_end_month": 12,
+               "fiscal_year_end_code": "1231", "name": "Example Co"}
+    state = {"ticker": "EXMP", "sec_report_date": "2025-09-30"}
+
+    with (
+        patch.object(node, "get_company_by_ticker", return_value=company),
+        patch.object(node, "get_next_period_type", return_value="quarterly"),
+        patch.object(node, "get_statement_concepts", return_value=[]),
+    ):
+        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
+
+    assert result["detected_period_type"] == "quarterly"
+
 
 # ── get_statement_concepts uses correct collection ───────────────────────────
 
@@ -405,6 +467,35 @@ def test_get_latest_period_returns_none_when_no_data():
         result = ndc.get_latest_period("000123")
 
     assert result is None
+
+
+# ── get_next_period_type (filing-cadence signal) ─────────────────────────────
+
+@pytest.mark.parametrize("latest, expected", [
+    # After Q3 the next release is always the annual report (no standalone Q4).
+    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 3}, "annual"),
+    # Mid-year quarters → the next standalone quarter.
+    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 1}, "quarterly"),
+    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 2}, "quarterly"),
+    # After the annual report → Q1 of the next fiscal year.
+    ({"period_type": "annual", "fiscal_year": 2025, "quarter": None}, "quarterly"),
+    # Defensive: a missing/zero quarter is treated as not-yet-Q3.
+    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": None}, "quarterly"),
+])
+def test_get_next_period_type(latest, expected):
+    from earnings_agents.tools import normalize_data_client as ndc
+
+    with patch.object(ndc, "get_latest_period", return_value=latest):
+        assert ndc.get_next_period_type("000123") == expected
+
+
+def test_get_next_period_type_returns_none_without_prior_data():
+    """No stored period → cadence cannot be inferred → None."""
+    from earnings_agents.tools import normalize_data_client as ndc
+
+    with patch.object(ndc, "get_latest_period", return_value=None):
+        assert ndc.get_next_period_type("000123") is None
+
 
 
 # ── _is_period_already_stored (CLI helper) ────────────────────────────────────

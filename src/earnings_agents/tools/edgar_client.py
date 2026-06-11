@@ -163,8 +163,9 @@ def _infer_period_end_from_prior_year(
     1. Find the 10-Q or 10-K in *recent* whose ``filingDate`` is closest to
        ``target_filing_date`` - 1 year, within a ±60-day window.
     2. Take its ``reportDate`` and add one calendar year.
-    3. Accept only if the result is 14–100 days before ``target_filing_date``
-       (the typical window for earnings press releases).
+    3. Accept only if the result is 1–100 days before ``target_filing_date``
+       (an earnings release is always filed *after* the period ends; fast
+       reporters such as Oracle announce only ~10 days after fiscal year-end).
 
     Returns ``"YYYY-MM-DD"`` or ``None`` if no suitable prior-year periodic
     filing is found or the sanity check fails.
@@ -211,9 +212,12 @@ def _infer_period_end_from_prior_year(
     except (ValueError, OverflowError):
         return None
 
-    # Sanity: inferred date must be 14–100 days before the filing date.
+    # Sanity: inferred date must be 1–100 days before the filing date.  An
+    # earnings release is always filed after the period ends, and fast
+    # reporters (e.g. Oracle, ~10 days after a May-31 fiscal year-end) must not
+    # be rejected by an over-tight lower bound.
     days_before = (filing_date - inferred).days
-    if not 14 <= days_before <= 100:
+    if not 1 <= days_before <= 100:
         logger.debug(
             "_infer_period_end: rejected inferred=%s (%d days before filing=%s)",
             inferred, days_before, filing_date,
