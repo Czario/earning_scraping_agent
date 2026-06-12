@@ -17,6 +17,8 @@ from earnings_agents.analysis.metric_patterns import (
     COGS_RE as _COGS_RE,
     COMPOSITE_COMMA_RE as _COMPOSITE_COMMA_RE,
     COMPOSITE_SLASH_RE as _COMPOSITE_SLASH_RE,
+    EPS_BASIC_RE as _EPS_BASIC_RE,
+    EPS_DILUTED_RE as _EPS_DILUTED_RE,
     GAAP_NONGAAP_RE as _GAAP_NONGAAP_RE,
     GROSS_PROFIT_RE as _GROSS_PROFIT_RE,
     NEVER_ROUND_RE as _NEVER_ROUND_RE,
@@ -533,6 +535,89 @@ def check_opex_label_collision(metrics: dict[str, Any]) -> list[Finding]:
 
 
 # -----------------------------------------------------------------------------
+# Income-statement ordering invariants.
+# -----------------------------------------------------------------------------
+
+# Tolerance: 1 % — wide enough for legitimate rounding when components are
+# reported at different scales, tight enough to catch a value lifted from the
+# wrong row/column (typically tens of percent off).
+_ORDERING_TOLERANCE = 0.01
+
+
+def check_operating_vs_gross(metrics: dict[str, Any]) -> list[Finding]:
+    """Flag when Operating income exceeds Gross profit.
+
+    Operating income = Gross profit − Operating expenses, and operating
+    expenses are never negative, so Operating income can never exceed Gross
+    profit. When it does, one of the two values was lifted from the wrong row
+    or column. Only checked when both values are positive — a gross or
+    operating *loss* makes the ordering meaningless. Severity is ``"medium"``:
+    it sharpens the next re-extract hint but never triggers a loop on its own.
+    """
+    gp_key, gp = _find_metric(metrics, _GROSS_PROFIT_RE)
+    oi_key, oi = _find_metric(metrics, _OPINC_RE)
+    if gp is None or oi is None or gp <= 0 or oi <= 0:
+        return []
+    if oi <= gp * (1 + _ORDERING_TOLERANCE):
+        return []
+    return [
+        Finding(
+            type="suspect_value",
+            severity="medium",
+            message=(
+                f"Operating income ({oi:,.0f}) exceeds Gross profit ({gp:,.0f}); "
+                f"operating income cannot exceed gross profit when operating "
+                f"expenses are non-negative — one value was likely taken from the "
+                f"wrong row or period column."
+            ),
+            keys=tuple(k for k in (oi_key, gp_key) if k),
+            suggested_action=(
+                "Re-extract Operating income and Gross profit from the SAME "
+                "current-period column; Operating income = Gross profit − "
+                "Operating expenses, so it must be ≤ Gross profit."
+            ),
+            evidence={"operating_income": oi, "gross_profit": gp},
+        )
+    ]
+
+
+def check_eps_dilution_ordering(metrics: dict[str, Any]) -> list[Finding]:
+    """Flag when Diluted EPS exceeds Basic EPS.
+
+    Diluted EPS divides the same earnings by a *larger* share count (it adds
+    dilutive securities), so for positive earnings Diluted EPS is always ≤
+    Basic EPS. When Diluted > Basic the two were almost certainly swapped or
+    one was read from the wrong row. Only checked when both are positive — for
+    a net loss the figures are anti-dilutive and reported equal. Severity is
+    ``"medium"``.
+    """
+    basic_key, basic = _find_metric(metrics, _EPS_BASIC_RE)
+    diluted_key, diluted = _find_metric(metrics, _EPS_DILUTED_RE)
+    if basic is None or diluted is None or basic <= 0 or diluted <= 0:
+        return []
+    if diluted <= basic * (1 + _ORDERING_TOLERANCE):
+        return []
+    return [
+        Finding(
+            type="suspect_value",
+            severity="medium",
+            message=(
+                f"Diluted EPS ({diluted:g}) exceeds Basic EPS ({basic:g}); "
+                f"diluted EPS divides earnings by a larger share count and can "
+                f"never exceed basic EPS for positive earnings — the values were "
+                f"likely swapped or mis-extracted."
+            ),
+            keys=tuple(k for k in (diluted_key, basic_key) if k),
+            suggested_action=(
+                "Re-extract Basic and Diluted EPS from the income statement; "
+                "Diluted EPS must be ≤ Basic EPS when earnings are positive."
+            ),
+            evidence={"basic_eps": basic, "diluted_eps": diluted},
+        )
+    ]
+
+
+# -----------------------------------------------------------------------------
 # Deterministic correction: derive Total operating expenses from components.
 # -----------------------------------------------------------------------------
 
@@ -671,6 +756,8 @@ CHECKER_REGISTRY: list = [
     check_gaap_nongaap_leakage,
     check_balance_sheet_identity,
     check_gross_profit_identity,
+    check_operating_vs_gross,
+    check_eps_dilution_ordering,
     check_sign_anomalies,
     check_suspect_round,
     check_opex_label_collision,

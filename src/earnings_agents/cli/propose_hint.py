@@ -14,6 +14,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from earnings_agents.llm_factory import build_llm
 from earnings_agents.tools.mongodb_client import get_collection
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 _HINTS_DIR = Path(__file__).parents[3] / "data" / "company_hints"
 _PROPOSED_DIR = _HINTS_DIR / "_proposed"
@@ -126,6 +128,38 @@ def _build_identity_block(docs: list[dict[str, Any]]) -> str:
                 lines.append(f"  • {w}")
     return "\n".join(lines) if lines else "  (none)"
 
+def _findings_block_from_list(findings: list[dict[str, Any]]) -> str:
+    """Build a findings block from a single run's in-memory findings list.
+
+    Mirrors :func:`_build_findings_block` but takes the findings directly
+    (no surrounding MongoDB document) so a finished pipeline run can draft a
+    hint without a round-trip through the database.
+    """
+    seen: set[tuple[str, str]] = set()
+    lines: list[str] = []
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        ftype = f.get("type", "unknown")
+        msg = f.get("message", "")
+        severity = f.get("severity", "")
+        key = (ftype, msg)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"  [{severity.upper()}] {ftype}: {msg}")
+    return "\n".join(lines) if lines else "  (no structured findings recorded)"
+
+
+def _identity_block_from_list(warnings: list[str]) -> str:
+    """Build an identity-warnings block from a single run's warning list."""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for w in warnings or []:
+        if isinstance(w, str) and w not in seen:
+            seen.add(w)
+            lines.append(f"  \u2022 {w}")
+    return "\n".join(lines) if lines else "  (none)"
 
 def _load_existing_hints(ticker: str) -> str:
     hint_file = _HINTS_DIR / f"{ticker.upper()}.md"
@@ -151,6 +185,50 @@ def _write_proposed(ticker: str, content: str, force: bool) -> Path:
     )
     out.write_text(header + content.strip() + "\n", encoding="utf-8")
     return out
+
+
+def propose_hint_from_run(
+    ticker: str,
+    company: str,
+    findings: list[dict[str, Any]],
+    identity_warnings: list[str],
+    *,
+    force: bool = True,
+) -> Path | None:
+    """Draft a hint file from a single finished (degraded) pipeline run.
+
+    Powers the self-improvement loop: when a run completes with unresolved
+    high-severity findings or accounting-identity warnings, the extractor's own
+    output is fed back into an LLM to draft company-specific hints. The draft is
+    written to ``data/company_hints/_proposed/{TICKER}.md`` for a human to
+    review and promote — it is **never** activated automatically.
+
+    Returns the written draft path, or ``None`` when there is no actionable
+    signal or the LLM draft fails (the caller should treat ``None`` as a no-op).
+    """
+    actionable = [
+        f for f in findings or []
+        if isinstance(f, dict) and f.get("severity") in ("high", "medium")
+    ]
+    if not actionable and not identity_warnings:
+        return None
+
+    prompt = _DRAFT_PROMPT.format(
+        ticker=ticker.upper(),
+        company=company or ticker.upper(),
+        run_count=1,
+        findings_block=_findings_block_from_list(findings),
+        identity_block=_identity_block_from_list(identity_warnings),
+        existing_hints=_load_existing_hints(ticker),
+    )
+    try:
+        llm = build_llm(format_json=False)
+        draft: str = llm.invoke(prompt)
+    except Exception:  # noqa: BLE001
+        logger.exception("Auto hint draft: LLM call failed for %s", ticker.upper())
+        return None
+
+    return _write_proposed(ticker, draft, force=force)
 
 
 def main(argv: list[str] | None = None) -> None:

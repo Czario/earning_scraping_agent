@@ -42,6 +42,8 @@ TIER2_REGISTRY: list[tuple[str, re.Pattern]] = [
     ("Income Tax Expense",          _R(r"provision for income tax|income tax expense|tax expense")),
     ("Basic EPS",                   _R(r"basic.*per share|basic.*eps|per share.*basic")),
     ("Weighted Avg Shares Diluted", _R(r"diluted.*(weighted|shares outstanding|shares used)|weighted.*shares.*diluted")),
+    ("Weighted Avg Shares Basic",   _R(r"basic.*(weighted|shares outstanding|shares used)|weighted.*shares.*basic")),
+    ("Interest Expense",            _R(r"interest expense")),
 ]
 
 TIER3_REGISTRY: list[tuple[str, re.Pattern]] = [
@@ -51,6 +53,10 @@ TIER3_REGISTRY: list[tuple[str, re.Pattern]] = [
     ("G&A",                       _R(r"general and administrative")),
     ("Comprehensive Income",      _R(r"comprehensive income")),
     ("Effective Tax Rate",        _R(r"effective tax rate")),
+    ("Depreciation & Amortization", _R(r"depreciation (and|&) amortization")),
+    ("Stock-Based Compensation",  _R(r"stock-?based compensation|share-?based compensation")),
+    ("EBITDA",                    _R(r"\bebitda\b")),
+    ("Dividends per Share",       _R(r"dividends? (declared )?per (common )?share|per share dividend")),
 ]
 
 

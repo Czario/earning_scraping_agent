@@ -12,9 +12,12 @@ import pytest
 from earnings_agents.cli.propose_hint import (
     _build_findings_block,
     _build_identity_block,
+    _findings_block_from_list,
+    _identity_block_from_list,
     _load_existing_hints,
     _write_proposed,
     main,
+    propose_hint_from_run,
 )
 
 
@@ -237,3 +240,100 @@ class TestMain:
         # MongoDB query should use uppercased ticker
         call_kwargs = mock_col.find.call_args[0][0]
         assert call_kwargs["ticker"] == "AAPL"
+
+
+# ---------------------------------------------------------------------------
+# List-based block builders (self-improvement loop helpers)
+# ---------------------------------------------------------------------------
+
+class TestListBlockBuilders:
+    def test_findings_block_from_list_includes_type_and_message(self):
+        findings = [
+            {"type": "missing_critical", "severity": "high", "message": "Revenue not found"},
+        ]
+        block = _findings_block_from_list(findings)
+        assert "missing_critical" in block
+        assert "Revenue not found" in block
+        assert "HIGH" in block
+
+    def test_findings_block_from_list_deduplicates(self):
+        findings = [
+            {"type": "sign_anomaly", "severity": "medium", "message": "Net income negative"},
+            {"type": "sign_anomaly", "severity": "medium", "message": "Net income negative"},
+        ]
+        block = _findings_block_from_list(findings)
+        assert block.count("Net income negative") == 1
+
+    def test_findings_block_from_list_skips_non_dict_and_empty(self):
+        assert "no structured findings" in _findings_block_from_list([])
+        assert "no structured findings" in _findings_block_from_list(["bad", None, 7])
+
+    def test_identity_block_from_list(self):
+        assert "Assets" in _identity_block_from_list(["Assets ≠ Liab + Equity"])
+        assert "(none)" in _identity_block_from_list([])
+
+
+# ---------------------------------------------------------------------------
+# propose_hint_from_run (auto self-improvement loop)
+# ---------------------------------------------------------------------------
+
+class TestProposeHintFromRun:
+    def _mock_llm(self, response: str):
+        llm = MagicMock()
+        llm.invoke.return_value = response
+        return llm
+
+    def test_returns_none_when_no_actionable_signal(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("earnings_agents.cli.propose_hint._PROPOSED_DIR", tmp_path / "_proposed")
+        # Only low-severity findings, no identity warnings → nothing to learn from.
+        result = propose_hint_from_run(
+            "AAPL", "Apple Inc.",
+            findings=[{"type": "case_duplicate", "severity": "low", "message": "dup"}],
+            identity_warnings=[],
+        )
+        assert result is None
+        assert not (tmp_path / "_proposed" / "AAPL.md").exists()
+
+    @patch("earnings_agents.cli.propose_hint.build_llm")
+    def test_drafts_from_high_finding(self, mock_build_llm, tmp_path, monkeypatch):
+        mock_build_llm.return_value = self._mock_llm("- Use 'Net sales' for Revenue.")
+        monkeypatch.setattr("earnings_agents.cli.propose_hint._HINTS_DIR", tmp_path)
+        monkeypatch.setattr("earnings_agents.cli.propose_hint._PROPOSED_DIR", tmp_path / "_proposed")
+
+        out = propose_hint_from_run(
+            "aapl", "Apple Inc.",
+            findings=[{"type": "missing_critical", "severity": "high", "message": "Revenue not found"}],
+            identity_warnings=[],
+        )
+        assert out is not None
+        assert out.exists()
+        assert "Net sales" in out.read_text()
+
+    @patch("earnings_agents.cli.propose_hint.build_llm")
+    def test_drafts_from_identity_warning_only(self, mock_build_llm, tmp_path, monkeypatch):
+        mock_build_llm.return_value = self._mock_llm("- Verify balance-sheet rows.")
+        monkeypatch.setattr("earnings_agents.cli.propose_hint._HINTS_DIR", tmp_path)
+        monkeypatch.setattr("earnings_agents.cli.propose_hint._PROPOSED_DIR", tmp_path / "_proposed")
+
+        out = propose_hint_from_run(
+            "MSFT", "Microsoft Corp.",
+            findings=[],
+            identity_warnings=["Assets ≠ Liabilities + Equity"],
+        )
+        assert out is not None and out.exists()
+
+    @patch("earnings_agents.cli.propose_hint.build_llm")
+    def test_llm_failure_returns_none(self, mock_build_llm, tmp_path, monkeypatch):
+        llm = MagicMock()
+        llm.invoke.side_effect = RuntimeError("LLM down")
+        mock_build_llm.return_value = llm
+        monkeypatch.setattr("earnings_agents.cli.propose_hint._HINTS_DIR", tmp_path)
+        monkeypatch.setattr("earnings_agents.cli.propose_hint._PROPOSED_DIR", tmp_path / "_proposed")
+
+        out = propose_hint_from_run(
+            "AAPL", "Apple Inc.",
+            findings=[{"type": "missing_critical", "severity": "high", "message": "Revenue not found"}],
+            identity_warnings=[],
+        )
+        assert out is None
+

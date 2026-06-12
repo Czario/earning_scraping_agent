@@ -68,6 +68,8 @@ from earnings_agents.hooks import set_detail_callback, set_node_callback  # noqa
 
 SEP = "=" * 64
 
+_logger = logging.getLogger(__name__)
+
 # Human-readable stage names for the rich progress description
 _NODE_LABELS: dict[str, str] = {
     "discover_earnings_release_node": "discover",
@@ -457,7 +459,51 @@ def _run_company(graph, info: dict, source: str = "sec", ir_url_override: str = 
         printer(f"  Error   : {final.get('error')}")
     printer(SEP)
 
+    _maybe_auto_propose_hint(final, printer=printer)
+
     return final
+
+
+def _maybe_auto_propose_hint(final: dict, printer=print) -> None:
+    """Auto-draft a company hint when a finished run stays degraded.
+
+    A run is "degraded" when it completed but left unresolved high-severity
+    findings or accounting-identity warnings. Gated by ``AUTO_PROPOSE_HINTS``
+    (default off). The draft lands in ``data/company_hints/_proposed/`` for
+    human review — it is never activated automatically. Failures here never
+    affect the run result.
+    """
+    from earnings_agents.config import AUTO_PROPOSE_HINTS
+
+    if not AUTO_PROPOSE_HINTS:
+        return
+
+    findings = [f for f in (final.get("findings") or []) if isinstance(f, dict)]
+    identity_warnings = final.get("identity_warnings") or []
+    high = [f for f in findings if f.get("severity") == "high"]
+    if not high and not identity_warnings:
+        return
+
+    ticker = final.get("ticker") or ""
+    if not ticker:
+        return
+
+    try:
+        from earnings_agents.cli.propose_hint import propose_hint_from_run
+
+        path = propose_hint_from_run(
+            ticker,
+            final.get("company_name") or ticker,
+            findings,
+            identity_warnings,
+            force=True,
+        )
+        if path is not None:
+            _logger.info("Auto-proposed hint draft for %s -> %s", ticker, path)
+            printer(f"  [HINT]  Drafted self-improvement hint -> {path} (review before activating)")
+    except Exception:  # noqa: BLE001 — never let hint drafting break a run
+        _logger.exception("Auto-propose-hint failed for %s", ticker)
+
 
 
 def _dry_run_company(

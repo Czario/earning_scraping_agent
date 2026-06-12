@@ -35,7 +35,7 @@ The routing weight of a `Finding`. `high` triggers a re-extract loop. `medium` a
 _Avoid_: priority, level, importance
 
 **FindingType**:
-The closed set of finding categories: `missing_critical`, `missing_expected`, `case_duplicate`, `identity_violation`, `sign_anomaly`, `suspect_round`, `suspect_value`, `gaap_nongaap_leakage`, `composite_key`, `auto_corrected`, `section_mismatch`.
+The closed set of finding categories: `missing_critical`, `missing_expected`, `case_duplicate`, `identity_violation`, `sign_anomaly`, `suspect_round`, `suspect_value`, `gaap_nongaap_leakage`, `composite_key`, `auto_corrected`, `section_mismatch`. The `suspect_value` type also covers income-statement ordering violations (Operating income > Gross profit; Diluted EPS > Basic EPS).
 _Avoid_: error type, warning type
 
 **Tier-1 metric**:
@@ -43,11 +43,11 @@ A core income statement line that must appear in every earnings release. Missing
 _Avoid_: required metric, critical field, mandatory metric
 
 **Tier-2 metric**:
-A supporting income statement line that should appear but whose absence does not force re-extraction. Missing Tier-2 metrics produce `missing_expected` findings with `medium` severity. Defined in `TIER2_REGISTRY`. Includes: Cost of Revenue, Total Operating Expenses, Pre-tax Income, Income Tax Expense, Basic EPS, Weighted Avg Shares Diluted.
+A supporting income statement line that should appear but whose absence does not force re-extraction. Missing Tier-2 metrics produce `missing_expected` findings with `medium` severity. Defined in `TIER2_REGISTRY`. Includes: Cost of Revenue, Total Operating Expenses, Pre-tax Income, Income Tax Expense, Basic EPS, Weighted Avg Shares Diluted, Weighted Avg Shares Basic, Interest Expense.
 _Avoid_: secondary metric, optional metric (use Tier-3 for truly optional)
 
 **Tier-3 metric**:
-Supplemental income statement lines that are tracked when present but never trigger any action on absence. Defined in `TIER3_REGISTRY`. Includes R&D, Sales & Marketing, G&A, Comprehensive Income, Effective Tax Rate.
+Supplemental income statement lines that are tracked when present but never trigger any action on absence. Defined in `TIER3_REGISTRY`. Includes R&D, Sales & Marketing, G&A, Comprehensive Income, Effective Tax Rate, Depreciation & Amortization, Stock-Based Compensation, EBITDA, Dividends per Share.
 _Avoid_: optional metric, bonus metric
 
 **`__scale__`**:

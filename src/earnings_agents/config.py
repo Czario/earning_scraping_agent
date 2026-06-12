@@ -86,3 +86,13 @@ CLEANUP_METRICS: bool = os.getenv("CLEANUP_METRICS", "1").strip().lower() not in
 # Maximum extraction passes in the agentic loop (initial pass + retries).
 # Override with the MAX_EXTRACTION_ATTEMPTS environment variable.
 MAX_EXTRACTION_ATTEMPTS: int = int(os.getenv("MAX_EXTRACTION_ATTEMPTS", "3"))
+
+# When True, a finished run that remains degraded (unresolved high-severity
+# findings or accounting-identity warnings after all extraction attempts)
+# auto-drafts a company hint file into data/company_hints/_proposed/{TICKER}.md.
+# This is the closed self-improvement loop — the draft is ALWAYS human-gated:
+# it is written to _proposed/ for review and is never activated automatically.
+# Opt-in (default off) because it spends an extra LLM call per degraded run.
+AUTO_PROPOSE_HINTS: bool = os.getenv("AUTO_PROPOSE_HINTS", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}

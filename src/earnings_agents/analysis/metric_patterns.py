@@ -37,6 +37,16 @@ OPINC_RE = re.compile(r"^\s*operating\s+income\b", re.IGNORECASE)
 OPEX_TOTAL_RE = re.compile(r"^\s*total\s+operating\s+expenses\b", re.IGNORECASE)
 OPEX_SUBTOTAL_RE = re.compile(r"^\s*operating\s+expenses\b", re.IGNORECASE)
 
+# Earnings-per-share patterns. Both require an explicit "per share"/"eps" token
+# so that weighted-average *share-count* lines ("Diluted shares outstanding")
+# are never mistaken for an EPS value.
+EPS_DILUTED_RE = re.compile(
+    r"diluted.*(per\s+share|eps)|(per\s+share|eps).*diluted", re.IGNORECASE
+)
+EPS_BASIC_RE = re.compile(
+    r"basic.*(per\s+share|eps)|(per\s+share|eps).*basic", re.IGNORECASE
+)
+
 # ---------------------------------------------------------------------------
 # Suspect-round heuristic constants and guard pattern
 # ---------------------------------------------------------------------------

@@ -459,6 +459,128 @@ def test_opex_collision_clean_when_opex_differs():
     assert check_opex_label_collision(metrics) == []
 
 
+# ---------------------------------------------------------------------------
+# Income-statement ordering invariants
+# ---------------------------------------------------------------------------
+
+from earnings_agents.analysis.findings import (  # noqa: E402
+    check_eps_dilution_ordering,
+    check_operating_vs_gross,
+)
+
+
+def test_operating_vs_gross_flags_when_operating_exceeds_gross():
+    metrics = {
+        "Gross profit": 60_000_000_000.0,
+        "Operating income": 70_000_000_000.0,   # impossible: OI > GP
+    }
+    findings = check_operating_vs_gross(metrics)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.type == "suspect_value"
+    assert f.severity == "medium"
+    assert set(f.keys) == {"Operating income", "Gross profit"}
+
+
+def test_operating_vs_gross_ok_when_operating_below_gross():
+    metrics = {
+        "Gross profit": 60_000_000_000.0,
+        "Operating income": 30_000_000_000.0,
+    }
+    assert check_operating_vs_gross(metrics) == []
+
+
+def test_operating_vs_gross_ignored_on_loss():
+    """A negative operating income makes the ordering meaningless."""
+    metrics = {
+        "Gross profit": 10_000_000_000.0,
+        "Operating income": -2_000_000_000.0,
+    }
+    assert check_operating_vs_gross(metrics) == []
+
+
+def test_eps_dilution_flags_when_diluted_exceeds_basic():
+    metrics = {
+        "Basic earnings per share": 2.39,
+        "Diluted earnings per share": 2.50,   # impossible: diluted > basic
+    }
+    findings = check_eps_dilution_ordering(metrics)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.type == "suspect_value"
+    assert f.severity == "medium"
+    assert set(f.keys) == {"Diluted earnings per share", "Basic earnings per share"}
+
+
+def test_eps_dilution_ok_when_diluted_below_basic():
+    metrics = {
+        "Basic earnings per share": 2.45,
+        "Diluted earnings per share": 2.39,
+    }
+    assert check_eps_dilution_ordering(metrics) == []
+
+
+def test_eps_dilution_ignored_on_loss():
+    """For a net loss EPS is anti-dilutive (basic == diluted); not flagged."""
+    metrics = {
+        "Basic earnings per share": -1.20,
+        "Diluted earnings per share": -1.20,
+    }
+    assert check_eps_dilution_ordering(metrics) == []
+
+
+def test_eps_dilution_does_not_match_share_counts():
+    """Weighted-average share-count lines must not be read as EPS values."""
+    metrics = {
+        "Weighted average shares outstanding, basic": 7_400_000_000.0,
+        "Weighted average shares outstanding, diluted": 7_500_000_000.0,
+    }
+    # diluted share count > basic is normal and must NOT be flagged as an EPS anomaly
+    assert check_eps_dilution_ordering(metrics) == []
+
+
+def test_ordering_checkers_recorded_by_analyze_node_no_reextract():
+    m = _full_metrics()
+    m["Basic earnings per share"] = 2.30
+    m["Diluted earnings per share"] = 2.50   # diluted > basic
+    out = analyze_metrics_node(_state(m))
+    assert any(f["type"] == "suspect_value" for f in out["findings"])
+    # medium severity alone must not trigger a re-extract loop
+    assert out["status"] == "extracted"
+    assert out["needs_reextract"] is False
+
+
+# ---------------------------------------------------------------------------
+# Expanded tier registries
+# ---------------------------------------------------------------------------
+
+def test_presence_detects_new_tier2_metrics():
+    metrics = {
+        "Weighted average shares outstanding, basic": 7_400_000_000,
+        "Interest expense": 500_000_000,
+    }
+    presence = presence_summary(metrics.keys())
+    assert "Weighted Avg Shares Basic" not in presence["tier2_missing"]
+    assert "Interest Expense" not in presence["tier2_missing"]
+
+
+def test_presence_detects_new_tier3_metrics():
+    metrics = {
+        "Depreciation and amortization": 1_000_000_000,
+        "Stock-based compensation": 800_000_000,
+        "EBITDA": 12_000_000_000,
+        "Dividends declared per common share": 0.25,
+    }
+    presence = presence_summary(metrics.keys())
+    assert {
+        "Depreciation & Amortization",
+        "Stock-Based Compensation",
+        "EBITDA",
+        "Dividends per Share",
+    } <= set(presence["tier3_present"])
+
+
+
 def test_opex_collision_no_opex_key_returns_empty():
     """If the document doesn't have 'Total operating expenses', no finding is emitted."""
     metrics = {
