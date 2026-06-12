@@ -99,39 +99,44 @@ def _infer_period_type(
 def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     """Load GAAP concepts for targeted extraction from normalize_data.
 
-    Falls back to ``target_concepts=[]`` (generic extraction) when the company
-    is not found in the DB or the DB is unreachable.
+    Targeted extraction requires stored historical concepts for the ticker.
+    When the company is absent from normalize_data, the DB is unreachable, or
+    no income-statement concepts are stored, the run is *skipped*
+    (``status="skipped"``) with a clear error message — we do not fall back to
+    generic extraction.
     """
     ticker = state["ticker"]
 
-    _fallback = {
-        **state,
-        "target_concepts": [],
-        "calculated_concepts": [],
-        "company_cik": None,
-        "fiscal_year_end_month": None,
-        "fiscal_year_end_code": None,
-        "detected_period_type": "quarterly",
-    }
+    def _skip(message: str, **extra: object) -> EarningsAgentState:
+        logger.info("load_company_concepts: %s", message)
+        skipped = {
+            **state,
+            "status": "skipped",
+            "error": message,
+            "target_concepts": [],
+            "calculated_concepts": [],
+            "company_cik": None,
+            "fiscal_year_end_month": None,
+            "fiscal_year_end_code": None,
+            "detected_period_type": "quarterly",
+        }
+        skipped.update(extra)
+        return skipped  # type: ignore[return-value]
 
     try:
         company = get_company_by_ticker(ticker)
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "load_company_concepts: DB lookup failed for %s (%s) — "
-            "falling back to generic extraction",
-            ticker,
-            exc,
+        return _skip(
+            f"No historical data for {ticker}: normalize_data lookup failed "
+            f"({exc}); we don't have historical data for the company so we "
+            f"can't proceed."
         )
-        return _fallback
 
     if company is None:
-        logger.info(
-            "load_company_concepts: %s not found in normalize_data.companies — "
-            "falling back to generic extraction",
-            ticker,
+        return _skip(
+            f"No historical data for {ticker} in normalize_data — we don't have "
+            f"historical data for the company so we can't proceed."
         )
-        return _fallback
 
     cik: str = company["cik"]
     fy_end_month: int = company["fiscal_year_end_month"]
@@ -194,22 +199,14 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             period_type=period_type,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "load_company_concepts: concept query failed for %s CIK=%s (%s) — "
-            "falling back to generic extraction",
-            ticker,
-            cik,
-            exc,
+        return _skip(
+            f"No historical data for {ticker}: concept query failed ({exc}); "
+            f"we don't have historical data for the company so we can't proceed.",
+            company_cik=cik,
+            fiscal_year_end_month=fy_end_month,
+            fiscal_year_end_code=company.get("fiscal_year_end_code"),
+            detected_period_type=period_type,
         )
-        return {
-            **state,
-            "target_concepts": [],
-            "calculated_concepts": [],
-            "company_cik": cik,
-            "fiscal_year_end_month": fy_end_month,
-            "fiscal_year_end_code": company.get("fiscal_year_end_code"),
-            "detected_period_type": period_type,
-        }
 
     logger.info(
         "load_company_concepts: loaded %d income-statement concept(s) for %s (CIK %s, %s)",
@@ -218,6 +215,16 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
         cik,
         period_type,
     )
+
+    if not concepts:
+        return _skip(
+            f"No income-statement concepts stored for {ticker} in normalize_data — "
+            f"we don't have historical data for the company so we can't proceed.",
+            company_cik=cik,
+            fiscal_year_end_month=fy_end_month,
+            fiscal_year_end_code=company.get("fiscal_year_end_code"),
+            detected_period_type=period_type,
+        )
 
     try:
         calculated = get_calculated_concepts(

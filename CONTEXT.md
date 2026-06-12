@@ -35,7 +35,7 @@ The routing weight of a `Finding`. `high` triggers a re-extract loop. `medium` a
 _Avoid_: priority, level, importance
 
 **FindingType**:
-The closed set of finding categories: `missing_critical`, `missing_expected`, `case_duplicate`, `identity_violation`, `sign_anomaly`, `suspect_round`, `suspect_value`, `gaap_nongaap_leakage`, `composite_key`, `auto_corrected`, `section_mismatch`. The `suspect_value` type also covers income-statement ordering violations (Operating income > Gross profit; Diluted EPS > Basic EPS).
+The closed set of finding categories: `missing_critical`, `missing_expected`, `case_duplicate`, `identity_violation`, `suspect_round`, `suspect_value`, `gaap_nongaap_leakage`, `composite_key`, `auto_corrected`, `section_mismatch`. The `suspect_value` type also covers income-statement ordering violations (Operating income > Gross profit; Diluted EPS > Basic EPS).
 _Avoid_: error type, warning type
 
 **Tier-1 metric**:
@@ -90,10 +90,6 @@ _Avoid_: table sections, parsed tables, HTML sections
 The two-phase process in `cleanup_metrics_node`: first a deterministic case-deduplication using `findings`; then an optional LLM pass to remove Rule-A/B/C duplicates. Neither pass may rename or edit the text of retained metric keys.
 _Avoid_: dedup, normalization, metric cleaning
 
-**company hint**:
-A Markdown file in `data/company_hints/<TICKER>.md` containing company-specific extraction guidance (e.g. known non-standard metric names, reporting quirks). Injected into the LLM prompt when present.
-_Avoid_: company config, extraction config, ticker hints
-
 **concept**:
 A `normalize_data` platform entity representing a standardized financial metric. When `EARNINGS_SAVE_TARGET=normalize_data`, `load_company_concepts_node` fetches the company's target concept list and `extract_financial_metrics_node` attempts to map extracted keys to concept IDs.
 _Avoid_: standard metric, normalized metric, concept ID (use concept_id for the ID specifically)
@@ -101,3 +97,11 @@ _Avoid_: standard metric, normalized metric, concept ID (use concept_id for the 
 **degraded**:
 A MongoDB document status (not pipeline status) meaning the pipeline completed all extraction attempts but Tier-1 findings remained unresolved. The document is saved with partial data rather than discarded.
 _Avoid_: partial success, incomplete, failed (use `failed` only when the pipeline aborted with `status = "failed"`)
+
+**failure-mode skill**:
+A self-contained, discoverable unit in `analysis/skills.py` that bundles metadata (stable `id`, human `title`, `finding_types`), a pure-observer detector from `findings.py`, and curated remediation guidance. Skills do not change the execution model — they reorganise knowledge so that adding a failure mode is one catalog entry plus a checker and a test. Correctors are explicitly excluded (ADR-0003). Browse the catalog with `uv run earnings-skills`.
+_Avoid_: skill engine, runtime skill, skill selector
+
+**skill effectiveness**:
+A per-pass record (`state["skill_effectiveness"]`) appended by `analyze_metrics` on each re-extract loop, counting how many of a finding type's findings were `resolved` (gone since the previous pass), `persisted` (present in both), or `new` (appeared this pass). Computed by `compute_skill_effectiveness` from stable `finding_signature` values. Pure observability — it shows which detectors earn their keep and never influences routing (ADR-0001/0006).
+_Avoid_: self-tuning, adaptive skills, skill scoring

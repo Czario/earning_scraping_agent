@@ -9,13 +9,11 @@ import pytest
 from earnings_agents.nodes.extract_financial_metrics import (
     _chunk_text,
     _llm_map_concepts,
-    _load_company_hints,
     _merge_metrics,
     _prescan_document,
     extract_financial_metrics_node,
 )
 from earnings_agents.extraction.chunker import _build_period_hint
-from earnings_agents.tools.company_hints_loader import _HINTS_DIR
 
 
 def _base_state(**overrides):
@@ -31,6 +29,18 @@ def _base_state(**overrides):
             "Diluted EPS: $2.40.\n"
             "Guidance: Revenue of $89-93 billion expected for Q2 FY2025."
         ),
+        # Generic extraction has been removed: every run is targeted, so a
+        # default set of income-statement concepts is supplied. Tests that
+        # assert exact LLM call counts override this with concepts whose labels
+        # match the mocked response so no Tier-2 mapping call is triggered.
+        "target_concepts": [
+            {"_id": "c_rev", "concept": "us-gaap:Revenues",
+             "label": "Total Net Revenue", "statement_type": "income_statement"},
+            {"_id": "c_ni", "concept": "us-gaap:NetIncomeLoss",
+             "label": "Net Income", "statement_type": "income_statement"},
+            {"_id": "c_eps", "concept": "us-gaap:EarningsPerShareDiluted",
+             "label": "Diluted EPS", "statement_type": "income_statement"},
+        ],
         "metrics": None,
         "error": None,
         "status": "text_extracted",
@@ -119,8 +129,8 @@ def test_extraction_fails_when_no_raw_text():
 def test_first_attempt_runs_all_section_chunks(mock_llm_cls):
     """When table sections are available, attempt 1 combines income_statement
     and other sections into a single chunk (balance_sheet and cash_flow are
-    excluded from generic earnings extraction).  With a large CHUNK_SIZE (Groq)
-    all included sections fit in one LLM call.
+    excluded because the targeted concepts are income-statement only).  With a
+    large CHUNK_SIZE (Groq) all included sections fit in one LLM call.
     """
     mock_llm = MagicMock()
     mock_llm.invoke.side_effect = [
@@ -131,9 +141,15 @@ def test_first_attempt_runs_all_section_chunks(mock_llm_cls):
     result = extract_financial_metrics_node(
         _base_state(
             file_type="html",
+            target_concepts=[
+                {"_id": "c_rev", "concept": "us-gaap:Revenues",
+                 "label": "Revenues", "statement_type": "income_statement"},
+                {"_id": "c_opex", "concept": "us-gaap:OperatingExpenses",
+                 "label": "Operating expenses", "statement_type": "income_statement"},
+            ],
             raw_sections={
                 "income_statement": ["income table"],
-                "balance_sheet": ["balance table"],   # excluded in generic mode
+                "balance_sheet": ["balance table"],   # excluded in targeted mode
                 "other": ["supplemental table"],
             },
             raw_text="Quarter data",
@@ -165,6 +181,14 @@ def test_retry_scopes_to_income_statement_and_preserves_other_sections(mock_llm_
     }
     state = _base_state(
         file_type="html",
+        target_concepts=[
+            {"_id": "c_rev", "concept": "us-gaap:Revenues",
+             "label": "Revenues", "statement_type": "income_statement"},
+            {"_id": "c_cor", "concept": "us-gaap:CostOfRevenue",
+             "label": "Cost of Revenue", "statement_type": "income_statement"},
+            {"_id": "c_gp", "concept": "us-gaap:GrossProfit",
+             "label": "Gross Profit", "statement_type": "income_statement"},
+        ],
         raw_sections={
             "income_statement": ["income table"],
             "other": ["other table"],
@@ -660,6 +684,18 @@ def _base_state(**overrides):
             "Diluted EPS: $2.40.\n"
             "Guidance: Revenue of $89-93 billion expected for Q2 FY2025."
         ),
+        # Generic extraction has been removed: every run is targeted, so a
+        # default set of income-statement concepts is supplied. Tests that
+        # assert exact LLM call counts override this with concepts whose labels
+        # match the mocked response so no Tier-2 mapping call is triggered.
+        "target_concepts": [
+            {"_id": "c_rev", "concept": "us-gaap:Revenues",
+             "label": "Total Net Revenue", "statement_type": "income_statement"},
+            {"_id": "c_ni", "concept": "us-gaap:NetIncomeLoss",
+             "label": "Net Income", "statement_type": "income_statement"},
+            {"_id": "c_eps", "concept": "us-gaap:EarningsPerShareDiluted",
+             "label": "Diluted EPS", "statement_type": "income_statement"},
+        ],
         "metrics": None,
         "error": None,
         "status": "text_extracted",
@@ -1044,86 +1080,6 @@ class TestPrescanDocument:
         text = "CONSOLIDATED STATEMENTS OF INCOME\nDollars\xa0in\xa0millions\nNet sales 124300\n"
         scale, _, _ = _prescan_document(text)
         assert scale == "millions"
-
-
-# ---------------------------------------------------------------------------
-# _load_company_hints
-# ---------------------------------------------------------------------------
-
-class TestLoadCompanyHints:
-    def test_returns_empty_when_no_file(self, tmp_path, monkeypatch):
-        """Missing hint file returns empty string."""
-        monkeypatch.setattr(
-            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
-        )
-        assert _load_company_hints("AAPL") == ""
-
-    def test_returns_content_when_file_exists(self, tmp_path, monkeypatch):
-        """Existing hint file returns its stripped content."""
-        (tmp_path / "AAPL.md").write_text("  Report shares in thousands.\n", encoding="utf-8")
-        monkeypatch.setattr(
-            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
-        )
-        assert _load_company_hints("AAPL") == "Report shares in thousands."
-
-    def test_ticker_uppercased_for_lookup(self, tmp_path, monkeypatch):
-        """Ticker is upper-cased so 'aapl' finds AAPL.md."""
-        (tmp_path / "AAPL.md").write_text("hint content", encoding="utf-8")
-        monkeypatch.setattr(
-            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
-        )
-        assert _load_company_hints("aapl") == "hint content"
-
-    def test_empty_file_returns_empty_string(self, tmp_path, monkeypatch):
-        """An all-whitespace hint file is treated as absent."""
-        (tmp_path / "MSFT.md").write_text("   \n\n  ", encoding="utf-8")
-        monkeypatch.setattr(
-            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
-        )
-        assert _load_company_hints("MSFT") == ""
-
-    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
-    def test_hint_injected_into_prompt(self, mock_build_llm, tmp_path, monkeypatch):
-        """Company hint text appears in the LLM prompt when a hint file is present."""
-        (tmp_path / "AAPL.md").write_text("Always look for segment revenue.", encoding="utf-8")
-        monkeypatch.setattr(
-            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
-        )
-        captured_prompts: list[str] = []
-
-        mock_llm = MagicMock()
-        mock_llm.invoke.side_effect = lambda prompt: (
-            captured_prompts.append(prompt)
-            or '{"Net income": 31000000000}'
-        )
-        mock_build_llm.return_value = mock_llm
-
-        state = _base_state(ticker="AAPL", company_name="Apple Inc.")
-        extract_financial_metrics_node(state)
-
-        assert captured_prompts, "LLM was never invoked"
-        assert "Always look for segment revenue." in captured_prompts[0]
-
-    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
-    def test_no_hint_file_does_not_alter_prompt(self, mock_build_llm, tmp_path, monkeypatch):
-        """When no hint file exists the prompt is unchanged (no hint section)."""
-        monkeypatch.setattr(
-            "earnings_agents.tools.company_hints_loader._HINTS_DIR", tmp_path
-        )
-        captured_prompts: list[str] = []
-
-        mock_llm = MagicMock()
-        mock_llm.invoke.side_effect = lambda prompt: (
-            captured_prompts.append(prompt)
-            or '{"Net income": 31000000000}'
-        )
-        mock_build_llm.return_value = mock_llm
-
-        state = _base_state(ticker="AAPL", company_name="Apple Inc.")
-        extract_financial_metrics_node(state)
-
-        assert captured_prompts, "LLM was never invoked"
-        assert "Company-specific extraction hints" not in captured_prompts[0]
 
 
 # ---------------------------------------------------------------------------

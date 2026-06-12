@@ -1,7 +1,7 @@
 """``uv run earnings-failures`` — query MongoDB for degraded/failed runs.
 
 Aggregates findings by ticker and finding type so you can spot recurring
-extraction problems and decide which tickers need a company hint file.
+extraction problems.
 
 Usage examples::
 
@@ -178,23 +178,6 @@ def main(argv: list[str] | None = None) -> None:
             )
             agg_table.add_row(ftype, str(count), affected)
         console.print(agg_table)
-
-    # ── Hint file suggestions ─────────────────────────────────────────────────
-    # Tickers with 2+ degraded docs get flagged as candidates for a hint file.
-    ticker_counts: dict[str, int] = defaultdict(int)
-    for doc in docs:
-        ticker_counts[doc.get("ticker", "?")] += 1
-
-    repeat_offenders = [t for t, n in ticker_counts.items() if n >= 2]
-    if repeat_offenders:
-        console.print()
-        console.print(
-            "[bold yellow]Hint file candidates[/bold yellow] "
-            "(≥2 degraded/failed runs — consider creating "
-            "[cyan]data/company_hints/{TICKER}.md[/cyan]):"
-        )
-        for t in sorted(repeat_offenders):
-            console.print(f"  • [cyan]{t}[/cyan] ({ticker_counts[t]} runs)")
 
 
 if __name__ == "__main__":

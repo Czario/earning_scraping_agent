@@ -98,6 +98,106 @@ _SHORT_STAGE: dict[str, str] = {
 }
 
 
+def _format_step_line(node_name: str, state: dict) -> str | None:
+    """Return a single-line human-readable summary for a completed node.
+
+    Returns ``None`` when no summary is needed.
+    """
+    if node_name == "discover_earnings_release_node":
+        # Covers both IR path (URL found by LLM) and SEC path (URL pre-set, node short-circuits).
+        url = state.get("discovered_file_url") or ""
+        period = state.get("sec_report_date") or ""
+        if state.get("status") == "failed":
+            return f"  [discover]       failed — {(state.get('error') or '')[:60]}"
+        return f"  [discover]       {url[:90]}" + (f"  ({period})" if period else "")
+    if node_name == "load_company_concepts_node":
+        if state.get("status") in ("skipped", "failed"):
+            reason = (state.get("error") or "no concepts")[:70]
+            return f"  [load concepts]  skipped — {reason}"
+        n = len(state.get("target_concepts") or [])
+        nc = len(state.get("calculated_concepts") or [])
+        pt = state.get("detected_period_type") or "quarterly"
+        return f"  [load concepts]  {n} concepts  ({nc} calculated,  {pt})"
+
+    if node_name == "detect_document_type_node":
+        if state.get("status") == "failed":
+            return f"  [detect type]    failed — {(state.get('error') or '')[:60]}"
+        return f"  [detect type]    {state.get('file_type') or '?'}"
+
+    if node_name in ("extract_html_text_node", "extract_pdf_text_node"):
+        label = "fetch pdf " if "pdf" in node_name else "fetch text"
+        if state.get("status") == "failed":
+            return f"  [{label}]    failed"
+        n = len(state.get("raw_text") or "")
+        return f"  [{label}]     {n:,} chars"
+
+    if node_name == "extract_financial_metrics_node":
+        attempt = state.get("extraction_attempts", 1)
+        metrics = state.get("metrics") or {}
+        n_metrics = len([k for k in metrics if not k.startswith("__")])
+        if state.get("status") == "failed":
+            return f"  [extract {attempt}/3]    failed — {(state.get('error') or '')[:60]}"
+        concept_metrics = state.get("concept_metrics") or {}
+        derived_ids = set(state.get("derived_concept_ids") or [])
+        target_concepts = state.get("target_concepts") or []
+        n_total_concepts = len(target_concepts) + len(state.get("calculated_concepts") or [])
+        n_mapped = len(concept_metrics) - len(derived_ids)
+        n_derived = len(derived_ids)
+        n_absent = len([c for c in target_concepts if c["_id"] not in concept_metrics])
+        lines = [f"  [extract {attempt}/3]    → {n_metrics} metrics extracted"]
+        if n_total_concepts:
+            lines.append(
+                f"  [extract {attempt}/3]    concepts: "
+                f"{n_mapped} mapped  {n_derived} derived  {n_absent} not in filing"
+                f"  (of {n_total_concepts})"
+            )
+        return "\n".join(lines)
+
+    if node_name == "analyze_metrics_node":
+        attempt = state.get("extraction_attempts", 1)
+        findings = state.get("findings") or []
+        high = [f for f in findings if isinstance(f, dict) and f.get("severity") == "high"]
+        medium = [f for f in findings if isinstance(f, dict) and f.get("severity") == "medium"]
+        needs = state.get("needs_reextract", False)
+        if needs:
+            msgs = "; ".join((f.get("message") or "?")[:45] for f in high[:2])
+            extra = f"  (+{len(high) - 2} more)" if len(high) > 2 else ""
+            lines = [f"  [analyze {attempt}/3]     ✗ {msgs}{extra}  → re-extract"]
+            notes = (state.get("extraction_notes") or "").strip()
+            if notes:
+                lines.append("  ┌─ hints injected into next prompt ───────────────────────")
+                for note_line in notes.splitlines()[:15]:
+                    lines.append(f"  │  {note_line}")
+                remaining = len(notes.splitlines()) - 15
+                if remaining > 0:
+                    lines.append(f"  │  ... ({remaining} more lines)")
+                lines.append("  └─────────────────────────────────────────────────────────")
+            return "\n".join(lines)
+        if high:
+            msgs = "; ".join((f.get("message") or "?")[:45] for f in high[:2])
+            return f"  [analyze {attempt}/3]     ⚠ {len(high)} unresolved (max attempts): {msgs}"
+        suffix = f"  ({len(medium)} medium)" if medium else ""
+        return f"  [analyze {attempt}/3]     ✓ all required found{suffix}"
+
+    if node_name == "cleanup_metrics_node":
+        removed = state.get("cleanup_removed") or []
+        return f"  [cleanup]        {len(removed)} key(s) removed"
+
+    if node_name == "mongodb_save_node":
+        s = state.get("status", "?")
+        ticker_val = state.get("ticker", "?")
+        period = state.get("sec_report_date") or ""
+        year = period[:4] if period else "?"
+        n_concepts = len(state.get("concept_metrics") or {})
+        if s == "saved":
+            return f"  [save]           ✓  {ticker_val}_{year}_latest  ({n_concepts} concepts upserted)"
+        if s == "failed":
+            return f"  [save]           ✗  {(state.get('error') or 'failed')[:70]}"
+        return f"  [save]           {s}"
+
+    return None
+
+
 def _check_ollama() -> tuple[bool, str]:
     """Return (ok, detail) for Ollama reachability and model availability."""
     try:
@@ -459,51 +559,7 @@ def _run_company(graph, info: dict, source: str = "sec", ir_url_override: str = 
         printer(f"  Error   : {final.get('error')}")
     printer(SEP)
 
-    _maybe_auto_propose_hint(final, printer=printer)
-
     return final
-
-
-def _maybe_auto_propose_hint(final: dict, printer=print) -> None:
-    """Auto-draft a company hint when a finished run stays degraded.
-
-    A run is "degraded" when it completed but left unresolved high-severity
-    findings or accounting-identity warnings. Gated by ``AUTO_PROPOSE_HINTS``
-    (default off). The draft lands in ``data/company_hints/_proposed/`` for
-    human review — it is never activated automatically. Failures here never
-    affect the run result.
-    """
-    from earnings_agents.config import AUTO_PROPOSE_HINTS
-
-    if not AUTO_PROPOSE_HINTS:
-        return
-
-    findings = [f for f in (final.get("findings") or []) if isinstance(f, dict)]
-    identity_warnings = final.get("identity_warnings") or []
-    high = [f for f in findings if f.get("severity") == "high"]
-    if not high and not identity_warnings:
-        return
-
-    ticker = final.get("ticker") or ""
-    if not ticker:
-        return
-
-    try:
-        from earnings_agents.cli.propose_hint import propose_hint_from_run
-
-        path = propose_hint_from_run(
-            ticker,
-            final.get("company_name") or ticker,
-            findings,
-            identity_warnings,
-            force=True,
-        )
-        if path is not None:
-            _logger.info("Auto-proposed hint draft for %s -> %s", ticker, path)
-            printer(f"  [HINT]  Drafted self-improvement hint -> {path} (review before activating)")
-    except Exception:  # noqa: BLE001 — never let hint drafting break a run
-        _logger.exception("Auto-propose-hint failed for %s", ticker)
-
 
 
 def _dry_run_company(
@@ -639,6 +695,7 @@ def _run_company_parallel(args: tuple) -> dict:
     _current_stage: list[str] = ["resolving\u2026"]
     _current_detail: list[str] = [""]
     _extract_pass: list[int] = [0]  # counts how many extraction passes have started
+    _last_chunk_done: list[int] = [0]  # tracks last printed chunk-done count per pass
 
     def _render() -> str:
         """Build a terminal-width-aware progress description.
@@ -690,11 +747,12 @@ def _run_company_parallel(args: tuple) -> dict:
         count_markup = f"[green]({n}\u2713)[/]  " if n > 0 else ""
         return f"{label}  {count_markup}[bold]\u2192 {active_trunc}[/]"
 
-    def _node_cb(node_name: str, event: str, _ticker: str) -> None:
+    def _node_cb(node_name: str, event: str, _ticker: str, node_state=None) -> None:
         stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
         if event == "start":
             if node_name == "extract_financial_metrics_node":
                 _extract_pass[0] += 1
+                _last_chunk_done[0] = 0  # reset per-pass chunk counter
                 if _extract_pass[0] > 1:
                     stage = f"re-extract #{_extract_pass[0]}"
             _current_stage[0] = stage
@@ -705,10 +763,35 @@ def _run_company_parallel(args: tuple) -> dict:
             if finished not in _completed:
                 _completed.append(finished)
             progress.update(company_task, description=_render())
+            # Print a one-line step summary above the spinner so the operator
+            # can see the full A-to-Z flow as it unfolds.
+            if node_state is not None:
+                line = _format_step_line(node_name, node_state)
+                if line:
+                    from rich.markup import escape as _escape
+                    # Prefix every line (multi-line for extract/analyze) with the ticker name.
+                    for part in line.split("\n"):
+                        progress.console.print(f"[dim]{name}[/]" + _escape(part))
 
     def _detail_cb(detail: str) -> None:
         _current_detail[0] = detail
         progress.update(company_task, description=_render())
+        # Print one line per chunk completion. The detail string looks like:
+        #   "chunks 1✓ 2✓ 3⟳ (2/4)"
+        # Parse the done/total counts and only print when done advances.
+        if "chunks " in detail and ("✓" in detail or "✗" in detail):
+            import re as _re
+            m = _re.search(r'\((\d+)/(\d+)\)', detail)
+            if m:
+                done, total = int(m.group(1)), int(m.group(2))
+                if done > _last_chunk_done[0]:
+                    _last_chunk_done[0] = done
+                    from rich.markup import escape as _escape
+                    pass_label = f"re-extract #{_extract_pass[0]}" if _extract_pass[0] > 1 else "extract"
+                    progress.console.print(
+                        f"[dim]{name}[/]  [{pass_label}]  chunk {done}/{total}  "
+                        + _escape(detail.split("(")[0].strip())
+                    )
 
     set_node_callback(_node_cb)
     set_detail_callback(_detail_cb)
@@ -973,7 +1056,6 @@ def main() -> None:
     # thing printed in the terminal.
     for _log_name in ("pymongo", "mongodb", "bson"):
         logging.getLogger(_log_name).setLevel(logging.WARNING)
-    _print_insertion_summary(results)
     sys.exit(1 if failed else 0)
 
 

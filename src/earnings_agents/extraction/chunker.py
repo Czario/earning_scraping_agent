@@ -280,31 +280,31 @@ def _build_section_chunks(
     per pass.  The ``other`` bucket (unclassified supplementary tables) is
     always included when any target is present.
 
+    Targeted concepts are required: generic extraction has been removed, so
+    without ``target_concepts`` there is nothing to scope to and ``None`` is
+    returned (the caller short-circuits before reaching this point in
+    production).
+
     Returns ``None`` for PDF documents or the HTML fallback path (no GAAP
     tables classified) so the caller can fall back to ``_chunk_text``.
     """
     if not raw_sections:
         return None
 
-    if target_concepts:
-        # Targeted mode (normalize_data): only send sections that match at
-        # least one concept's statement_type.  Always include "other" as a
-        # catch-all for supplementary tables.
-        allowed_keys: set[str] = {
-            (c.get("statement_type") or "").strip().lower()
-            for c in target_concepts
-            if c.get("statement_type")
-        }
-        allowed_keys.discard("")
-        if allowed_keys:
-            allowed_keys.add("other")
-    else:
-        # Generic earnings mode: extraction is scoped to income statement only
-        # (balance sheet and cash-flow items are intentionally excluded -- see
-        # critical_metrics.py).  "other" is kept as a fallback for documents
-        # where the HTML extractor failed to classify the income statement
-        # (e.g. everything lands in "FINANCIAL DATA").
-        allowed_keys = {"income_statement", "other"}
+    if not target_concepts:
+        return None
+
+    # Targeted mode (normalize_data): only send sections that match at
+    # least one concept's statement_type.  Always include "other" as a
+    # catch-all for supplementary tables.
+    allowed_keys: set[str] = {
+        (c.get("statement_type") or "").strip().lower()
+        for c in target_concepts
+        if c.get("statement_type")
+    }
+    allowed_keys.discard("")
+    if allowed_keys:
+        allowed_keys.add("other")
 
     # Assemble all selected table entries into one ordered text block, then
     # split by _CHUNK_SIZE.  With a large CHUNK_SIZE (Groq) everything lands

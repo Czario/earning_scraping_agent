@@ -37,6 +37,20 @@ def _load_fixture(path: Path) -> dict[str, Any]:
 
 
 def _base_state(fixture: dict[str, Any]) -> dict[str, Any]:
+    # Generic extraction has been removed: the node requires target_concepts.
+    # Build one income-statement concept per expected key so every concept maps
+    # deterministically (Tier-1) and no Tier-2 LLM mapping call is triggered —
+    # the side_effect factory yields exactly one mock per chunk, so an extra
+    # build_llm() call would raise StopIteration.
+    target_concepts = [
+        {
+            "_id": f"c_{i}",
+            "concept": f"us-gaap:Concept{i}",
+            "label": key,
+            "statement_type": "income_statement",
+        }
+        for i, key in enumerate(fixture["expected"])
+    ]
     return {
         "ticker": fixture["ticker"],
         "company_name": fixture["company_name"],
@@ -45,7 +59,7 @@ def _base_state(fixture: dict[str, Any]) -> dict[str, Any]:
         "file_type": "html",
         "raw_text": fixture["raw_text"],
         "raw_sections": None,
-        "target_concepts": None,
+        "target_concepts": target_concepts,
         "metrics": None,
         "error": None,
         "status": "text_extracted",

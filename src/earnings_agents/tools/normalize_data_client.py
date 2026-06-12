@@ -129,23 +129,18 @@ def get_statement_concepts(
       - ``"quarterly"`` (default) → ``normalized_concepts_quarterly``
       - ``"annual"``              → ``normalized_concepts_annual``
 
-    Filters out abstract, hidden, and inactive rows.  Dimensional value rows
-    (``dimension: true``) and axis/dimension definition rows
-    (``dimension_concept: true``) are both **kept**, since earnings releases
-    routinely report breakdowns like "Net sales — Product" / "Membership fee
-    income — Membership" and the upstream pipeline expects both forms to
-    round-trip.  Results are sorted by ``path`` so the prompt lists concepts
-    in statement order.
+    Filters out only abstract (``abstract: true``) and hidden (``hide: true``)
+    rows.  All other rows — including calculated/system concepts, dimensional
+    breakdown rows, and XBRL structural labels — are included.
+
+    Results are sorted by ``path`` so the prompt lists concepts in statement
+    order.
 
     Each returned dict has keys: ``_id`` (str), ``concept`` (GAAP name),
     ``label`` (cleaned, disambiguated only when needed), ``path``,
     ``statement_type``, ``taxonomy_key`` (stable XBRL identity used as the
     JSON key in the extraction prompt and as the mapping key back to
     ``concept_id``).
-
-    ``system:``-prefixed concepts (``calculated: True``) are excluded — they
-    are derived metrics owned by the downstream normaliser, not values that
-    appear in an earnings press release.
 
     Rows whose ``label`` is empty after cleanup are dropped with a debug log.
     When two rows in the same statement collapse to the same base label, the
@@ -167,7 +162,6 @@ def get_statement_concepts(
             "statement_type": {"$in": statement_types},
             "abstract": {"$ne": True},
             "hide": {"$ne": True},
-            "active": {"$ne": False},
         },
         {
             "_id": 1,
@@ -175,7 +169,6 @@ def get_statement_concepts(
             "label": 1,
             "path": 1,
             "statement_type": 1,
-            "calculated": 1,
         },
     ).sort("path", 1)
 
@@ -184,16 +177,6 @@ def get_statement_concepts(
     base_counts: dict[tuple[str, str], int] = {}
     for d in cursor:
         concept = d.get("concept", "") or ""
-        # Skip system:/calculated rows — derived metrics owned by the downstream
-        # normaliser; not present in earnings press releases.
-        calculated = d.get("calculated")
-        if concept.lower().startswith("system:") or calculated in (True, "True", "true"):
-            logger.debug(
-                "get_statement_concepts: skipping calculated/system concept %r "
-                "(cik=%s)",
-                concept, cik,
-            )
-            continue
         raw_label = d.get("label", "")
         head, member = _clean_label(raw_label)
         if not head:
@@ -201,17 +184,6 @@ def get_statement_concepts(
                 "get_statement_concepts: dropping concept with empty label "
                 "(cik=%s concept=%s raw_label=%r)",
                 cik, concept, raw_label,
-            )
-            continue
-        # Skip XBRL axis/dimension definition rows — these are structural
-        # taxonomy labels (e.g. "AOCI Attributable to Parent [Member]",
-        # "Gift Card Programs [Member]") that never carry reportable values
-        # in an earnings press release and only add noise to the LLM prompt.
-        if head.endswith((" [Member]", " [Axis]", " [Domain]", " [Table]", " [Line Items]")):
-            logger.debug(
-                "get_statement_concepts: skipping XBRL structural label %r "
-                "(cik=%s concept=%s)",
-                head, cik, concept,
             )
             continue
         member_tag = _extract_member_tag(raw_label)

@@ -49,6 +49,7 @@ Shared harness principles live in `.github/instructions/agent-harness.instructio
   - `0003` — `analysis/validators.py` (correctors) kept separate from `analysis/findings.py` (checkers)
   - `0004` — MongoDB document ID format: `{TICKER}_{YEAR}_latest`
   - `0005` — `MAX_EXTRACTION_ATTEMPTS` hard cap; no infinite retry paths
+  - `0006` — Failure-mode skills catalog (`analysis/skills.py`); `CHECKER_REGISTRY` migrated; correctors stay in `validators.py` (ADR-0003 preserved)
 
 ## Available skills
 Skills live in `.github/skills/` and should be invoked by name when the situation calls for them:
@@ -75,3 +76,4 @@ Skills live in `.github/skills/` and should be invoked by name when the situatio
 ## Repository notes
 - `src/earnings_agents/tools/edgar_client.py` has a single canonical definition of `normalize_cik` and `get_latest_earnings_url`.
 - `MAX_EXTRACTION_ATTEMPTS` is defined in `src/earnings_agents/config.py` (env-overridable via `MAX_EXTRACTION_ATTEMPTS`). `src/earnings_agents/nodes/reflect_metrics.py` has been deleted.
+- `analysis/skills.py` is the failure-mode skill catalog. `CHECKER_REGISTRY` (formerly in `findings.py`) is replaced by `skills.iter_detectors()`. Run `uv run earnings-skills` to browse the catalog. Each skill bundles an id, title, detector function, finding types, and curated remediation text that feeds the hint drafter.

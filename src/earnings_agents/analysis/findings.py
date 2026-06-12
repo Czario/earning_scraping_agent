@@ -11,9 +11,6 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from earnings_agents.analysis.metric_patterns import (
-    BS_ASSETS_RE as _BS_ASSETS_RE,
-    BS_EQUITY_RE as _BS_EQUITY_RE,
-    BS_LIAB_RE as _BS_LIAB_RE,
     COGS_RE as _COGS_RE,
     COMPOSITE_COMMA_RE as _COMPOSITE_COMMA_RE,
     COMPOSITE_SLASH_RE as _COMPOSITE_SLASH_RE,
@@ -43,7 +40,6 @@ FindingType = Literal[
     "missing_expected",       # tier-2 metric absent
     "case_duplicate",         # two keys differ only by case/whitespace, same value
     "identity_violation",     # accounting identity does not reconcile
-    "sign_anomaly",           # value carries the wrong sign for its concept
     "suspect_round",          # implausibly round number (likely narrative prose)
     "suspect_value",          # value matches a different metric — likely mis-assigned row
     "gaap_nongaap_leakage",   # key leaked from a GAAP/Non-GAAP reconciliation table
@@ -169,107 +165,6 @@ def _find_metric(
         if pat.search(k) and isinstance(v, (int, float)) and not isinstance(v, bool):
             return k, float(v)
     return None, None
-
-
-# -----------------------------------------------------------------------------
-# Balance-sheet identity:  Total Assets ≈ Total Liabilities + Total Equity
-# -----------------------------------------------------------------------------
-
-# Balance-sheet patterns imported from metric_patterns; alias kept for reader context.
-# Tolerance: 1 % accommodates rounding when components are reported in
-# millions but totals in thousands (rare but documented).
-_BS_IDENTITY_TOLERANCE = 0.01
-
-
-def check_balance_sheet_identity(metrics: dict[str, Any]) -> list[Finding]:
-    """Flag when Total Assets ≠ Total Liabilities + Total Equity (within 1 %).
-
-    Catches the NVDA-style defect where a sibling component was mis-extracted
-    and Total Liabilities ends up far off the sum of its parts.
-    """
-    a_key, a = _find_metric(metrics, _BS_ASSETS_RE)
-    l_key, lia = _find_metric(metrics, _BS_LIAB_RE)
-    e_key, eq = _find_metric(metrics, _BS_EQUITY_RE)
-    if None in (a, lia, eq):
-        return []
-
-    lhs = float(a)
-    rhs = float(lia) + float(eq)
-    if lhs == 0:
-        return []
-    rel_err = abs(lhs - rhs) / abs(lhs)
-    if rel_err <= _BS_IDENTITY_TOLERANCE:
-        return []
-
-    return [
-        Finding(
-            type="identity_violation",
-            severity="high",
-            message=(
-                f"Balance-sheet identity broken: Total Assets ({lhs:,.0f}) ≠ "
-                f"Total Liabilities + Equity ({rhs:,.0f}); diff "
-                f"{lhs - rhs:,.0f} ({rel_err * 100:.2f}%)"
-            ),
-            keys=tuple(k for k in (a_key, l_key, e_key) if k),
-            suggested_action="Re-extract balance-sheet rows; verify component sums.",
-            evidence={
-                "total_assets": lhs,
-                "total_liabilities": float(lia),
-                "total_equity": float(eq),
-                "relative_error": rel_err,
-            },
-        )
-    ]
-
-
-# -----------------------------------------------------------------------------
-# Sign anomalies — balance-sheet line items that should be positive.
-# -----------------------------------------------------------------------------
-
-# Each entry: (display_name, regex). Listed items are stock balances; they
-# can never be legitimately negative on the balance sheet. (Contra-asset
-# items like "accumulated depreciation" or cash-flow uses of cash are
-# intentionally excluded.)
-_POSITIVE_BS_ITEMS: list[tuple[str, re.Pattern]] = [
-    ("Inventories",                re.compile(r"^\s*inventor(y|ies)\s*$", re.IGNORECASE)),
-    ("Cash and equivalents",       re.compile(r"^\s*cash and (cash )?equivalents\s*$", re.IGNORECASE)),
-    ("Accounts receivable",        re.compile(r"^\s*accounts receivable", re.IGNORECASE)),
-    ("Total assets",               re.compile(r"^\s*total assets\b", re.IGNORECASE)),
-    ("Total current assets",       re.compile(r"^\s*total current assets\b", re.IGNORECASE)),
-    ("Total liabilities",          re.compile(r"^\s*total liabilities\s*$", re.IGNORECASE)),
-    ("Total current liabilities",  re.compile(r"^\s*total current liabilities\b", re.IGNORECASE)),
-    ("Long-term debt",             re.compile(r"^\s*long-?term debt\s*$", re.IGNORECASE)),
-    ("Goodwill",                   re.compile(r"^\s*goodwill\s*$", re.IGNORECASE)),
-]
-
-
-def check_sign_anomalies(metrics: dict[str, Any]) -> list[Finding]:
-    """Flag balance-sheet stock items that came back with a negative value.
-
-    A negative ``Inventories`` almost always means the LLM picked up a
-    cash-flow row (where Δinventory can be negative) instead of the
-    balance-sheet row.
-    """
-    out: list[Finding] = []
-    for label, pat in _POSITIVE_BS_ITEMS:
-        key, val = _find_metric(metrics, pat)
-        if val is None or val >= 0:
-            continue
-        out.append(
-            Finding(
-                type="sign_anomaly",
-                severity="medium",
-                message=(
-                    f"{label} reported as negative ({val:,.0f}); the balance-sheet "
-                    f"value is expected to be ≥ 0. The negative value may be a "
-                    f"cash-flow delta mis-keyed as a balance."
-                ),
-                keys=(key,) if key else (),
-                suggested_action="Re-extract; confirm whether this is a balance or a delta.",
-                evidence={"metric": label, "value": val},
-            )
-        )
-    return out
 
 
 # -----------------------------------------------------------------------------
@@ -733,32 +628,23 @@ def check_source_grounding(
 
 
 # ---------------------------------------------------------------------------
-# Checker registry
+# Observer checkers above are catalogued as **skills** in ``analysis/skills.py``.
 #
-# The ordered list of every pure-observer checker.  ``analyze_metrics_node``
-# iterates this list rather than hard-coding a call sequence, so adding a new
-# checker only requires writing the function and appending it here.
+# The ordered detector sequence that ``analyze_metrics_node`` runs now lives in
+# ``skills.SKILL_REGISTRY`` (via ``skills.iter_detectors()``), where each checker
+# is paired with metadata and curated remediation guidance. This module owns
+# only the checker *functions* and the ``Finding`` model — it has no knowledge
+# of the skill catalog, preserving the one-way dependency
+# (``skills.py`` → ``findings.py``).
 #
-# Rules for registry members:
+# Rules for any checker registered as a skill detector:
 #   - Signature: (metrics: dict[str, Any]) -> list[Finding]
 #   - Must not mutate *metrics*.
-#   - ``check_presence`` is NOT in this list because it requires the pre-computed
-#     *presence* summary from ``critical_metrics.check_presence`` as a second
-#     argument.  It is called explicitly before the registry loop.
+#   - ``check_presence`` and ``check_source_grounding`` are NOT detectors: they
+#     need extra arguments and are invoked explicitly by the node. They are
+#     still catalogued in ``skills.py`` (with ``detector=None``) for discovery.
 #
-# Correctors (``derive_corrected_total_opex``) are also excluded — they return
-# ``(key, value)`` not ``list[Finding]`` and are handled in a separate post-pass
-# inside the node (ADR-0003).
+# Correctors (``derive_corrected_total_opex``, ``validators.validate_metrics``)
+# are excluded — they mutate values and are handled separately (ADR-0003).
 # ---------------------------------------------------------------------------
-CHECKER_REGISTRY: list = [
-    check_case_duplicates,
-    check_composite_keys,
-    check_gaap_nongaap_leakage,
-    check_balance_sheet_identity,
-    check_gross_profit_identity,
-    check_operating_vs_gross,
-    check_eps_dilution_ordering,
-    check_sign_anomalies,
-    check_suspect_round,
-    check_opex_label_collision,
-]
+

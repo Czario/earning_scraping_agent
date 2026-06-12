@@ -37,21 +37,8 @@ HTTP_TIMEOUT: int = 30
 # Max characters of extracted link list passed to LLM for IR discovery
 IR_PAGE_MAX_CHARS: int = 8_000
 
-# Max characters of raw document text passed to LLM for metric extraction.
-# Groq (llama-4-scout) has a 128K token context (~512K chars) so the effective
-# cap is much higher than for local Ollama (typically 4K–8K tokens).
-_GROQ_PROVIDER = LLM_PROVIDER == "groq"
-EXTRACTION_MAX_CHARS: int = int(
-    os.getenv("EXTRACTION_MAX_CHARS", "400000" if _GROQ_PROVIDER else "40000")
-)
-
-# Chunk size and overlap for splitting raw text before LLM extraction.
-# For Groq, default to 8 000 chars (~2 000 input tokens) so each request stays
-# well within the 12 K TPM free-tier budget (leaving headroom for output tokens
-# and retries).  Operators on paid plans can raise this via CHUNK_SIZE.
-CHUNK_SIZE: int = int(
-    os.getenv("CHUNK_SIZE", "8000" if _GROQ_PROVIDER else "6000")
-)
+EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "400000"))
+CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "400000"))
 CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "300"))
 
 # Maximum concurrent Ollama requests across all parallel company workers.
@@ -86,13 +73,3 @@ CLEANUP_METRICS: bool = os.getenv("CLEANUP_METRICS", "1").strip().lower() not in
 # Maximum extraction passes in the agentic loop (initial pass + retries).
 # Override with the MAX_EXTRACTION_ATTEMPTS environment variable.
 MAX_EXTRACTION_ATTEMPTS: int = int(os.getenv("MAX_EXTRACTION_ATTEMPTS", "3"))
-
-# When True, a finished run that remains degraded (unresolved high-severity
-# findings or accounting-identity warnings after all extraction attempts)
-# auto-drafts a company hint file into data/company_hints/_proposed/{TICKER}.md.
-# This is the closed self-improvement loop — the draft is ALWAYS human-gated:
-# it is written to _proposed/ for review and is never activated automatically.
-# Opt-in (default off) because it spends an extra LLM call per degraded run.
-AUTO_PROPOSE_HINTS: bool = os.getenv("AUTO_PROPOSE_HINTS", "0").strip().lower() in {
-    "1", "true", "yes", "on"
-}

@@ -17,7 +17,7 @@ import logging
 import threading as _threading
 import time
 from functools import wraps
-from typing import Callable
+from typing import Any, Callable
 
 from earnings_agents.workflow_state import EarningsAgentState
 
@@ -59,7 +59,7 @@ def report_detail(detail: str) -> None:
 
 def with_hooks(
     node_fn: Callable[[EarningsAgentState], EarningsAgentState],
-) -> Callable[[EarningsAgentState], EarningsAgentState]:
+) -> Any:
     """Return *node_fn* wrapped with pre/post structured log events and timing.
 
     On entry:  logs ``node_start`` with ticker and incoming status.
@@ -77,7 +77,7 @@ def with_hooks(
 
         cb = getattr(_thread_local, "node_callback", None)
         if cb:
-            cb(node_name, "start", ticker)
+            cb(node_name, "start", ticker, state)
 
         logger.debug(
             '{"event":"node_start","node":"%s","ticker":"%s","status_in":"%s"}',
@@ -116,7 +116,7 @@ def with_hooks(
         )
         cb = getattr(_thread_local, "node_callback", None)
         if cb:
-            cb(node_name, "end", ticker)
+            cb(node_name, "end", ticker, new_state)
         return new_state
 
     return _wrapper

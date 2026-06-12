@@ -43,7 +43,7 @@ The pipeline runs an **agentic loop** between `extract_financial_metrics` and `a
 - **Analyse** (`analyze_metrics`): runs pure-Python checkers from `analysis/` — tiered presence checks, case-duplicate detection, balance-sheet identity, sign anomalies, suspect-round heuristic. Produces `state["findings"]`. If any `high`-severity finding exists and `extraction_attempts < MAX_EXTRACTION_ATTEMPTS` (3), sets `extraction_notes` and loops back.
 - **Cleanup** (`cleanup_metrics`): applies deterministic case-dedup from `findings`, then an LLM pass to drop Rule-A/B/C duplicates.
 
-Pure-Python analysis helpers live in `analysis/`: `critical_metrics.py` (tiered metric registries + `check_presence`), `findings.py` (the `Finding` dataclass and all checker functions).
+Pure-Python analysis helpers live in `analysis/`: `critical_metrics.py` (tiered metric registries + `check_presence`), `findings.py` (the `Finding` dataclass and all checker functions), `skills.py` (the failure-mode skill catalog — bundles each checker with metadata and curated remediation; `iter_detectors()` replaces the former `CHECKER_REGISTRY`; browsable via `uv run earnings-skills`).
 
 External integrations live in `tools/`: `edgar_client.py`, `mongodb_client.py`, `playwright_scraper.py`, `static_scraper.py`.
 
@@ -90,9 +90,10 @@ Documents are upserted with `_id = "{TICKER}_{YEAR}_latest"` (e.g. `GOOGL_2026_l
 3. Add tests in `tests/test_<node_name>.py`.
 
 ### Adding a new deterministic checker
-1. Add checker function to `src/earnings_agents/analysis/findings.py` returning `list[Finding]`.
-2. Call it inside `analyze_metrics_node` in `nodes/analyze_metrics.py`.
-3. Add the new `FindingType` literal to the union in `findings.py`.
+1. Add the checker function to `src/earnings_agents/analysis/findings.py` returning `list[Finding]`. It must not mutate the dict.
+2. Add the new `FindingType` literal to the union in `findings.py`.
+3. Add a `Skill` entry to `SKILL_REGISTRY` in `src/earnings_agents/analysis/skills.py` — set `detector=<your_function>` and write `remediation` text. The node iterates `iter_detectors()` automatically; **do not edit `analyze_metrics_node`**.
+4. Add a test in `tests/test_skills.py` (catalog integrity) and/or `tests/test_analyze_metrics.py` (end-to-end finding).
 
 ### SEC-specific behaviour (`extract_html_text`)
 - Uses a SEC-compliant `User-Agent` header.

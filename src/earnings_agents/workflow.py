@@ -38,6 +38,20 @@ def _route_after_discovery(
     return _fail_or(state, "load_company_concepts")  # type: ignore[return-value]
 
 
+def _route_after_concepts(
+    state: EarningsAgentState,
+) -> Literal["detect_document_type", "__end__"]:
+    """End the run when concept loading failed or was skipped.
+
+    Targeted extraction requires stored concepts; ``load_company_concepts``
+    sets ``status="skipped"`` when none are available, in which case there is
+    nothing further to do.
+    """
+    if state.get("status") in ("failed", "skipped"):
+        return "__end__"
+    return "detect_document_type"
+
+
 def _route_by_file_type(
     state: EarningsAgentState,
 ) -> Literal["extract_pdf_text", "extract_html_text", "__end__"]:
@@ -171,7 +185,11 @@ def build_graph():
         _route_after_discovery,
         {"load_company_concepts": "load_company_concepts", "__end__": END},
     )
-    graph.add_edge("load_company_concepts", "detect_document_type")
+    graph.add_conditional_edges(
+        "load_company_concepts",
+        _route_after_concepts,
+        {"detect_document_type": "detect_document_type", "__end__": END},
+    )
     graph.add_conditional_edges(
         "detect_document_type",
         _route_by_file_type,

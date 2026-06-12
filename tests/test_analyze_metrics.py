@@ -5,13 +5,11 @@ import pytest
 
 from earnings_agents.analysis.critical_metrics import check_presence as presence_summary
 from earnings_agents.analysis.findings import (
-    check_balance_sheet_identity,
     check_case_duplicates,
     check_composite_keys,
     check_gaap_nongaap_leakage,
     check_gross_profit_identity,
     check_presence,
-    check_sign_anomalies,
     check_source_grounding,
     check_suspect_round,
     derive_corrected_total_opex,
@@ -157,41 +155,6 @@ def test_check_presence_severity_mapping():
 
 
 # ---------------------------------------------------------------------------
-# Balance-sheet identity checker
-# ---------------------------------------------------------------------------
-
-def test_balance_sheet_identity_passes_when_reconciled():
-    m = {
-        "Total assets": 100.0,
-        "Total liabilities": 60.0,
-        "Total stockholders' equity": 40.0,
-    }
-    assert check_balance_sheet_identity(m) == []
-
-
-def test_balance_sheet_identity_within_one_percent_tolerance():
-    m = {
-        "Total assets": 100.0,
-        "Total liabilities": 60.5,            # 0.5% drift
-        "Total stockholders' equity": 40.0,
-    }
-    assert check_balance_sheet_identity(m) == []
-
-
-def test_balance_sheet_identity_flags_nvda_style_mismatch():
-    # NVDA defect #4: Total liabilities reported as 64B but components sum to ~56.5B.
-    m = {
-        "Total assets": 96_000_000_000.0,
-        "Total liabilities": 64_000_000_000.0,
-        "Total stockholders' equity": 25_000_000_000.0,   # 64 + 25 = 89 ≠ 96
-    }
-    findings = check_balance_sheet_identity(m)
-    assert len(findings) == 1
-    assert findings[0].type == "identity_violation"
-    assert findings[0].severity == "high"
-
-
-# ---------------------------------------------------------------------------
 # Gross-profit income-statement identity checker
 # ---------------------------------------------------------------------------
 
@@ -235,28 +198,6 @@ def test_gross_profit_identity_silent_when_components_missing():
 
 
 # ---------------------------------------------------------------------------
-# Sign-anomaly checker
-# ---------------------------------------------------------------------------
-
-def test_sign_anomaly_flags_negative_inventories():
-    # NVDA defect #1: Inventories: -4,420,000,000 (cash-flow row, not balance sheet).
-    findings = check_sign_anomalies({"Inventories": -4_420_000_000})
-    assert len(findings) == 1
-    assert findings[0].type == "sign_anomaly"
-    assert findings[0].severity == "medium"
-    assert findings[0].keys == ("Inventories",)
-
-
-def test_sign_anomaly_ignores_positive_balances():
-    assert check_sign_anomalies({"Inventories": 5_000_000_000, "Goodwill": 10_000_000_000}) == []
-
-
-def test_sign_anomaly_ignores_unrelated_keys():
-    # Operating cash flow can legitimately be negative for some companies; not on our list.
-    assert check_sign_anomalies({"Net cash from operating activities": -1_000_000}) == []
-
-
-# ---------------------------------------------------------------------------
 # Suspect-round-number heuristic
 # ---------------------------------------------------------------------------
 
@@ -294,12 +235,10 @@ def test_suspect_round_skips_megacap_totals():
 # analyze_metrics_node — integration with new checkers
 # ---------------------------------------------------------------------------
 
-def test_analyze_balance_sheet_violation_triggers_reextract():
+def test_analyze_gross_profit_violation_triggers_reextract():
     m = _full_metrics()
-    # Supply a full balance sheet where the identity is intentionally broken.
-    m["Total assets"] = 500_000_000_000
-    m["Total liabilities"] = 200_000_000_000
-    m["Total stockholders' equity"] = 10_000_000_000   # 200 + 10 ≠ 500
+    # Break the income-statement identity: Revenue − Cost of revenue ≠ Gross profit.
+    m["Cost of revenue"] = 80_000_000_000   # 100B − 80B = 20B ≠ 60B gross profit
     out = analyze_metrics_node(_state(m, attempts=1))
     assert out["needs_reextract"] is True
     assert any(f["type"] == "identity_violation" for f in out["findings"])

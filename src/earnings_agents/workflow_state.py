@@ -36,6 +36,11 @@ class EarningsAgentState(TypedDict):
     # Drives the re-extract loop and is consumed by cleanup_metrics for
     # deterministic case-duplicate removal.
     findings: Optional[list]
+    # Per-pass skill-effectiveness records appended by analyze_metrics_node on
+    # each re-extract loop: {"to_attempt": int, "deltas": [...]}. Pure
+    # observability (ADR-0006) — shows which skills' findings were resolved
+    # between passes; never influences routing.
+    skill_effectiveness: NotRequired[Optional[list]]
     # ── normalize_data targeted extraction ──────────────────────────────────
     # Populated by load_company_concepts_node when EARNINGS_SAVE_TARGET=normalize_data.
     # Empty list (not None) means the node ran but the company was not found,

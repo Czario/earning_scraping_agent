@@ -20,12 +20,12 @@ from typing import Any
 
 from earnings_agents.analysis.critical_metrics import check_presence as presence_summary
 from earnings_agents.analysis.findings import (
-    CHECKER_REGISTRY,
     Finding,
     derive_corrected_total_opex,
     check_presence,
     check_source_grounding,
 )
+from earnings_agents.analysis.skills import compute_skill_effectiveness, iter_detectors
 from earnings_agents.config import MAX_EXTRACTION_ATTEMPTS
 from earnings_agents.workflow_state import EarningsAgentState
 
@@ -111,6 +111,11 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     metrics: dict[str, Any] = state.get("metrics") or {}
     ticker = state.get("ticker", "?")
 
+    # Findings from the previous analysis pass (carried on state across the
+    # extract↔analyze loop). Used purely for skill-effectiveness observation;
+    # never feeds back into routing (ADR-0001).
+    prev_findings: list[dict[str, Any]] = state.get("findings") or []
+
     if not metrics:
         logger.warning("analyze_metrics: no metrics on state for %s", ticker)
         return {**state, "needs_reextract": False}
@@ -121,7 +126,7 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
     # Registry loop — pure observers only (ADR-0003). check_presence is called
     # separately above because it requires a pre-computed presence summary.
-    for checker in CHECKER_REGISTRY:
+    for checker in iter_detectors():
         findings.extend(checker(metrics))
 
     # Source-grounding ("show me") verification. Called explicitly (not via the
@@ -207,8 +212,29 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
         ]
         out["findings"] = [f.to_dict() for f in findings]
 
-    high = [f for f in findings if f.severity == "high"]
+    # Skill-effectiveness tracking (observability, ADR-0006). On every pass
+    # after the first we have the previous pass's findings, so we can record
+    # which skills' findings were resolved/persisted/new. This is pure
+    # observation: it is logged and accumulated on state for later inspection,
+    # and never influences routing.
     attempts = state.get("extraction_attempts", 0)
+    if prev_findings:
+        deltas = compute_skill_effectiveness(prev_findings, out["findings"])
+        if deltas:
+            effectiveness_log = list(state.get("skill_effectiveness") or [])
+            effectiveness_log.append({"to_attempt": attempts, "deltas": deltas})
+            out["skill_effectiveness"] = effectiveness_log
+            resolved_by_type = {
+                d["finding_type"]: d["resolved"] for d in deltas if d["resolved"]
+            }
+            logger.info(
+                "analyze_metrics %s: skill effectiveness — resolved=%s deltas=%s",
+                ticker,
+                resolved_by_type or "{}",
+                deltas,
+            )
+
+    high = [f for f in findings if f.severity == "high"]
 
     if not high or attempts >= MAX_EXTRACTION_ATTEMPTS:
         if high:

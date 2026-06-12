@@ -33,7 +33,7 @@ earnings-scheduler = "earnings_agents.cli.scheduler:main"
 earnings-run-once = "earnings_agents.cli.earnings:main"
 earnings = "earnings_agents.cli.earnings:main"
 earnings-failures = "earnings_agents.cli.failures:main"
-earnings-propose-hint = "earnings_agents.cli.propose_hint:main"
+earnings-skills = "earnings_agents.cli.skills:main"
 
 [build-system]
 requires = ["hatchling"]

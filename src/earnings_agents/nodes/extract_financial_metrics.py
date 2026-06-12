@@ -16,7 +16,6 @@ from earnings_agents.hooks import get_detail_callback, report_detail
 from earnings_agents.llm_factory import build_llm
 from earnings_agents.workflow_state import EarningsAgentState
 from earnings_agents.analysis.validators import validate_metrics
-from earnings_agents.tools.company_hints_loader import load_company_hints as _load_company_hints
 from earnings_agents.tools.llm_extractor import (
     _CHUNK_MAX_RETRIES,
     _OLLAMA_REQUEST_TIMEOUT,
@@ -67,144 +66,9 @@ from earnings_agents.extraction.concept_mapper import (
 
 logger = logging.getLogger(__name__)
 
-# Human-curated hint files are now loaded via tools/company_hints_loader.
-# _HINTS_DIR and _load_company_hints kept as aliases for backward compatibility.
-
 
 # Chunking parameters now come from earnings_agents.extraction.chunker (imported above).
 # LLM invocation constants now come from earnings_agents.tools.llm_extractor (imported above).
-
-_PROMPT_TEMPLATE = """\
-You are a financial data extraction assistant.
-
-Extract ONLY income statement metrics from the text excerpt below for {company_name} ({ticker}).
-This is chunk {chunk_num} of {total_chunks} of the full document.
-{focus_hint}{scale_hint}{period_hint}
-SCOPE — extract ONLY these income statement concepts.
-Always use the EXACT single row label printed in the document as the JSON key.
-The canonical names below are for concept recognition only — never use them as keys
-and never combine multiple names into one key.
-
-  Income statement concepts to extract:
-  • Revenue
-  • Cost of revenue
-  • Gross profit
-  • Research and development expense
-  • Sales and marketing expense
-  • General and administrative expense
-  • Total operating expenses
-  • Operating income
-  • Interest income
-  • Interest expense
-  • Other income (expense), net
-  • Income before income taxes
-  • Income tax expense
-  • Net income
-  • Basic earnings per share
-  • Diluted earnings per share
-  • Weighted-average basic shares outstanding
-  • Weighted-average diluted shares outstanding
-
-  Common alternative labels (for recognition only — use whichever the document uses):
-    Revenue → "Net revenue", "Net sales"
-    Cost of revenue → "Cost of goods sold", "Cost of sales"
-    Operating income → "Operating profit", "Operating loss", "Income from operations"
-    Income tax expense → "Provision for income taxes"
-    Net income → "Net earnings", "Net loss"
-    Basic EPS → "Basic net income per share", "Net income per share — Basic"
-    Diluted EPS → "Diluted net income per share", "Net income per share — Diluted"
-
-IGNORE — do NOT extract any of the following:
-  • Percentage-form metrics: gross margin %, operating margin %, net margin %.
-    These are derivable — capture Gross profit (dollar amount) instead.
-  • Balance sheet items (Assets, Liabilities, Equity, Inventory, Receivables, etc.)
-  • Cash flow items (Operating / Investing / Financing cash flows, Capex, Depreciation, etc.)
-  • Guidance, forecasts, or forward-looking projections.
-  • Any table whose header or column labels contain "Non-GAAP", "non-GAAP", "Adjusted",
-    "Reconciliation", "Supplemental", or lists both a GAAP and a Non-GAAP column side-by-side.
-    Skip the ENTIRE table — do not extract any rows from it, even the GAAP column.
-    If you are unsure whether a table is a reconciliation, skip it.
-  • Any key prefixed with "GAAP " or "Non-GAAP " or containing "impact of", "adjustment".
-  • Duplicate summary rows that restate a metric already captured (e.g. "Total operating
-    expenses" when "Operating expenses" is already present with the same value).
-
-TABLE PRIORITY — when the same metric appears in multiple tables, prefer this order:
-  1. Primary condensed GAAP income statement (usually the first financial table).
-  2. Segment or product-line breakdowns — skip unless the primary table is absent.
-  3. GAAP-to-Non-GAAP reconciliation — always skip (covered by IGNORE above).
-  Use the plain metric label from table (1); never prefix keys with "GAAP " or "Non-GAAP ".
-
-Return ONLY a flat JSON object — no markdown fences, no extra text, no nested objects.
-Every value must be a plain number or null. NEVER produce arithmetic expressions or
-formulas (e.g. do NOT write "15929 - 540 + 102" — use null if you cannot determine
-the exact number). NEVER produce {{"Key": {{"SubKey": value}}}} — that is
-a nested object and is illegal. If a metric has sub-categories, create separate flat keys.
-
-FIRST field must be "__scale__":
-  Set it to the unit of the table in this excerpt:
-  - "millions"  → table header says "(In millions)" or "(in millions of dollars)"
-  - "thousands" → table header says "(In thousands)"
-  - "billions"  → table header says "(In billions)"
-  - "as-is"     → values come from narrative prose only (no table, or values already
-                   stated in full dollars, e.g. "$82.9 billion", "$4.27 per share")
-
-SECOND field must be "__period__":
-  Earnings releases often show side-by-side columns for multiple time periods
-  (e.g. "Q1 2026 | Q1 2025" or "Nine Months Ended Mar 31, 2026 | Nine Months Ended Mar 31, 2025").
-  - Set it to the label of the MOST RECENT period column, exactly as printed in the document
-    (e.g. "Three Months Ended March 31, 2026").
-  - If only one period is present, set it to that period's label.
-  - If no period label is visible in this excerpt, set it to null.
-
-PERIOD RULE — CRITICAL when multiple period columns are present:
-  Extract numeric values ONLY from the MOST RECENT period column (usually the leftmost data column).
-  NEVER capture values from prior-period or year-ago comparison columns.
-  If a metric appears in multiple columns, take ONLY the value under the most recent column header.
-
-ALL OTHER fields:
-  - Keys   : the EXACT metric label as it appears in the document (company's own wording)
-  - Values : the RAW numeric value EXACTLY as printed in the table or text, or null
-
-IMPORTANT — report RAW numbers, do NOT scale yourself:
-  If the table says "(In millions)" and shows "82,886" → report 82886  (NOT 82886000000).
-  The scaling multiplier will be applied automatically from the __scale__ field.
-
-Exceptions (always report as-is regardless of __scale__):
-  • EPS / earnings per share: raw decimal (e.g. "4.27" stays 4.27).
-  • Percentage values (margin %, growth %): number 0–100 with no scaling.
-
-Other rules:
-  1. Use the company’s exact terminology.
-  2. Return null for any field not present in this excerpt.
-  3. Return {{"__scale__": "as-is", "__period__": null}} if no financial metrics are found.
-  4. Do NOT include non-numeric fields (dates, names, addresses, descriptions).  5. METRIC KEY RULES — keys must be SHORT official labels (≤ 8 words):
-     • Use the table row header or bold label exactly as printed.
-     • REJECT any key that is a full sentence or contains change-description
-       verbs: "increased", "decreased", "grew", "expanded", "saw", "reflected",
-       "improved", "declined", "up", "down". Those are commentary, not labels.
-     • REJECT keys containing comparison phrases like "grew by", "up X%",
-       "vs prior year", "rose to", "fell to".
-     • If a narrative sentence mentions a metric value, extract ONLY the numeric
-       value under the nearest official table label instead.
-  6. NON-DOLLAR COUNTS are never scaled — report raw value for any key
-     containing: "employee", "headcount", "number of shares", "share count",
-     "basis points", "percentage points", "production", "deliveries",
-     "stations", "connectors", "subscriptions", "days of supply",
-     "lease count", "units".
-  7. PERCENTAGE METRICS are never scaled — report as a number 0–100 for any
-     key containing: "gross margin", "operating margin", "net margin",
-     "gross margin %", "profit margin", "margin %", "growth rate".LAST field must be "__sources__" (verification / "show me"):
-  A JSON object mapping EACH metric key you returned above to the EXACT
-  verbatim text snippet from the excerpt where you read its value — the row
-  label together with the value as printed (e.g.
-  {{"Net revenue": "Net revenue 82,886"}}).
-  Copy the text character-for-character from the excerpt; do NOT paraphrase,
-  reformat, or invent. If you cannot point to the exact source text for a
-  value, return null for that value instead of guessing.Text excerpt:
-\"\"\"
-{text}
-\"\"\"
-"""
 
 # Keys whose values are percentages, per-share amounts, or non-dollar counts --
 # moved to earnings_agents.extraction.merger (imported above).
@@ -372,6 +236,20 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     if not raw_text:
         return {**state, "status": "failed", "error": "No raw text available for extraction"}
 
+    # Targeted extraction requires concepts loaded from normalize_data. Generic
+    # extraction has been removed, so a run that reaches this node without
+    # target_concepts cannot proceed. In production this never happens because
+    # load_company_concepts skips such runs; this is a defensive guard.
+    if not (state.get("target_concepts") or []):
+        return {
+            **state,
+            "status": "failed",
+            "error": (
+                f"No target concepts for {ticker}; cannot extract "
+                f"(company missing from normalize_data)."
+            ),
+        }
+
     # Increment attempt counter (Stage 1 — Perceive & Plan)
     attempt_num = state.get("extraction_attempts", 0) + 1
     logger.info("Extraction pass %d for %s", attempt_num, ticker)
@@ -414,15 +292,10 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     is_annual = state.get("detected_period_type") == "annual"
     period_hint = _build_period_hint(sec_report_date_str, doc_period, is_annual)
 
-    # Load static human-curated company hints (if any) — injected on every pass.
-    company_hints = _load_company_hints(ticker)
-
     # If the reflection node left guidance from a previous pass, inject it
     # into every chunk prompt so the LLM focuses on what was missed.
     extraction_notes = state.get("extraction_notes") or ""
     focus_hint_parts: list[str] = []
-    if company_hints:
-        focus_hint_parts.append(f"Company-specific extraction hints:\n{company_hints}")
     if extraction_notes:
         # On retry passes, frame the notes explicitly as a correction so the
         # LLM treats them as high-priority errors to fix, not advisory hints.
@@ -546,36 +419,21 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
 
     # Build all chunk prompts up front
     target_concepts: list[dict] = state.get("target_concepts") or []  # type: ignore[assignment]
-    if target_concepts:
-        concept_list_str = _build_concept_prompt_list(target_concepts)
-        prompts = [
-            _TARGETED_PROMPT_TEMPLATE.format(
-                company_name=state["company_name"],
-                ticker=ticker,
-                chunk_num=i,
-                total_chunks=total,
-                focus_hint=focus_hint,
-                scale_hint=scale_hint,
-                period_hint=period_hint,
-                concept_list=concept_list_str,
-                text=chunk,
-            )
-            for i, chunk in enumerate(chunks, start=1)
-        ]
-    else:
-        prompts = [
-            _PROMPT_TEMPLATE.format(
-                company_name=state["company_name"],
-                ticker=ticker,
-                chunk_num=i,
-                total_chunks=total,
-                focus_hint=focus_hint,
-                scale_hint=scale_hint,
-                period_hint=period_hint,
-                text=chunk,
-            )
-            for i, chunk in enumerate(chunks, start=1)
-        ]
+    concept_list_str = _build_concept_prompt_list(target_concepts)
+    prompts = [
+        _TARGETED_PROMPT_TEMPLATE.format(
+            company_name=state["company_name"],
+            ticker=ticker,
+            chunk_num=i,
+            total_chunks=total,
+            focus_hint=focus_hint,
+            scale_hint=scale_hint,
+            period_hint=period_hint,
+            concept_list=concept_list_str,
+            text=chunk,
+        )
+        for i, chunk in enumerate(chunks, start=1)
+    ]
 
     # Parallel execution when OLLAMA_NUM_PARALLEL > 1.
     # Requires Ollama server started with OLLAMA_NUM_PARALLEL set to the same value.

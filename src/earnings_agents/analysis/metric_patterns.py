@@ -17,15 +17,6 @@ from __future__ import annotations
 import re
 
 # ---------------------------------------------------------------------------
-# Balance-sheet identity patterns
-# ---------------------------------------------------------------------------
-BS_ASSETS_RE = re.compile(r"^\s*total assets\b", re.IGNORECASE)
-BS_LIAB_RE = re.compile(r"^\s*total liabilities\s*$", re.IGNORECASE)
-BS_EQUITY_RE = re.compile(
-    r"total\s+(stockholders'?|shareholders'?)\s*equity", re.IGNORECASE
-)
-
-# ---------------------------------------------------------------------------
 # Income-statement patterns
 # ---------------------------------------------------------------------------
 REVENUE_RE = re.compile(r"^\s*(total\s+)?revenues?\b", re.IGNORECASE)

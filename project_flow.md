@@ -100,16 +100,17 @@ Uses the SEC-compliant `User-Agent` and never relies on JS rendering.
 
 [nodes/load_company_concepts_node.py](src/earnings_agents/nodes/load_company_concepts_node.py).
 
-- **Default mode (`EARNINGS_SAVE_TARGET=earnings_db`)**: cheap no-op. Sets
-  `target_concepts=[]` so the generic extraction prompt is used.
-- **Normalize-data mode (`EARNINGS_SAVE_TARGET=normalize_data`)**:
+- Targeted extraction requires stored concepts from `normalize_data`:
   1. Looks up the company by ticker in `normalize_data.companies`.
   2. Pulls income-statement concepts from
      `normalize_data.normalized_concepts_quarterly`.
   3. Populates `company_cik`, `target_concepts`,
      `fiscal_year_end_month`, `fiscal_year_end_code`.
-- Always degrades gracefully: any DB / lookup failure falls back to the
-  generic path. Never sets `status="failed"`.
+- **Skips the run** (`status="skipped"` + clear `error`) when the company is
+  absent from `normalize_data`, the DB lookup/concept query fails, or no
+  income-statement concepts are stored — we don't have historical data for the
+  company so we can't proceed. Generic extraction has been removed; there is no
+  fallback path. The router `_route_after_concepts` ends the run on a skip.
 
 ---
 
@@ -154,18 +155,14 @@ Uses the SEC-compliant `User-Agent` and never relies on JS rendering.
 
 [nodes/extract_financial_metrics.py](src/earnings_agents/nodes/extract_financial_metrics.py).
 
-Two prompt variants, selected from state:
+Targeted extraction prompt (`target_concepts` present): supplies the concrete
+list of `"Label" (GAAP: LocalName)` strings and instructs the LLM to use those
+label strings verbatim as keys, enabling lossless mapping to `concept_id`
+for `normalize_data` upserts. (Generic extraction has been removed; a run that
+reaches this node without `target_concepts` fails defensively — in production
+`load_company_concepts` has already skipped it.)
 
-- **Generic prompt** (default): enumerates the canonical income-statement
-  concepts and tells the LLM to use the company's own exact label as the
-  JSON key. Explicitly forbids Non-GAAP / reconciliation tables, percent
-  metrics, balance-sheet, cash-flow, guidance, and full-sentence keys.
-- **Targeted prompt** (`target_concepts` present): supplies the concrete list
-  of `"Label" (GAAP: LocalName)` strings and instructs the LLM to use those
-  label strings verbatim as keys, enabling lossless mapping to `concept_id`
-  for `normalize_data` upserts.
-
-Both prompts require two leading fields:
+The prompt requires two leading fields:
 
 - `__scale__` ∈ `{"millions","thousands","billions","as-is"}`.
 - `__period__` — the most recent period column label exactly as printed.
@@ -191,17 +188,23 @@ Per-call mechanics:
 
 [nodes/analyze_metrics.py](src/earnings_agents/nodes/analyze_metrics.py).
 
-Runs every deterministic checker from
-[analysis/findings.py](src/earnings_agents/analysis/findings.py):
+Runs every deterministic checker from the **skill catalog**
+([analysis/skills.py](src/earnings_agents/analysis/skills.py) — `iter_detectors()`).
+Each checker is defined in [analysis/findings.py](src/earnings_agents/analysis/findings.py)
+and paired in the catalog with stable metadata and curated remediation guidance:
 
-- `check_presence` — tiered coverage against `TIER1/2/3_REGISTRY`.
+- `check_presence` — tiered coverage against `TIER1/2/3_REGISTRY` (special-invocation).
 - `check_case_duplicates`
 - `check_composite_keys`
 - `check_gaap_nongaap_leakage`
-- `check_balance_sheet_identity`
-- `check_sign_anomalies`
+- `check_gross_profit_identity`
+- `check_operating_vs_gross`
+- `check_eps_dilution_ordering`
 - `check_suspect_round`
 - `check_opex_label_collision`
+- `check_source_grounding` (special-invocation)
+
+Browse the catalog: `uv run earnings-skills`.
 
 Deterministic auto-correction:
 
