@@ -1,7 +1,7 @@
-"""LLM factory — returns either an Ollama or Groq client.
+"""LLM factory — returns either an Ollama, Groq, Gemini, or DeepSeek client.
 
 Provider is selected via the ``LLM_PROVIDER`` env var (``"ollama"`` default,
-or ``"groq"``). Call sites use a uniform interface::
+``"groq"``, ``"gemini"``, or ``"deepseek"``). Call sites use a uniform interface::
 
     from earnings_agents.llm_factory import build_llm
     llm = build_llm(format_json=True)
@@ -19,6 +19,13 @@ from collections import deque
 from typing import Any
 
 from earnings_agents.config import (
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_MODEL,
+    DEEPSEEK_REQUEST_TIMEOUT,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GEMINI_REQUEST_TIMEOUT,
     GROQ_API_KEY,
     GROQ_BASE_URL,
     GROQ_MODEL,
@@ -179,6 +186,39 @@ class _GroqInvokeAdapter:
         return content if isinstance(content, str) else str(content)
 
 
+class _GeminiInvokeAdapter:
+    """Gemini adapter built on the official ``google-genai`` SDK.
+
+    Wraps ``client.models.generate_content`` so that ``invoke(str) -> str``
+    matches the uniform interface used by the rest of the pipeline. JSON mode
+    is requested via ``response_mime_type="application/json"``; the expected
+    schema (when provided) is embedded in the prompt by the caller, mirroring
+    the Groq adapter's behaviour.
+    """
+
+    def __init__(self, client: Any, model: str, config: Any) -> None:
+        self._client = client
+        self._model = model
+        self._config = config
+
+    def invoke(self, prompt: str) -> str:
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=prompt,
+            config=self._config,
+        )
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            logger.debug(
+                "gemini tokens — prompt: %s  candidates: %s  total: %s",
+                getattr(usage, "prompt_token_count", "?"),
+                getattr(usage, "candidates_token_count", "?"),
+                getattr(usage, "total_token_count", "?"),
+            )
+        text = getattr(response, "text", None)
+        return text if isinstance(text, str) else str(text)
+
+
 def build_llm(
     *,
     format_json: bool = False,
@@ -200,9 +240,10 @@ def build_llm(
             When provided, takes precedence over ``format_json``.
         request_timeout: Per-request HTTP timeout in seconds. Falls back to
             sensible per-provider defaults when None.
-        provider: Explicit provider override (``"ollama"`` or ``"groq"``).
-            When given, takes precedence over the ``LLM_PROVIDER`` env var.
-            Used by the extraction node to escalate to Groq on retry attempts.
+        provider: Explicit provider override (``"ollama"``, ``"groq"`` or
+            ``"gemini"``). When given, takes precedence over the
+            ``LLM_PROVIDER`` env var. Used by the extraction node to escalate
+            to a cloud provider on retry attempts.
     """
     effective_provider = (provider or LLM_PROVIDER).strip().lower()
     if effective_provider == "groq":
@@ -228,6 +269,60 @@ def build_llm(
         llm: Any = _GroqInvokeAdapter(ChatOpenAI(**kwargs))
         if LLM_CACHE_ENABLED:
             llm = _CachedLLM(llm, f"groq:{GROQ_MODEL}", LLM_CACHE_DIR)
+        return llm
+
+    if effective_provider == "deepseek":
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "LLM_PROVIDER=deepseek requires the langchain-openai package. "
+                "Install it with: uv add langchain-openai"
+            ) from exc
+        if not DEEPSEEK_API_KEY:
+            raise ValueError("LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY is not set")
+        kwargs = {
+            "model": DEEPSEEK_MODEL,
+            "temperature": 0,
+            "api_key": DEEPSEEK_API_KEY,
+            "base_url": DEEPSEEK_BASE_URL,
+            "timeout": request_timeout if request_timeout is not None else DEEPSEEK_REQUEST_TIMEOUT,
+        }
+        if json_schema is not None or format_json:
+            kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+        llm = _GroqInvokeAdapter(ChatOpenAI(**kwargs))
+        if LLM_CACHE_ENABLED:
+            llm = _CachedLLM(llm, f"deepseek:{DEEPSEEK_MODEL}", LLM_CACHE_DIR)
+        return llm
+
+    if effective_provider == "gemini":
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "LLM_PROVIDER=gemini requires the google-genai package. "
+                "Install it with: uv add google-genai"
+            ) from exc
+        if not GEMINI_API_KEY:
+            raise ValueError("LLM_PROVIDER=gemini but GEMINI_API_KEY is not set")
+        timeout_s = (
+            request_timeout if request_timeout is not None else GEMINI_REQUEST_TIMEOUT
+        )
+        client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            # google-genai expects the HTTP timeout in milliseconds.
+            http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
+        )
+        config_kwargs: dict[str, Any] = {"temperature": 0}
+        if json_schema is not None or format_json:
+            # gemini-2.5 supports native JSON mode. The schema (when present) is
+            # embedded in the prompt by the caller, mirroring the Groq adapter.
+            config_kwargs["response_mime_type"] = "application/json"
+        gen_config = types.GenerateContentConfig(**config_kwargs)
+        llm = _GeminiInvokeAdapter(client, GEMINI_MODEL, gen_config)
+        if LLM_CACHE_ENABLED:
+            llm = _CachedLLM(llm, f"gemini:{GEMINI_MODEL}", LLM_CACHE_DIR)
         return llm
 
     # Default: Ollama

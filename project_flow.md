@@ -15,7 +15,7 @@ discovery; IR mode performs discovery inside the graph.
 discover_earnings_release
         │
         ▼
-load_company_concepts        ← no-op unless EARNINGS_SAVE_TARGET=normalize_data
+load_company_concepts        ← skips run when company absent from normalize_data
         │
         ▼
 detect_document_type
@@ -35,7 +35,7 @@ analyze_metrics  ────────────────┘   (loops wh
 cleanup_metrics            ← deterministic case-dedup + constrained LLM pass
         │
         ▼
-mongodb_save               ← upsert as {TICKER}_{YEAR}_latest
+mongodb_save               ← upsert concept values into normalize_data
 ```
 
 All routing is implemented by the `_route_*` helpers in
@@ -100,17 +100,24 @@ Uses the SEC-compliant `User-Agent` and never relies on JS rendering.
 
 [nodes/load_company_concepts_node.py](src/earnings_agents/nodes/load_company_concepts_node.py).
 
-- Targeted extraction requires stored concepts from `normalize_data`:
-  1. Looks up the company by ticker in `normalize_data.companies`.
-  2. Pulls income-statement concepts from
-     `normalize_data.normalized_concepts_quarterly`.
-  3. Populates `company_cik`, `target_concepts`,
-     `fiscal_year_end_month`, `fiscal_year_end_code`.
+- Looks up the company by ticker in `normalize_data.companies`.
+- Infers `detected_period_type` (`"annual"` or `"quarterly"`) using a
+  two-signal strategy:
+  - **Cadence-based** (primary): queries `get_next_period_type` for the
+    company's filing cycle (Q1→Q2→Q3→annual→Q1…) stored in the DB. Most
+    reliable when historical documents exist.
+  - **Date-based** (safety net): compares `sec_report_date` month against the
+    company's `fiscal_year_end_month`. Used for bootstrap (no stored history)
+    and as an override when the period-end date unambiguously lands on the
+    fiscal year-end (covers 52/53-week filers with ±7-day drift tolerance).
+- Pulls income-statement concepts from the appropriate collection
+  (`normalized_concepts_quarterly` or `normalized_concepts_annual`) and
+  populates `company_cik`, `target_concepts`, `calculated_concepts`,
+  `fiscal_year_end_month`, `fiscal_year_end_code`, `detected_period_type`.
 - **Skips the run** (`status="skipped"` + clear `error`) when the company is
   absent from `normalize_data`, the DB lookup/concept query fails, or no
-  income-statement concepts are stored — we don't have historical data for the
-  company so we can't proceed. Generic extraction has been removed; there is no
-  fallback path. The router `_route_after_concepts` ends the run on a skip.
+  income-statement concepts are stored — there is no generic extraction
+  fallback. The router `_route_after_concepts` ends the run on a skip.
 
 ---
 
@@ -265,21 +272,20 @@ keys go to `state["cleanup_removed"]` for visibility.
 
 Defined in [workflow.py](src/earnings_agents/workflow.py).
 
-- `_id = "{TICKER}_{YEAR}_latest"` where `YEAR` is parsed from the
-  extracted `__period__` label (fallback: UTC current year).
 - Refuses to save when `identity_warnings` is non-empty AND
-  `STRICT_ACCURACY=1` (the default).
-- Saves with `status="degraded"` instead of `"success"` when any
-  unresolved `high`-severity finding remains after the loop. Saves
-  `findings`, `identity_warnings`, and `unresolved_findings` as document
-  fields when present.
-
-### Optional `normalize_data` upsert
-When `EARNINGS_SAVE_TARGET=normalize_data`, after the primary upsert the
-node also calls `upsert_concept_values` from
-[tools/normalize_data_client.py](src/earnings_agents/tools/normalize_data_client.py)
-to record `concept_id → value` entries keyed by company CIK, period,
-fiscal-year-end month, and fiscal-year-end code.
+  `STRICT_ACCURACY=1` (the default) — returns `status="failed"`.
+- Logs a warning (but does not abort) when unresolved `high`-severity
+  findings remain in `state["findings"]` after the loop.
+- Calls `upsert_concept_values` from
+  [tools/normalize_data_client.py](src/earnings_agents/tools/normalize_data_client.py)
+  to record `concept_id → value` entries keyed by company CIK, period,
+  fiscal-year-end month, and fiscal-year-end code. Rows are routed to
+  `concept_values_quarterly` or `concept_values_annual` based on the
+  `detected_period_type` inferred at concept-load time.
+- When `concept_metrics`, `company_cik`, or `fiscal_year_end_month` are
+  missing the normalize_data upsert is skipped with a warning (run still
+  ends as `status="saved"`).
+- Returns `status="saved"` on success.
 
 ---
 
@@ -294,16 +300,24 @@ Routing-specific state fields (not part of the linear status):
 | `needs_reextract` | `analyze_metrics` | `_route_after_analysis` |
 | `extraction_notes` | `analyze_metrics` | `extract_financial_metrics` |
 | `previous_high_finding_keys` | `analyze_metrics` | `analyze_metrics` (next pass) |
+| `skill_effectiveness` | `analyze_metrics` | observability only (never routes) |
 | `findings` | `analyze_metrics` | `cleanup_metrics`, save doc |
 | `identity_warnings` | `extract_financial_metrics` | `mongodb_save` (gate) |
 | `cleanup_removed` | `cleanup_metrics` | informational |
 | `raw_sections` | `extract_html_text` | `extract_financial_metrics` |
-| `target_concepts` / `company_cik` / `fiscal_year_end_*` | `load_company_concepts` | `extract_financial_metrics`, `mongodb_save` |
+| `chunk_metric_sources` | `extract_financial_metrics` | `analyze_metrics` (scoped retry) |
+| `metric_source_snippets` | `extract_financial_metrics` | `analyze_metrics` (source grounding) |
+| `mapped_metric_keys` | `extract_financial_metrics` | `cleanup_metrics` (protected set) |
+| `concept_metrics` | `extract_financial_metrics` | `mongodb_save` (normalize_data upsert) |
+| `derived_concept_ids` | `extract_financial_metrics` | informational |
+| `target_concepts` / `calculated_concepts` / `company_cik` / `fiscal_year_end_*` | `load_company_concepts` | `extract_financial_metrics`, `mongodb_save` |
+| `sec_report_date` | CLI (SEC path) | `load_company_concepts`, `mongodb_save` |
+| `detected_period_type` | `load_company_concepts` | `mongodb_save` |
 
-The document `status` field written to MongoDB is one of `"success"`,
-`"degraded"` (high-severity findings unresolved after the loop), or
-`"failed"` (only when the save itself fails or `STRICT_ACCURACY` blocks
-the save).
+The document `status` field at pipeline end is one of `"saved"` (normalize_data
+upsert succeeded or was skipped due to missing conditions) or `"failed"` (when
+`STRICT_ACCURACY` blocks the save due to identity warnings, or when the
+normalize_data upsert itself fails).
 
 ---
 
@@ -311,12 +325,15 @@ the save).
 
 From [config.py](src/earnings_agents/config.py):
 
-- `LLM_PROVIDER` — `ollama` (default) | `openai` | `groq`.
-- `OLLAMA_*`, `OPENAI_*`, `GROQ_*` — provider credentials, model, timeouts.
+- `LLM_PROVIDER` — `ollama` (default) | `groq` | `gemini` | `deepseek`.
+- `OLLAMA_*` — Ollama base URL, model, context window, concurrency.
+- `GROQ_*` — Groq API key, model, base URL, request timeout, RPM/TPM rate-limit budgets.
+- `DEEPSEEK_*` — DeepSeek API key, model (`deepseek-chat` default or `deepseek-reasoner`), base URL, timeout.
+- `GEMINI_*` — Google Gemini API key, model (`gemini-2.5-flash` default), timeout.
 - `OLLAMA_CONCURRENCY` — global cap on concurrent LLM calls.
 - `MONGODB_URI` / `MONGODB_DB` / `MONGODB_COLLECTION`.
-- `EARNINGS_SAVE_TARGET` — `earnings_db` | `normalize_data`.
 - `CHUNK_SIZE`, `CHUNK_OVERLAP`, `EXTRACTION_MAX_CHARS`.
 - `MAX_EXTRACTION_ATTEMPTS` (default 3).
 - `STRICT_ACCURACY` (default on) — blocks save on identity failures.
 - `CLEANUP_METRICS` (default on) — enables the constrained LLM cleanup pass.
+- `LLM_CACHE_ENABLED` / `LLM_CACHE_DIR` — opt-in dev cache for LLM responses (keyed by sha256 of provider+model+prompt); never enabled in production.

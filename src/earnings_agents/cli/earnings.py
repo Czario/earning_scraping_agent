@@ -51,6 +51,10 @@ logging.basicConfig(
 
 from earnings_agents.config import (  # noqa: E402
     COMPANIES,
+    GEMINI_API_KEY,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_MODEL,
+    GEMINI_MODEL,
     GROQ_API_KEY,
     GROQ_MODEL,
     LLM_PROVIDER,
@@ -219,6 +223,14 @@ def _check_llm() -> tuple[bool, str]:
         if not GROQ_API_KEY:
             return False, "Groq API key missing (set GROQ_API_KEY in .env)"
         return True, f"Groq configured — model '{GROQ_MODEL}'"
+    if LLM_PROVIDER == "gemini":
+        if not GEMINI_API_KEY:
+            return False, "Gemini API key missing (set GEMINI_API_KEY in .env)"
+        return True, f"Gemini configured — model '{GEMINI_MODEL}'"
+    if LLM_PROVIDER == "deepseek":
+        if not DEEPSEEK_API_KEY:
+            return False, "DeepSeek API key missing (set DEEPSEEK_API_KEY in .env)"
+        return True, f"DeepSeek configured — model '{DEEPSEEK_MODEL}'"
     return _check_ollama()
 
 
@@ -974,6 +986,10 @@ def main() -> None:
         llm_label = f"openai:{OPENAI_MODEL}"
     elif LLM_PROVIDER == "groq":
         llm_label = f"groq:{GROQ_MODEL}"
+    elif LLM_PROVIDER == "gemini":
+        llm_label = f"gemini:{GEMINI_MODEL}"
+    elif LLM_PROVIDER == "deepseek":
+        llm_label = f"deepseek:{DEEPSEEK_MODEL}"
     else:
         llm_label = f"ollama:{OLLAMA_MODEL}"
     _progress.console.print(f"[bold cyan]LLM[/]      : {llm_label}")

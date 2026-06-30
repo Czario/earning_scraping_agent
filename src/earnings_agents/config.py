@@ -10,7 +10,7 @@ OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 
-# LLM provider selector: "ollama" (default), "openai", or "groq".
+# LLM provider selector: "ollama" (default), "groq", "gemini", or "deepseek".
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 
 # Groq-only settings (read when LLM_PROVIDER="groq").
@@ -21,6 +21,19 @@ GROQ_REQUEST_TIMEOUT: float = float(os.getenv("GROQ_REQUEST_TIMEOUT", "60"))
 # Groq rate-limit budgets (free-tier defaults; override via env vars for paid plans).
 GROQ_RPM: int = int(os.getenv("GROQ_RPM", "30"))       # requests per minute
 GROQ_TPM: int = int(os.getenv("GROQ_TPM", "12000"))    # tokens per minute
+
+# DeepSeek settings (read when LLM_PROVIDER="deepseek").
+# deepseek-chat (fast/cheap), deepseek-reasoner (R1, slower, higher accuracy)
+DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+DEEPSEEK_REQUEST_TIMEOUT: float = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "120"))
+
+# Google Gemini settings (read when LLM_PROVIDER="gemini").
+# Uses the official google-genai SDK (https://ai.google.dev/gemini-api/docs/libraries).
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_REQUEST_TIMEOUT: float = float(os.getenv("GEMINI_REQUEST_TIMEOUT", "120"))
 MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")

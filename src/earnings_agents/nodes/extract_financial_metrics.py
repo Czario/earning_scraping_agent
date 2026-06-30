@@ -10,7 +10,9 @@ from typing import Any, Optional
 
 from earnings_agents.config import (
     EXTRACTION_MAX_CHARS,
+    GEMINI_REQUEST_TIMEOUT,
     GROQ_REQUEST_TIMEOUT,
+    LLM_PROVIDER,
 )
 from earnings_agents.hooks import get_detail_callback, report_detail
 from earnings_agents.llm_factory import build_llm
@@ -168,6 +170,21 @@ Text excerpt:
 # imported from earnings_agents.tools.llm_extractor (above).
 
 
+def _request_timeout_for(provider: str | None) -> float:
+    """Return the per-request HTTP timeout for the given LLM provider.
+
+    ``provider`` may be ``None``, in which case the configured
+    ``LLM_PROVIDER`` is used. Each cloud provider has its own timeout budget;
+    everything else (local Ollama) uses the Ollama default.
+    """
+    effective = (provider or LLM_PROVIDER).strip().lower()
+    if effective == "groq":
+        return GROQ_REQUEST_TIMEOUT
+    if effective == "gemini":
+        return GEMINI_REQUEST_TIMEOUT
+    return _OLLAMA_REQUEST_TIMEOUT
+
+
 def _invoke_chunk_with_retry(
     prompt: str,
     chunk_num: int,
@@ -192,7 +209,7 @@ def _invoke_chunk_with_retry(
     def _parse(response: str) -> dict | None:
         return _parse_llm_response(response, shares_multiplier, prescan_dollar_multiplier)
 
-    timeout = GROQ_REQUEST_TIMEOUT if provider == "groq" else _OLLAMA_REQUEST_TIMEOUT
+    timeout = _request_timeout_for(provider)
     llm = build_llm(format_json=True, request_timeout=timeout, provider=provider)
 
     return _invoke_chunk_with_retry_new(
@@ -611,7 +628,7 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 "— running LLM semantic mapping",
                 len(unmapped_concepts), ticker,
             )
-            map_timeout = GROQ_REQUEST_TIMEOUT if escalated_provider == "groq" else _OLLAMA_REQUEST_TIMEOUT
+            map_timeout = _request_timeout_for(escalated_provider)
             map_llm = build_llm(format_json=True, request_timeout=map_timeout, provider=escalated_provider)
             llm_matches = _llm_map_concepts(
                 numeric_keys,
