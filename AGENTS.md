@@ -13,7 +13,6 @@ uv sync                                          # install / sync deps
 uv run earnings --source sec --ticker MSFT       # SEC EDGAR mode
 uv run earnings --source ir --ticker MSFT --ir-url "<url>"  # IR mode
 uv run earnings --ticker AAPL MSFT GOOGL         # multi-ticker parallel run
-uv run earnings-scheduler                        # run the APScheduler daemon
 uv run pytest -q                                 # full test suite
 uv run pytest tests/test_extract_financial_metrics.py -q    # focused test
 ```

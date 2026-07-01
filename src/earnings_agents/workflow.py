@@ -9,7 +9,6 @@ from langgraph.graph import END, StateGraph
 from earnings_agents.nodes.extract_financial_metrics import extract_financial_metrics_node
 from earnings_agents.nodes.detect_document_type import detect_document_type_node
 from earnings_agents.nodes.extract_html_text import extract_html_text_node
-from earnings_agents.nodes.discover_earnings_release import discover_earnings_release_node
 from earnings_agents.nodes.extract_pdf_text import extract_pdf_text_node
 from earnings_agents.nodes.analyze_metrics import analyze_metrics_node
 from earnings_agents.nodes.cleanup_metrics import cleanup_metrics_node
@@ -30,12 +29,6 @@ def _fail_or(state: EarningsAgentState, next_node: str) -> str:
     ``status == "failed"``) into a single reusable primitive.
     """
     return "__end__" if state.get("status") == "failed" else next_node
-
-
-def _route_after_discovery(
-    state: EarningsAgentState,
-) -> Literal["load_company_concepts", "__end__"]:
-    return _fail_or(state, "load_company_concepts")  # type: ignore[return-value]
 
 
 def _route_after_concepts(
@@ -168,7 +161,6 @@ def build_graph():
     """Compile and return the LangGraph earnings scraping workflow."""
     graph = StateGraph(EarningsAgentState)
 
-    graph.add_node("discover_earnings_release", with_hooks(discover_earnings_release_node))
     graph.add_node("load_company_concepts", with_hooks(load_company_concepts_node))
     graph.add_node("detect_document_type", with_hooks(detect_document_type_node))
     graph.add_node("extract_pdf_text", with_hooks(extract_pdf_text_node))
@@ -178,13 +170,8 @@ def build_graph():
     graph.add_node("cleanup_metrics", with_hooks(cleanup_metrics_node))
     graph.add_node("mongodb_save", with_hooks(mongodb_save_node))
 
-    graph.set_entry_point("discover_earnings_release")
+    graph.set_entry_point("load_company_concepts")
 
-    graph.add_conditional_edges(
-        "discover_earnings_release",
-        _route_after_discovery,
-        {"load_company_concepts": "load_company_concepts", "__end__": END},
-    )
     graph.add_conditional_edges(
         "load_company_concepts",
         _route_after_concepts,

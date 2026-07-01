@@ -94,14 +94,6 @@ uv run earnings --ticker AAPL MSFT GOOGL
 uv run earnings --cik 0000320193 0000789019
 ```
 
-## Scheduler
-
-Run the packaged scheduler command:
-
-```bash
-uv run earnings-scheduler
-```
-
 ## Tests
 
 Run all tests:
@@ -123,6 +115,4 @@ uv run pytest tests/test_company_registry.py -q
 - Results are upserted into MongoDB with keys like `TICKER_YEAR_latest`.
 
 
-note : 
 
-1. **`scheduler.py`** — poll the *global* feed every few minutes, filter entries by CIK against your watched tickers, and auto-trigger the pipeline the moment a new 8-K appears. This is the high-value use: zero manual polling, pipeline fires as soon as the filing lands.

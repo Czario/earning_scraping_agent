@@ -14,7 +14,6 @@ dependencies = [
     "requests>=2.32.0",
     "playwright>=1.44.0",
     "pymongo>=4.8.0",
-    "apscheduler>=3.10.0",
     "pydantic>=2.8.0",
     "python-dotenv>=1.0.0",
     "lxml>=5.2.0",
@@ -30,7 +29,6 @@ dev = [
 ]
 
 [project.scripts]
-earnings-scheduler = "earnings_agents.cli.scheduler:main"
 earnings-run-once = "earnings_agents.cli.earnings:main"
 earnings = "earnings_agents.cli.earnings:main"
 earnings-failures = "earnings_agents.cli.failures:main"

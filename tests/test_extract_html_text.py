@@ -119,7 +119,113 @@ class TestClassifyTable:
         assert _classify_table("", "") == "other"
 
 
-# ── _get_table_context ───────────────────────────────────────────────────────
+# ── segment table classification ────────────────────────────────────────────
+
+
+class TestSegmentTableClassification:
+    """Segment/geographic/product revenue tables must classify as 'segment'
+    (bypassing the LLM filter) so they always reach the extraction LLM."""
+
+    # --- context-heading driven (real-world patterns) ---
+
+    def test_divisional_revenues_nike(self):
+        # Nike's exact heading: "DIVISIONAL REVENUES"
+        ctx = "NIKE, Inc. DIVISIONAL REVENUES (Unaudited)"
+        table_text = "North America Footwear 3230 Apparel 1310 Equipment 292 Total 4832"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_divisional_revenues_with_nongaap_footnote_in_body(self):
+        # Critical: Nike's DIVISIONAL REVENUES table embeds a footnote cell
+        # "currency-neutral basis is considered a non-GAAP financial measure."
+        # The full table text triggers _NON_GAAP_TABLE_RX — but the context
+        # check fires FIRST, so the table is still classified as segment.
+        ctx = "NIKE, Inc. DIVISIONAL REVENUES (Unaudited)"
+        table_text = (
+            "North America Footwear 3230 Total 4832 "
+            "1 The percent change calculated using actual exchange rates "
+            "is considered a non-GAAP financial measure."
+        )
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_net_sales_by_reportable_segment_apple(self):
+        # Apple-style heading
+        ctx = "Net Sales by Reportable Segment"
+        table_text = "Americas 40,000 Europe 25,000 Greater China 18,000 Total 83,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_net_sales_by_category(self):
+        ctx = "Net Sales by Category"
+        table_text = "Products 57,000 Services 26,000 Total net sales 83,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_revenue_by_geography_context(self):
+        ctx = "Revenue by Geography"
+        table_text = "Americas 45,000 Europe 22,000 Asia Pacific 18,000 Total 85,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_revenue_by_segment_context(self):
+        ctx = "Revenue by Segment"
+        table_text = "Cloud 35,000 Devices 15,000 Gaming 5,000 Total 55,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_geographic_revenue_adjective_form(self):
+        ctx = "Geographic Revenue"
+        table_text = "North America 80,000 International 40,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_segment_results_heading(self):
+        ctx = "Segment Results"
+        table_text = "Intelligent Cloud 28,500 Productivity 25,100 Personal Computing 13,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_segment_information_heading(self):
+        ctx = "Segment Information"
+        table_text = "Segment A 100 Segment B 200 Total 300"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_supplemental_revenue_data(self):
+        ctx = "Supplemental Revenue Data"
+        table_text = "Product revenue 60,000 Service revenue 25,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_revenue_breakdown_by_in_context(self):
+        ctx = "Revenue breakdown by product line"
+        table_text = "Hardware 30,000 Software 50,000 Services 20,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_operating_segments_heading(self):
+        ctx = "Operating Segments"
+        table_text = "Segment A Revenue 100,000 Segment B Revenue 50,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    # --- priority / guard tests ---
+
+    def test_non_gaap_context_wins_over_segment(self):
+        # Context explicitly says "Non-GAAP" → guard blocks segment, falls
+        # through to full-probe non_gaap check.
+        ctx = "Non-GAAP Adjusted Segment Revenue"
+        table_text = "Cloud (GAAP) 35,000 Adjustments (2,000) Cloud (Non-GAAP) 33,000"
+        assert _classify_table(table_text, ctx) == "non_gaap"
+
+    def test_reconciliation_context_wins_over_segment(self):
+        ctx = "Reconciliation of GAAP to Adjusted Segment Revenue"
+        table_text = "Segment A GAAP 100,000 Adjustments (5,000) Adjusted 95,000"
+        assert _classify_table(table_text, ctx) == "non_gaap"
+
+    def test_segment_context_wins_over_nongaap_footnote_in_table_body(self):
+        # Segment context is authoritative; non-GAAP only in footnote inside
+        # the table body must NOT reclassify a GAAP segment table.
+        ctx = "Revenue by Segment"
+        table_text = "Cloud 35,000 Services 20,000 1 non-GAAP measure for reporting purposes"
+        assert _classify_table(table_text, ctx) == "segment"
+
+    def test_income_statement_keywords_in_body_do_not_override_segment_context(self):
+        # Context matches segment → returns "segment" before GAAP body checks.
+        ctx = "Revenue by Segment (Three Months Ended)"
+        table_text = "Cloud Net Revenue 35,000 Services Net Revenue 25,000"
+        assert _classify_table(table_text, ctx) == "segment"
+
+
 
 
 class TestGetTableContext:

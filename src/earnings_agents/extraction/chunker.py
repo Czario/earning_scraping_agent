@@ -273,12 +273,11 @@ def _build_section_chunks(
     values map to the GAAP income-statement / balance-sheet / cash-flow
     registries.
 
-    When ``target_concepts`` is non-empty (normalize_data mode), only sections
-    whose ``statement_type`` matches at least one targeted concept are
-    emitted.  Sending the balance-sheet table through an income-statement-only
-    targeted prompt produces all-null responses, wasting ~30-60 s per chunk
-    per pass.  The ``other`` bucket (unclassified supplementary tables) is
-    always included when any target is present.
+    Only income statement and supplementary FINANCIAL DATA ("other") sections
+    are sent to the LLM.  Balance-sheet and cash-flow tables are excluded:
+    the extraction prompt is scoped to income statement metrics only, and
+    sending unrelated statement tables wastes context window tokens while
+    producing only null responses for every non-IS concept.
 
     Targeted concepts are required: generic extraction has been removed, so
     without ``target_concepts`` there is nothing to scope to and ``None`` is
@@ -294,17 +293,11 @@ def _build_section_chunks(
     if not target_concepts:
         return None
 
-    # Targeted mode (normalize_data): only send sections that match at
-    # least one concept's statement_type.  Always include "other" as a
-    # catch-all for supplementary tables.
-    allowed_keys: set[str] = {
-        (c.get("statement_type") or "").strip().lower()
-        for c in target_concepts
-        if c.get("statement_type")
-    }
-    allowed_keys.discard("")
-    if allowed_keys:
-        allowed_keys.add("other")
+    # Only income statement + supplementary ("other") tables are sent.
+    # Balance-sheet and cash-flow sections are excluded regardless of what
+    # statement_type values appear in target_concepts — the extraction prompt
+    # is IS-only and those tables waste context window budget.
+    allowed_keys: set[str] = {"income_statement", "other"}
 
     # Assemble all selected table entries into one ordered text block, then
     # split by _CHUNK_SIZE.  With a large CHUNK_SIZE (Groq) everything lands

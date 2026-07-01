@@ -69,6 +69,40 @@ _CASH_FLOW_TABLE_RX = re.compile(
     re.I,
 )
 
+# Positively identifies supplementary GAAP revenue-detail tables:
+# revenue by segment, geography, product line, business unit, etc.
+#
+# These patterns are matched against the table CONTEXT (heading) only, BEFORE
+# the full-probe non_gaap check runs. Many real-world segment tables carry a
+# footnote cell like "currency-neutral basis is considered a non-GAAP measure"
+# — that footnote refers only to a percentage column, not to the dollar values.
+# Matching on context (never the table body) prevents that footnote text from
+# triggering the non_gaap classification on the entire table.
+#
+# Safety: the caller also checks that the context itself does NOT match
+# _NON_GAAP_TABLE_RX, so "Non-GAAP Revenue by Segment" is never misclassified.
+_SEGMENT_TABLE_RX = re.compile(
+    # "Revenue/Sales by X" — e.g. "Revenue by Geography",
+    # "Net Sales by Reportable Segment" (Apple), "Sales by Region"
+    r"(?:revenues?|net\s+(?:revenues?|sales)|sales)\s+by\s+"
+    r"(?:segment|reportable\s+segment|geography|region|product|category|type|channel|business|division)\b"
+    # Adjective-noun — e.g. "Geographic Revenue", "Divisional Revenues" (Nike),
+    # "Segment Results", "Product Breakdown"
+    r"|(?:segment|geographic|product|category|regional|divisional)\s+"
+    r"(?:revenues?|net\s+(?:revenues?|sales)|results|breakdown)\b"
+    # Bare "Divisional Revenues" (Nike) not already caught above
+    r"|\bdivisional\s+revenues?\b"
+    # "Revenue/Sales breakdown/detail/mix by …"
+    r"|(?:revenues?|sales)\s+(?:breakdown|detail|mix)\s+by\b"
+    # Supplemental financial data
+    r"|\bsupplemental\s+(?:revenue|financial)\s+(?:data|information|detail)\b"
+    # "Segment information/data/results/summary"
+    r"|\bsegment(?:al)?\s+(?:information|data|details?|summary|results)\b"
+    # "Operating Segments" section heading
+    r"|\boperating\s+segments?\b",
+    re.I,
+)
+
 # Detects whether a table entry already carries its own scale caption, so a
 # document/preceding scale is only injected when the table itself says nothing
 # — never overriding a table that declares its own scale. ``[^\S\n]`` matches
@@ -134,20 +168,45 @@ def _classify_table(table_text: str, context_text: str) -> str:
     """Classify a financial table using fast keyword regex.
 
     Returns one of: ``'income_statement'``, ``'balance_sheet'``, ``'cash_flow'``,
-    ``'non_gaap'``, or ``'other'`` (catch-all for tables that don't match any
-    keyword pattern).
+    ``'segment'``, ``'non_gaap'``, or ``'other'``.
 
-    ``non_gaap`` is checked against the *full* table text because reconciliation
-    tables often have the key phrase ('Adjusted net income') near the bottom.
-    Positive GAAP classifications use a shorter probe to avoid false matches on
-    non-GAAP tables that share metric names (e.g. 'Net income as reported').
+    Classification order (earlier wins):
 
-    Tables that fall through to ``'other'`` are subsequently screened by
-    :func:`_llm_classify_other` inside the extraction node.
+    1. **Segment context** — if the heading (context) matches *_SEGMENT_TABLE_RX*
+       AND does NOT itself contain non-GAAP keywords, return ``'segment'``
+       immediately.  This must fire before the full-probe non-GAAP check because
+       many GAAP segment tables carry a footnote cell such as "currency-neutral
+       figures are a non-GAAP measure" — that footnote describes only a
+       percentage column and should never cause the entire table (which contains
+       GAAP dollar revenues) to be suppressed.  Checking context-only is safe
+       because genuine non-GAAP tables are excluded by the guard on the context.
+
+    2. **Full-probe non-GAAP** — ``non_gaap`` is checked against the full table
+       text because reconciliation tables often have the key phrase ('Adjusted
+       net income') near the bottom, not the top.
+
+    3. **Short-probe GAAP statements** — income statement, cash flow, balance
+       sheet checked on context + first 600 chars to avoid false matches on
+       non-GAAP tables that share metric names ('Net income as reported').
+
+    4. **Short-probe segment fallback** — catches segment tables where the
+       context heading is ambiguous but the opening rows contain segment keywords.
+
+    5. **other** — catch-all; subsequently screened by the LLM batch filter.
     """
+    # ── 1. Segment context check (BEFORE full-probe non_gaap) ────────────────
+    # Match only on context (heading text), never the table body, to avoid
+    # footnote-text contamination. Reject if the context itself advertises
+    # non-GAAP content — e.g. "Non-GAAP Revenue by Segment".
+    if _SEGMENT_TABLE_RX.search(context_text) and not _NON_GAAP_TABLE_RX.search(context_text):
+        return "segment"
+
+    # ── 2. Full-probe non-GAAP ────────────────────────────────────────────────
     full_probe = context_text + " " + table_text
     if _NON_GAAP_TABLE_RX.search(full_probe):
         return "non_gaap"
+
+    # ── 3. Short-probe GAAP statement checks ─────────────────────────────────
     short_probe = context_text[-600:] + " " + table_text[:600]
     if _INCOME_STMT_TABLE_RX.search(short_probe):
         return "income_statement"
@@ -155,6 +214,11 @@ def _classify_table(table_text: str, context_text: str) -> str:
         return "cash_flow"
     if _BALANCE_SHEET_TABLE_RX.search(short_probe):
         return "balance_sheet"
+
+    # ── 4. Short-probe segment fallback ──────────────────────────────────────
+    if _SEGMENT_TABLE_RX.search(short_probe):
+        return "segment"
+
     return "other"
 
 
@@ -328,6 +392,17 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                     entry = f"(in {table_scale})\n{entry}"
             if ttype == "other":
                 _other_pending.append((entry, table_text, context))
+            elif ttype == "segment":
+                # Segment/geographic/product revenue tables — always keep;
+                # bypass the LLM batch filter and place directly into "other"
+                # so they reach extraction as FINANCIAL DATA chunks.
+                # Also inject scale if the table doesn't declare its own.
+                if not _ENTRY_HAS_SCALE_RX.search(entry):
+                    table_scale = _find_preceding_scale(table) or doc_scale
+                    if table_scale:
+                        entry = f"(in {table_scale})\n{entry}"
+                sections["other"].append(entry)
+                has_gaap_tables = True
             else:
                 sections[ttype].append(entry)
                 if ttype in ("income_statement", "balance_sheet", "cash_flow"):

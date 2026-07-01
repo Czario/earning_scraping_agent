@@ -36,6 +36,8 @@ def _build_extraction_notes(
     findings: list[Finding],
     attempt_num: int,
     prev_notes: str,
+    missing_toplevel: list[str] | None = None,
+    missing_segments: list[str] | None = None,
 ) -> str:
     """Build a focused hint block for the next extraction pass.
 
@@ -57,7 +59,7 @@ def _build_extraction_notes(
 
     lines.append(
         f"Attempt {attempt_num} still incomplete. Prioritise finding these metrics "
-        f"(search income statement, balance sheet, cash-flow, and supplementary tables):"
+        f"(search the income statement and supplementary FINANCIAL DATA tables only):"
     )
     for f in high:
         lines.append(f"  - [REQUIRED] {f.message}")
@@ -97,6 +99,25 @@ def _build_extraction_notes(
         lines.append("Also locate these if reported:")
         for f in medium:
             lines.append(f"  - {f.message}")
+
+    # Concept-level gap hints: tell the LLM specifically which concepts had no
+    # value mapped in the previous pass so it knows exactly what is still missing.
+    missing_toplevel = missing_toplevel or []
+    missing_segments = missing_segments or []
+    if missing_toplevel:
+        lines.append(
+            "MISSING top-level IS concepts (look in the primary income statement):"
+        )
+        for lbl in missing_toplevel[:10]:  # cap to avoid runaway hints
+            lines.append(f"  • {lbl}")
+    if missing_segments:
+        lines.append(
+            "MISSING segment/dimensional concepts (look in FINANCIAL DATA tables — "
+            "segment, geographic, or product breakdowns):"
+        )
+        for lbl in missing_segments[:20]:
+            lines.append(f"  • {lbl}")
+
     lines.append(
         "Preserve the exact wording each metric uses in the document."
     )
@@ -259,7 +280,13 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
     # Loop back: build cumulative extraction notes.
     prev_notes = state.get("extraction_notes") or ""
-    out["extraction_notes"] = _build_extraction_notes(findings, attempts + 1, prev_notes)
+    out["extraction_notes"] = _build_extraction_notes(
+        findings,
+        attempts + 1,
+        prev_notes,
+        missing_toplevel=state.get("missing_toplevel_labels") or [],
+        missing_segments=state.get("missing_segment_labels") or [],
+    )
     out["needs_reextract"] = True
     out["previous_high_finding_keys"] = current_high_keys
     logger.info(

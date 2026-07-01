@@ -20,7 +20,6 @@ def _base_state(**overrides):
     return {
         "ticker": "AAPL",
         "company_name": "Apple Inc.",
-        "ir_url": "https://investor.apple.com/",
         "discovered_file_url": "https://example.com/q1-2025.pdf",
         "file_type": "pdf",
         "raw_text": (
@@ -675,7 +674,6 @@ def _base_state(**overrides):
     return {
         "ticker": "AAPL",
         "company_name": "Apple Inc.",
-        "ir_url": "https://investor.apple.com/",
         "discovered_file_url": "https://example.com/q1-2025.pdf",
         "file_type": "pdf",
         "raw_text": (

@@ -3,29 +3,9 @@
 Pass one or more company identifiers and the graph runs for each.
 
 Usage examples:
-    # SEC EDGAR path (default) — looks up latest 8-K Exhibit 99.1 automatically
     uv run earnings --cik 0000320193
     uv run earnings --ticker AAPL MSFT GOOGL
-    uv run earnings --source sec --cik 0000320193 0000789019
-
-    # IR website path — LLM scans the IR page to find the earnings release URL
-    uv run earnings --source ir --ticker AAPL
-    uv run earnings --source ir --cik 0000320193 --ir-url https://investor.apple.com/news/press-releases/default.aspx
-
-Source flag behaviour:
-  --source sec (default)
-      Queries SEC EDGAR submissions API for the latest 8-K Item 2.02 filing,
-      extracts Exhibit 99.1 URL, and injects it directly into the graph
-    (the discover_earnings_release node is skipped).
-
-  --source ir
-      Uses the company's Investor Relations website. The discover_earnings_release node
-      fetches the IR page, extracts all links, and asks Ollama to identify
-      the earnings release URL.
-      IR URL resolution order:
-        1. --ir-url argument (applies to every company in this run)
-        2. COMPANIES dict in config.py (per-ticker hard-coded URL)
-        3. Error — cannot proceed without an IR URL
+    uv run earnings --cik 0000320193 0000789019
 """
 from __future__ import annotations
 
@@ -50,7 +30,6 @@ logging.basicConfig(
 )
 
 from earnings_agents.config import (  # noqa: E402
-    COMPANIES,
     GEMINI_API_KEY,
     DEEPSEEK_API_KEY,
     DEEPSEEK_MODEL,
@@ -76,7 +55,6 @@ _logger = logging.getLogger(__name__)
 
 # Human-readable stage names for the rich progress description
 _NODE_LABELS: dict[str, str] = {
-    "discover_earnings_release_node": "discover",
     "load_company_concepts_node":     "load concepts",
     "detect_document_type_node":      "detect type",
     "extract_html_text_node":         "fetch text",
@@ -90,7 +68,6 @@ _NODE_LABELS: dict[str, str] = {
 # Short abbreviations used when compacting the completed-stage breadcrumb
 # so it fits within the terminal width.
 _SHORT_STAGE: dict[str, str] = {
-    "discover":       "disc",
     "load concepts":  "cncpt",
     "detect type":    "type",
     "fetch text":     "fetch",
@@ -107,13 +84,6 @@ def _format_step_line(node_name: str, state: dict) -> str | None:
 
     Returns ``None`` when no summary is needed.
     """
-    if node_name == "discover_earnings_release_node":
-        # Covers both IR path (URL found by LLM) and SEC path (URL pre-set, node short-circuits).
-        url = state.get("discovered_file_url") or ""
-        period = state.get("sec_report_date") or ""
-        if state.get("status") == "failed":
-            return f"  [discover]       failed — {(state.get('error') or '')[:60]}"
-        return f"  [discover]       {url[:90]}" + (f"  ({period})" if period else "")
     if node_name == "load_company_concepts_node":
         if state.get("status") in ("skipped", "failed"):
             reason = (state.get("error") or "no concepts")[:70]
@@ -432,14 +402,11 @@ def _has_existing_period_data(ticker: str) -> bool:
         return False
 
 
-def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str = "", printer=print) -> dict:
+def _build_initial_state(info: dict, printer=print) -> dict:
     """Build the LangGraph initial state for one company.
 
-    source="sec"  → query SEC EDGAR for the latest 8-K Exhibit 99.1 and
-                     inject the URL directly (discover_earnings_release node is skipped).
-    source="ir"   → use the company's IR website; the discover_earnings_release node
-                     fetches the page and asks Ollama to find the earnings URL.
-                     IR URL is taken from ir_url_override, then COMPANIES config.
+    Queries SEC EDGAR for the latest 8-K Exhibit 99.1 URL and injects it
+    directly into the state so the pipeline starts at load_company_concepts.
     """
     ticker = info.get("ticker") or ""
     company_name = info["company_name"]
@@ -458,36 +425,12 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
         "previous_high_finding_keys": None,
     }
 
-    if source == "ir":
-        # Resolve IR URL: CLI override > COMPANIES config > error
-        ir_url = ir_url_override or COMPANIES.get(ticker.upper(), {}).get("ir_url", "")
-        if not ir_url:
-            return {
-                **_base,
-                "ir_url": "",
-                "discovered_file_url": None,
-                "status": "failed",
-                "error": (
-                    f"No IR URL for {ticker or cik}. "
-                    "Provide --ir-url or add the ticker to COMPANIES in config.py."
-                ),
-            }
-        printer(f"  [IR]     {company_name} ({ticker or cik}) → {ir_url}")
-        return {
-            **_base,
-            "ir_url": ir_url,
-            "discovered_file_url": None,
-            "status": "pending",
-        }
-
-    # source == "sec" (default)
     if not _has_existing_period_data(ticker):
         printer(
             f"  [SKIP]   {company_name} ({ticker or cik}) — no existing normalize_data period data; skipping 8-K discovery"
         )
         return {
             **_base,
-            "ir_url": "",
             "discovered_file_url": None,
             "status": "skipped",
             "error": "no existing normalize_data period data found for this company; skipping 8-K path.",
@@ -498,7 +441,6 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
     if not filing_url:
         return {
             **_base,
-            "ir_url": "",
             "discovered_file_url": None,
             "status": "failed",
             "error": f"No 8-K earnings filing found on SEC EDGAR for CIK {cik}",
@@ -511,29 +453,25 @@ def _build_initial_state(info: dict, source: str = "sec", ir_url_override: str =
         )
         return {
             **_base,
-            "ir_url": "",
             "discovered_file_url": filing_url,
             "sec_report_date": sec_report_date,
             "status": "already_stored",
         }
     return {
         **_base,
-        "ir_url": "",
         "discovered_file_url": filing_url,
         "sec_report_date": sec_report_date,  # authoritative period-end date from SEC
-        # Skip IR discovery — jump straight to file-type detection
         "status": "discovered",
     }
 
 
-def _run_company(graph, info: dict, source: str = "sec", ir_url_override: str = "", printer=print) -> dict:
+def _run_company(graph, info: dict, printer=print) -> dict:
     label = f"{info['company_name']} ({info.get('ticker') or info['cik']})"
     printer(f"\n{SEP}")
     printer(f"  Company : {label}")
     printer(f"  CIK     : {info['cik']}")
-    printer(f"  Source  : {source.upper()}")
 
-    state = _build_initial_state(info, source=source, ir_url_override=ir_url_override, printer=printer)
+    state = _build_initial_state(info, printer=printer)
 
     if state["status"] == "failed":
         printer(f"  [SKIP]  {state['error']}")
@@ -553,8 +491,6 @@ def _run_company(graph, info: dict, source: str = "sec", ir_url_override: str = 
     if state["status"] != "failed":
         if state.get("discovered_file_url"):
             printer(f"  Filing  : {state['discovered_file_url']}")
-        else:
-            printer(f"  IR URL  : {state['ir_url']}")
     printer(SEP)
 
     final = graph.invoke(state)
@@ -576,8 +512,6 @@ def _run_company(graph, info: dict, source: str = "sec", ir_url_override: str = 
 
 def _dry_run_company(
     info: dict,
-    source: str = "sec",
-    ir_url_override: str = "",
     printer=print,
 ) -> dict:
     """Resolve URLs and check service connectivity without running the LLM or saving.
@@ -589,9 +523,8 @@ def _dry_run_company(
     printer(f"\n{SEP}")
     printer(f"  DRY-RUN : {label}")
     printer(f"  CIK     : {info['cik']}")
-    printer(f"  Source  : {source.upper()}")
 
-    state = _build_initial_state(info, source=source, ir_url_override=ir_url_override, printer=printer)
+    state = _build_initial_state(info, printer=printer)
 
     llm_ok, llm_detail = _check_llm()
     mongo_ok, mongo_detail = _check_mongodb()
@@ -614,7 +547,7 @@ def _dry_run_company(
     else:
         verdict = "ready"
 
-    url_display = state.get("discovered_file_url") or state.get("ir_url") or "(none)"
+    url_display = state.get("discovered_file_url") or "(none)"
     printer(SEP)
     printer(f"  URL     : {url_display}")
     if file_type:
@@ -692,7 +625,7 @@ def _is_period_already_stored(ticker: str, sec_report_date_str: str | None) -> b
 
 def _run_company_parallel(args: tuple) -> dict:
     """Thread worker: run one company and update the shared rich Progress."""
-    graph, info, source, ir_url_override, skip_existing, progress, overall_task = args
+    graph, info, skip_existing, progress, overall_task = args
     ticker = info.get("ticker", "")
     name = ticker or info.get("company_name", "?")
     label = f"[cyan]{name}[/]"
@@ -807,8 +740,7 @@ def _run_company_parallel(args: tuple) -> dict:
 
     set_node_callback(_node_cb)
     set_detail_callback(_detail_cb)
-    result = _run_company(graph, info, source=source, ir_url_override=ir_url_override,
-                          printer=lambda _: None)
+    result = _run_company(graph, info, printer=lambda _: None)
     set_node_callback(None)
     set_detail_callback(None)
 
@@ -828,7 +760,7 @@ def _run_company_parallel(args: tuple) -> dict:
 
 def _dry_run_company_parallel(args: tuple) -> dict:
     """Thread worker: dry-run one company and update the shared rich Progress."""
-    info, source, ir_url_override, skip_existing, progress, overall_task = args
+    info, skip_existing, progress, overall_task = args
     ticker = info.get("ticker", "")
     name = ticker or info.get("company_name", "?")
     label = f"[cyan]{name}[/]"
@@ -838,8 +770,7 @@ def _dry_run_company_parallel(args: tuple) -> dict:
         return {"_dry_run_verdict": "ready", "status": "skipped", "ticker": ticker}
 
     company_task = progress.add_task(f"{label}  checking\u2026", total=None)
-    result = _dry_run_company(info, source=source, ir_url_override=ir_url_override,
-                              printer=lambda _: None)
+    result = _dry_run_company(info, printer=lambda _: None)
     verdict = result.get("_dry_run_verdict", "?")
     color = {"ready": "green", "warning": "yellow", "blocked": "red", "already_stored": "cyan"}.get(verdict, "white")
     verdict_label = {"already_stored": "up to date"}.get(verdict, verdict)
@@ -873,18 +804,6 @@ def main() -> None:
         metavar="TICKER",
         default=[],
         help="One or more ticker symbols (e.g. AAPL MSFT)",
-    )
-    parser.add_argument(
-        "--source",
-        choices=["ir", "sec"],
-        default="sec",
-        help="URL discovery method: 'sec' (default) queries SEC EDGAR; 'ir' scrapes the company's IR website via LLM.",
-    )
-    parser.add_argument(
-        "--ir-url",
-        metavar="URL",
-        default="",
-        help="IR website URL to use when --source ir is set (overrides COMPANIES config for all companies in this run).",
     )
     parser.add_argument(
         "--dry-run",
@@ -948,9 +867,6 @@ def main() -> None:
         import earnings_agents.nodes.cleanup_metrics as _cm
         _cm.CLEANUP_METRICS = False
 
-    if args.ir_url and args.source != "ir":
-        parser.error("--ir-url is only meaningful with --source ir.")
-
     companies = _resolve_companies(args.cik, args.ticker)
     if not companies:
         print("No valid companies resolved. Exiting.")
@@ -1000,7 +916,7 @@ def main() -> None:
         with _progress as progress:
             overall_task = progress.add_task("[bold]Dry-run[/]", total=total)
             worker_args = [
-                (c, args.source, args.ir_url, args.skip_existing, progress, overall_task)
+                (c, args.skip_existing, progress, overall_task)
                 for c in companies
             ]
             results = []
@@ -1037,7 +953,7 @@ def main() -> None:
     with _progress as progress:
         overall_task = progress.add_task("[bold]Companies[/]", total=total)
         worker_args = [
-            (graph, c, args.source, args.ir_url, args.skip_existing, progress, overall_task)
+            (graph, c, args.skip_existing, progress, overall_task)
             for c in companies
         ]
         results = []

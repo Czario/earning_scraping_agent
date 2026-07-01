@@ -22,7 +22,11 @@ For each table below, decide whether it contains PRIMARY GAAP financial statemen
 data worth extracting — rows with numeric values for revenue, cost, expenses,
 income, EPS, or share counts.
 
-Mark useful=true for: primary income-statement rows, condensed GAAP summaries.
+Mark useful=true for:
+- Primary income-statement rows, condensed GAAP summaries.
+- Revenue or sales breakdowns by segment, geography, product line, or business unit
+  (these are GAAP supplementary disclosures — always keep them).
+
 Mark useful=false for:
 - Contact blocks (names, email addresses, phone numbers, job titles)
 - Footnote annotation tables (rows beginning with (A), (B), * etc.)

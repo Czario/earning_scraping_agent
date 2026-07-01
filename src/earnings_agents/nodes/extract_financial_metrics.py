@@ -91,20 +91,37 @@ Extract ONLY the income statement metrics listed below from the text excerpt for
 This is chunk {chunk_num} of {total_chunks} of the full document.
 {focus_hint}{scale_hint}{period_hint}
 SCOPE — extract ONLY the concepts listed below.
-Use EXACTLY the label shown in quotes as the JSON key — not the document's own wording.
+Use the bracketed key [ ] as your JSON key when one is shown; otherwise use
+the quoted label exactly. For dimensional concepts (bracket contains "|"), the
+bracket encodes what metric AND what segment/dimension is being measured —
+e.g. [us-gaap:Revenues|aapl:AmericasSegmentMember] means: find the Americas
+segment row under Revenue and return it with that exact bracketed string as
+the JSON key.
 
 {concept_list}
 IGNORE — do NOT extract:
   • Balance sheet items, cash flow items, non-GAAP metrics, guidance / forecasts.
   • Any table from a GAAP-to-Non-GAAP reconciliation.
-  • Percentage metrics (margins, growth rates).
+  • Percentage-only metrics (margins, growth rates) UNLESS they appear in the
+    concept list above.
   • Values from FOOTNOTES or parenthetical sub-tables (e.g. "Stock-based
     compensation included in the above", supplementary breakdowns). A genuine
     income-statement line item is a primary row of the main statement, not a
     footnote disclosure. If R&D, S&M, or G&A appears both as a primary row
     AND inside a footnote, take ONLY the primary-row value (the larger one).
+  EXCEPTION: Segment/geographic/category footnote sections that appear at the
+    bottom of the income statement table ARE GAAP disclosures — extract them
+    when they match a concept in your list. These sections are labeled like
+    "(1) Net sales by reportable segment:", "(1) Net sales by category:",
+    "(1) Revenue by geography:", etc. They are NOT the kind of footnotes to
+    ignore; they contain primary GAAP segment data.
 
-TABLE PRIORITY: prefer the primary condensed GAAP income statement. Skip Non-GAAP tables.
+TABLE PRIORITY: prefer the primary condensed GAAP income statement. Also extract
+from GAAP supplementary tables labeled "FINANCIAL DATA" in this document — these
+include segment revenue, geographic revenue breakdown, and product-line detail
+tables (the FINANCIAL DATA tables are the PRIMARY source for segment/geographic/
+product-line concepts whose labels reference a region, segment name, or category).
+Skip Non-GAAP tables entirely.
 
 PERIOD RULE — CRITICAL when multiple period columns are present:
   Earnings statements show side-by-side columns (e.g. current quarter | year-ago
@@ -138,9 +155,26 @@ SECOND field must be "__period__":
 
 ALL OTHER fields: use EXACTLY the label strings in quotes from the concept list above.
 
-IMPORTANT — report RAW numbers, do NOT scale yourself:
-  If the table says "(In millions)" and shows "82,886" → report 82886 (NOT 82886000000).
-  EPS values and percentages are always reported as-is regardless of __scale__.
+IMPORTANT — scale handling:
+  The table caption (e.g. "(In millions)") declares the base unit. Set __scale__
+  to that unit. Python multiplies every numeric value you return by that multiplier,
+  so report the RAW table number exactly as printed — do NOT multiply yourself.
+  Example: table says "(In millions)" and shows "82,886" → report 82886.
+
+  INLINE SCALE NOTATION — some cells or column headers override the base unit:
+  • Cell suffixes: B = billions, M = millions, T = trillions, K = thousands.
+    Convert to the document base unit before reporting:
+      table is "(In millions)", cell shows "1.5B"   → report 1500
+      table is "(In billions)",  cell shows "500M"   → report 0.5
+      table is "(In millions)", cell shows "2.4T"   → report 2400000
+      table is "(In millions)", cell shows "150K"   → report 0.15
+  • Column-header scale: if a column header declares its own unit
+    (e.g. "Revenue ($B)" in a table captioned "(In millions)"), all values
+    in that column are in the header's unit — convert to the document base
+    unit before reporting.
+  • Negative values: parentheses mean negative — "(1,234)" = −1234.
+  • EPS, share prices, and percentages are always reported as-is (never
+    scaled by __scale__), regardless of the table caption.
 
 LAST field must be "__sources__" (verification / "show me"):
   A JSON object mapping EACH metric key you returned above to the EXACT
@@ -604,12 +638,24 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         norm_label_to_id: dict[str, str] = {
             _norm_label(c["label"]): c["_id"] for c in target_concepts
         }
+        # Tier-0 lookup: taxonomy_key → concept_id (for dimensional concepts
+        # where the LLM uses the taxonomy_key as the JSON key directly).
+        taxonomy_key_to_id: dict[str, str] = {
+            c["taxonomy_key"]: c["_id"]
+            for c in target_concepts
+            if c.get("taxonomy_key")
+        }
         concept_metrics = {}
         concept_id_to_metric_key: dict[str, str] = {}  # reverse map for mapped_metric_keys
         for key, value in metrics.items():
             if not isinstance(value, (int, float)):
                 continue
-            if key in exact_label_to_id:
+            if key in taxonomy_key_to_id:
+                # Tier 0: LLM returned taxonomy_key as JSON key
+                cid = taxonomy_key_to_id[key]
+                concept_metrics[cid] = float(value)
+                concept_id_to_metric_key[cid] = key
+            elif key in exact_label_to_id:
                 cid = exact_label_to_id[key]
                 concept_metrics[cid] = float(value)
                 concept_id_to_metric_key[cid] = key
@@ -673,6 +719,19 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
             c["label"] for c in target_concepts
             if c["_id"] not in concept_metrics
         )
+        # Separate segment/dimensional concepts from top-level IS concepts in
+        # the absent list so retry hints can give the LLM targeted guidance on
+        # WHERE to look (FINANCIAL DATA table vs primary income statement).
+        absent_segment_labels = [
+            c["label"] for c in target_concepts
+            if c["_id"] not in concept_metrics
+            and "|" in (c.get("taxonomy_key") or "")
+        ]
+        absent_toplevel_labels = [
+            c["label"] for c in target_concepts
+            if c["_id"] not in concept_metrics
+            and "|" not in (c.get("taxonomy_key") or "")
+        ]
 
         # Build lines: one per mapped concept, sorted by label, derived ones tagged.
         summary_lines: list[str] = []
@@ -715,4 +774,10 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         new_state["concept_metrics"] = concept_metrics
         new_state["mapped_metric_keys"] = list(concept_id_to_metric_key.values())
         new_state["derived_concept_ids"] = list(derived_concept_ids)
+        if absent_labels:
+            new_state["missing_concept_labels"] = absent_labels
+        if absent_segment_labels:
+            new_state["missing_segment_labels"] = absent_segment_labels
+        if absent_toplevel_labels:
+            new_state["missing_toplevel_labels"] = absent_toplevel_labels
     return new_state

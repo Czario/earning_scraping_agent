@@ -85,7 +85,6 @@ def _state(metrics: dict, attempts: int = 1) -> dict:
     return {
         "ticker": "TEST",
         "company_name": "Test Co.",
-        "ir_url": "",
         "discovered_file_url": None,
         "file_type": "html",
         "raw_text": "irrelevant for analyze",

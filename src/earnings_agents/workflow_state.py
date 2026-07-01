@@ -8,7 +8,6 @@ from typing_extensions import NotRequired, TypedDict
 class EarningsAgentState(TypedDict):
     ticker: str
     company_name: str
-    ir_url: str
     discovered_file_url: Optional[str]
     file_type: Optional[str]   # "pdf" | "html"
     raw_text: Optional[str]
@@ -57,6 +56,18 @@ class EarningsAgentState(TypedDict):
     # semantic match).  Populated by extract_financial_metrics_node; consumed
     # by cleanup_metrics_node as a protected set that the LLM cannot remove.
     mapped_metric_keys: NotRequired[Optional[list[str]]]
+    # Labels of target_concepts that had no value mapped after all tiers.
+    # Stored by extract_financial_metrics_node; consumed by analyze_metrics_node
+    # to generate targeted retry hints that tell the LLM exactly what to find.
+    missing_concept_labels: NotRequired[Optional[list[str]]]   # all unmapped
+    missing_segment_labels: NotRequired[Optional[list[str]]]   # dimensional (|) only
+    missing_toplevel_labels: NotRequired[Optional[list[str]]]  # non-dimensional only
+    # Labels of target_concepts that had no value mapped after all tiers.
+    # Stored by extract_financial_metrics_node; consumed by analyze_metrics_node
+    # to generate targeted retry hints that tell the LLM exactly what to find.
+    missing_concept_labels: NotRequired[Optional[list[str]]]   # all unmapped
+    missing_segment_labels: NotRequired[Optional[list[str]]]   # dimensional only
+    missing_toplevel_labels: NotRequired[Optional[list[str]]]  # non-dimensional only
     # ── SEC-derived reporting period ────────────────────────────────────────
     # ``reportDate`` from the EDGAR submissions API — the period-end date for
     # the filing as declared to the SEC ("YYYY-MM-DD" string).  Set by the

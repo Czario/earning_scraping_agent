@@ -794,7 +794,7 @@ def test_build_initial_state_skips_sec_path_without_history():
     ):
         from importlib import import_module
         mod = import_module("earnings_agents.cli.earnings")
-        state = mod._build_initial_state(info, source="sec", printer=lambda *_: None)
+        state = mod._build_initial_state(info, printer=lambda *_: None)
 
     assert state["status"] == "skipped"
     assert "no existing normalize_data period data" in state["error"]

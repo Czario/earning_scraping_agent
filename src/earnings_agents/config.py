@@ -38,17 +38,8 @@ MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")
 
-# Hard-coded IR URLs per company.
-# Only add a company here if you want to use its own IR website for discovery
-# instead of SEC EDGAR. Companies NOT listed here automatically fall back to
-# the EDGAR 8-K / Exhibit 99.1 path (works for any public US company).
-COMPANIES: dict[str, dict] = {}
-
 # Seconds before HTTP requests time out
 HTTP_TIMEOUT: int = 30
-
-# Max characters of extracted link list passed to LLM for IR discovery
-IR_PAGE_MAX_CHARS: int = 8_000
 
 EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "400000"))
 CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "400000"))

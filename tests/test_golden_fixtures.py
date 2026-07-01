@@ -54,7 +54,6 @@ def _base_state(fixture: dict[str, Any]) -> dict[str, Any]:
     return {
         "ticker": fixture["ticker"],
         "company_name": fixture["company_name"],
-        "ir_url": "https://example.com/ir",
         "discovered_file_url": "https://example.com/earnings.html",
         "file_type": "html",
         "raw_text": fixture["raw_text"],
