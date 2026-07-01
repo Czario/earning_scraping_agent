@@ -49,6 +49,23 @@ logger = logging.getLogger(__name__)
 
 _R = lambda s: re.compile(s, re.IGNORECASE)  # noqa: E731
 
+# ── Exclusion guard ───────────────────────────────────────────────────────────
+# Labels that match any of these patterns should NEVER be assigned a P&L role,
+# even if they incidentally contain a P&L keyword.
+#
+# Examples of false-positive matches without this guard:
+#   • "Pre-tax restructuring charges"  →  would claim  pretax_income  role
+#   • "OCI, Reclassification Adjustment … Included in Net Income, Net of Tax"
+#                                       →  would claim  net_income  role
+_ROLE_EXCLUSION_RX = _R(
+    r"comprehensive\s+(?:income|loss)"
+    r"|reclassification\s+adjust"
+    r"|accumulated\s+other\s+comprehensive"
+    r"|restructuring\s+charges?"
+    r"|included\s+in\s+net\s+income"
+    r"|other\s+comprehensive\s+income"
+)
+
 # ── Role patterns ─────────────────────────────────────────────────────────────
 # List order matters: first match wins when a label could satisfy multiple roles.
 # More-specific patterns are listed before broad catch-alls.
@@ -63,7 +80,7 @@ _ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("interest_income",      _R(r"^interest\s+(?:and\s+other\s+)?income")),
     ("interest_expense",     _R(r"interest\s+expense")),
     ("other_income_net",     _R(r"other\s+(?:income|expense)|non.?operating\s+income")),
-    ("pretax_income",        _R(r"income\s+before\s+(?:income\s+)?tax|pre.?tax")),
+    ("pretax_income",        _R(r"income\s+before\s+(?:income\s+)?tax|pre.?tax\s+income")),
     ("tax_expense",          _R(r"income\s+tax\s+(?:expense|provision)|provision\s+for\s+(?:income\s+)?tax")),
     # EPS patterns must appear before net_income — "Diluted net income per share"
     # contains "net income" but should map to eps_diluted, not net_income.
@@ -82,6 +99,8 @@ _ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
 
 def _identify_role(label: str) -> str | None:
     """Return the first matching semantic role for *label*, or ``None``."""
+    if _ROLE_EXCLUSION_RX.search(label):
+        return None
     for role, pattern in _ROLE_PATTERNS:
         if pattern.search(label):
             return role

@@ -204,7 +204,27 @@ def _classify_table(table_text: str, context_text: str) -> str:
     # ── 2. Full-probe non-GAAP ────────────────────────────────────────────────
     full_probe = context_text + " " + table_text
     if _NON_GAAP_TABLE_RX.search(full_probe):
-        return "non_gaap"
+        # Guard: a GAAP segment revenue table often carries a footnote cell such
+        # as "* Currency-neutral revenues are a non-GAAP measure."  That line
+        # refers only to a percentage column — the dollar values are all GAAP.
+        # When the full probe contains BOTH a non-GAAP keyword AND a segment
+        # pattern, AND the context heading itself does NOT advertise non-GAAP
+        # content, the table is a GAAP segment table with a footnote disclaimer.
+        # Fall through to the GAAP/segment checks below rather than suppressing
+        # the whole table.
+        #
+        # This handles the common case where the "(1) Revenues by reportable
+        # segment" note is a row inside the preceding IS table (and disappears
+        # when that table is decomposed), leaving the segment table with an
+        # empty context — so step 1 above cannot fire — while the body still
+        # contains the currency-neutral footnote row.
+        if not (_SEGMENT_TABLE_RX.search(full_probe) and not _NON_GAAP_TABLE_RX.search(context_text)):
+            return "non_gaap"
+        logger.debug(
+            "Table has non-GAAP footnote but also segment keywords — "
+            "treating as GAAP segment table (context=%r...)",
+            context_text[:120],
+        )
 
     # ── 3. Short-probe GAAP statement checks ─────────────────────────────────
     short_probe = context_text[-600:] + " " + table_text[:600]
@@ -217,6 +237,12 @@ def _classify_table(table_text: str, context_text: str) -> str:
 
     # ── 4. Short-probe segment fallback ──────────────────────────────────────
     if _SEGMENT_TABLE_RX.search(short_probe):
+        return "segment"
+
+    # ── 5. Full-probe segment fallback ───────────────────────────────────────
+    # Catches tables where the segment heading appears deeper in the body
+    # (e.g. after a "(Dollars in millions)" caption row).
+    if _SEGMENT_TABLE_RX.search(full_probe):
         return "segment"
 
     return "other"
@@ -377,6 +403,12 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
             context = _get_table_context(table)
             table_text = table.get_text(" ", strip=True)
             ttype = _classify_table(table_text, context)
+            logger.debug(
+                "Table classified as %r — context=%r... body_start=%r...",
+                ttype,
+                context[:100],
+                table_text[:100],
+            )
             md = _table_to_markdown(table)
             entry = (f"{context}\n" if context.strip() else "") + md
             # Re-attach a scale caption to GAAP statements whose own text says
