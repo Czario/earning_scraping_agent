@@ -1,14 +1,14 @@
 """Redis consumer: process 8-K filings published by admin_backend.
 
-Listens to the shared Redis queue, filters for ``filing_type == "8-K"``
-messages, and runs the **exact same pipeline** as ``uv run earnings --ticker X``.
+Listens to the **dedicated** ``sec:filings:8k`` queue (set via
+``REDIS_QUEUE_NAME`` env var, default ``sec:filings:8k``).
+admin_backend publishes 8-K messages here and 10-K/10-Q messages to a
+separate queue consumed by the filings-extractor worker.  Each worker
+only ever sees its own messages — no re-queue loops.
 
-The only difference from the CLI is the trigger source:
+Pipeline mirrors ``uv run earnings --ticker X`` exactly:
   CLI    → ticker arg → EDGAR lookup → Exhibit 99.1 → pipeline
   Worker → Redis msg  → accession  → Exhibit 99.1 → pipeline
-
-Messages for other filing types (10-K, 10-Q) are re-queued so the
-filings-extractor worker can consume them.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from earnings_agents.cli.earnings import (
     _has_existing_period_data,
     _is_period_already_stored,
 )
-from earnings_agents.config import REDIS_QUEUE_NAME, REDIS_URL
+from earnings_agents.config import REDIS_URL
 from earnings_agents.tools.edgar_client import _find_exhibit_99_in_index, normalize_cik
 from earnings_agents.tools.redis_queue import get_redis_client, serialize_message
 from earnings_agents.workflow import build_graph
@@ -38,9 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# These form types belong to the filings-extractor worker. Re-queue them so
-# they are not lost when both workers share the same queue name.
-_REQUEUE_TYPES = frozenset({"10-K", "10-Q", "10-K/A", "10-Q/A"})
+# Dedicated queue — admin_backend publishes 8-K messages here only.
+# 10-K/10-Q go to sec:filings:10kq consumed by the filings-extractor worker.
+_DEFAULT_QUEUE = "sec:filings:8k"
 
 
 # ── MongoDB helper ─────────────────────────────────────────────────────────────
@@ -168,7 +168,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Consume 8-K filing jobs from Redis and run the earnings extraction pipeline.",
     )
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", REDIS_URL))
-    parser.add_argument("--queue-name", default=os.getenv("REDIS_QUEUE_NAME", REDIS_QUEUE_NAME))
+    parser.add_argument("--queue-name", default=os.getenv("REDIS_QUEUE_NAME", _DEFAULT_QUEUE))
     parser.add_argument("--dead-letter-queue", default=os.getenv("REDIS_DEAD_LETTER_QUEUE", "sec:filings:dlq:8k"))
     parser.add_argument("--poll-timeout", type=int, default=5,
                         help="Seconds to block-wait for a Redis message.")
@@ -216,16 +216,10 @@ def main(argv: list[str] | None = None) -> None:
 
         form_type = (payload.get("filing_type") or payload.get("form_type") or "").upper()
 
-        # Re-queue 10-K/10-Q messages for the filings-extractor worker
-        if form_type in _REQUEUE_TYPES:
-            logger.debug("Re-queuing %s message (handled by filings-extractor)", form_type)
-            client.rpush(queue_name, raw_message)
-            if args.once:
-                break
-            continue
-
         if form_type != "8-K":
-            logger.debug("Ignoring unknown filing type %r", form_type)
+            # Dedicated queue: only 8-K messages should arrive here.
+            # Log and skip anything unexpected without re-queuing.
+            logger.warning("Unexpected form_type %r on 8-K queue — skipping", form_type)
             if args.once:
                 break
             continue
