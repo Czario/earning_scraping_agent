@@ -38,6 +38,10 @@ MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")
 
+# Redis queue settings (used by the 8-K worker).
+REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_QUEUE_NAME: str = os.getenv("REDIS_QUEUE_NAME", "sec:filings")
+
 # Seconds before HTTP requests time out
 HTTP_TIMEOUT: int = 30
 

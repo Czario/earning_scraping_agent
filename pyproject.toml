@@ -19,6 +19,7 @@ dependencies = [
     "lxml>=5.2.0",
     "rich>=13.0.0",
     "diskcache>=5.6.3",
+    "redis>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +34,7 @@ earnings-run-once = "earnings_agents.cli.earnings:main"
 earnings = "earnings_agents.cli.earnings:main"
 earnings-failures = "earnings_agents.cli.failures:main"
 earnings-skills = "earnings_agents.cli.skills:main"
+earnings-8k-worker = "earnings_agents.cli.worker_8k:main"
 
 [build-system]
 requires = ["hatchling"]
