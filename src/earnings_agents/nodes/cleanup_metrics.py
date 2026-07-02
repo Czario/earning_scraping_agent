@@ -19,7 +19,7 @@ import logging
 import re
 from typing import Any
 
-from earnings_agents.config import CLEANUP_METRICS
+from earnings_agents.config import CLEANUP_METRICS, LLM_PROVIDER as _LLM_PROVIDER
 from earnings_agents.llm_factory import build_llm
 from earnings_agents.analysis.validators import validate_metrics
 from earnings_agents.workflow_state import EarningsAgentState
@@ -317,10 +317,13 @@ def cleanup_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
     prompt = _build_prompt(metrics)
     try:
+        from earnings_agents.hooks import report_call
+        report_call(f"  [llm]  cleanup  → calling llm  ({_LLM_PROVIDER or 'llm'})")
         llm = build_llm(format_json=True, request_timeout=60)
         response: str = llm.invoke(prompt)
     except Exception as exc:  # noqa: BLE001 — best-effort cleanup
         logger.warning("Cleanup LLM call failed for %s: %s — keeping metrics", ticker, exc)
+        report_call(f"  cleanup  ✗  {exc}")
         return _finalize(state, metrics, [])
 
     parsed = _parse_response(response)
@@ -361,9 +364,13 @@ def cleanup_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     if protected_keys:
         concept_blocked = [k for k in remove if k in protected_keys]
         if concept_blocked:
-            logger.warning(
-                "Cleanup LLM tried to remove concept-mapped key(s) for %s — blocked: %s",
-                ticker, concept_blocked,
+            logger.info(
+                "Cleanup guardrail: blocked removal of %d concept-mapped key(s) for %s: %s",
+                len(concept_blocked), ticker, concept_blocked,
+            )
+            report_call(
+                f"  [guardrail]  blocked {len(concept_blocked)} concept-mapped removal(s)"
+                f"  — {', '.join(concept_blocked)}"
             )
             remove = [k for k in remove if k not in protected_keys]
 

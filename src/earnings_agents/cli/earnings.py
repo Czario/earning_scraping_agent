@@ -53,12 +53,24 @@ SEP = "=" * 64
 
 _logger = logging.getLogger(__name__)
 
+
+def _fmt_dur(ms: float) -> str:
+    """Format a millisecond duration as a human-readable string.
+
+    Examples: 450 ms → "0.5s", 5300 ms → "5.3s", 196200 ms → "3m 16s".
+    """
+    s = ms / 1000
+    if s < 60:
+        return f"{s:.1f}s"
+    m = int(s // 60)
+    return f"{m}m {s - m * 60:.0f}s"
+
+
 # Human-readable stage names for the rich progress description
 _NODE_LABELS: dict[str, str] = {
     "load_company_concepts_node":     "load concepts",
     "detect_document_type_node":      "detect type",
     "extract_html_text_node":         "fetch text",
-    "extract_pdf_text_node":          "fetch pdf",
     "extract_financial_metrics_node": "extract metrics",
     "analyze_metrics_node":           "analyse",
     "cleanup_metrics_node":           "cleanup",
@@ -89,21 +101,19 @@ def _format_step_line(node_name: str, state: dict) -> str | None:
             reason = (state.get("error") or "no concepts")[:70]
             return f"  [load concepts]  skipped — {reason}"
         n = len(state.get("target_concepts") or [])
-        nc = len(state.get("calculated_concepts") or [])
         pt = state.get("detected_period_type") or "quarterly"
-        return f"  [load concepts]  {n} concepts  ({nc} calculated,  {pt})"
+        return f"  [load concepts]  {n} concepts  ({pt})"
 
     if node_name == "detect_document_type_node":
         if state.get("status") == "failed":
             return f"  [detect type]    failed — {(state.get('error') or '')[:60]}"
         return f"  [detect type]    {state.get('file_type') or '?'}"
 
-    if node_name in ("extract_html_text_node", "extract_pdf_text_node"):
-        label = "fetch pdf " if "pdf" in node_name else "fetch text"
+    if node_name == "extract_html_text_node":
         if state.get("status") == "failed":
-            return f"  [{label}]    failed"
+            return "  [fetch text]    failed"
         n = len(state.get("raw_text") or "")
-        return f"  [{label}]     {n:,} chars"
+        return f"  [fetch text]     {n:,} chars"
 
     if node_name == "extract_financial_metrics_node":
         attempt = state.get("extraction_attempts", 1)
@@ -641,6 +651,7 @@ def _run_company_parallel(args: tuple) -> dict:
     _current_detail: list[str] = [""]
     _extract_pass: list[int] = [0]  # counts how many extraction passes have started
     _last_chunk_done: list[int] = [0]  # tracks last printed chunk-done count per pass
+    _llm_calls: list[int] = [0]  # total LLM API requests fired this run
 
     def _render() -> str:
         """Build a terminal-width-aware progress description.
@@ -692,7 +703,7 @@ def _run_company_parallel(args: tuple) -> dict:
         count_markup = f"[green]({n}\u2713)[/]  " if n > 0 else ""
         return f"{label}  {count_markup}[bold]\u2192 {active_trunc}[/]"
 
-    def _node_cb(node_name: str, event: str, _ticker: str, node_state=None) -> None:
+    def _node_cb(node_name: str, event: str, _ticker: str, node_state=None, elapsed_ms: float | None = None) -> None:
         stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
         if event == "start":
             if node_name == "extract_financial_metrics_node":
@@ -703,6 +714,8 @@ def _run_company_parallel(args: tuple) -> dict:
             _current_stage[0] = stage
             _current_detail[0] = ""
             progress.update(company_task, description=_render())
+            from rich.markup import escape as _escape
+            progress.console.print(f"[dim]{name}[/]  [bold cyan]▶ {_escape(stage)}[/]")
         elif event == "end":
             finished = _current_stage[0]  # may be "re-extract #2" etc.
             if finished not in _completed:
@@ -714,9 +727,11 @@ def _run_company_parallel(args: tuple) -> dict:
                 line = _format_step_line(node_name, node_state)
                 if line:
                     from rich.markup import escape as _escape
-                    # Prefix every line (multi-line for extract/analyze) with the ticker name.
-                    for part in line.split("\n"):
-                        progress.console.print(f"[dim]{name}[/]" + _escape(part))
+                    dur = f"  [dim]{_fmt_dur(elapsed_ms)}[/]" if elapsed_ms is not None else ""
+                    parts = line.split("\n")
+                    for i, part in enumerate(parts):
+                        suffix = dur if i == len(parts) - 1 else ""
+                        progress.console.print(f"[dim]{name}[/]{_escape(part)}{suffix}")
 
     def _detail_cb(detail: str) -> None:
         _current_detail[0] = detail
@@ -734,21 +749,38 @@ def _run_company_parallel(args: tuple) -> dict:
                     from rich.markup import escape as _escape
                     pass_label = f"re-extract #{_extract_pass[0]}" if _extract_pass[0] > 1 else "extract"
                     progress.console.print(
-                        f"[dim]{name}[/]  [{pass_label}]  chunk {done}/{total}  "
+                        f"[dim]{name}[/]  {_escape(f'[{pass_label}]')}  chunk {done}/{total}  "
                         + _escape(detail.split("(")[0].strip())
                     )
 
+    def _call_cb(msg: str) -> None:
+        from rich.markup import escape as _escape
+        esc_msg = _escape(msg)
+        # Highlight LLM-related messages (direct calls and LLM-triggered steps)
+        # distinctly so they stand out from DB/HTTP operational messages.
+        is_llm = " [llm]" in msg or ("llm" in msg.lower() and "\u2192" in msg)
+        if is_llm:
+            if "\u2192 calling llm" in msg:
+                _llm_calls[0] += 1
+            progress.console.print(f"[dim]{name}[/][bold yellow]{esc_msg}[/]")
+        else:
+            progress.console.print(f"[dim]{name}[/]{esc_msg}")
+
     set_node_callback(_node_cb)
     set_detail_callback(_detail_cb)
+    from earnings_agents.hooks import set_call_callback
+    set_call_callback(_call_cb)
     result = _run_company(graph, info, printer=lambda _: None)
     set_node_callback(None)
     set_detail_callback(None)
+    set_call_callback(None)
 
     status = result.get("status", "?")
+    llm_tag = f"  [dim]({_llm_calls[0]} LLM calls)[/]" if _llm_calls[0] else ""
     if status == "saved":
-        desc = f"[green]{name}[/]  saved \u2713"
+        desc = f"[green]{name}[/]  saved \u2713{llm_tag}"
     elif status == "failed":
-        desc = f"[red]{name}[/]  failed \u2717"
+        desc = f"[red]{name}[/]  failed \u2717{llm_tag}"
     elif status == "already_stored":
         desc = f"[cyan]{name}[/]  already up to date \u2713"
     else:

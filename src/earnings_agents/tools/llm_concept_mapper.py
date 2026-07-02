@@ -106,3 +106,81 @@ def llm_map_concepts(
         result[concept_id] = matched_key
         used_keys.add(matched_key)
     return result
+
+
+_LLM_ROLE_PROMPT = """\
+You are a financial metric role classifier.
+
+Map each label below to the closest standard financial metric role.
+Only assign a role when you are confident — return null if unsure.
+
+Known roles and their meaning:
+  revenue              — total net revenue or sales
+  cost_of_revenue      — cost of goods/products/services sold
+  gross_profit         — gross profit (revenue minus cost of revenue)
+  rd_expense           — research and development expense
+  sm_expense           — sales and marketing expense
+  ga_expense           — general and administrative expense
+  total_opex           — total operating expenses or costs
+  operating_income     — income/profit/loss from operations
+  interest_income      — interest and other income
+  interest_expense     — interest expense
+  other_income_net     — other non-operating income or expense (net)
+  pretax_income        — income before income taxes
+  tax_expense          — income tax expense / provision for taxes
+  net_income           — net income, net earnings, or net loss
+  eps_basic            — basic earnings per share
+  eps_diluted          — diluted earnings per share
+  shares_basic         — basic weighted-average shares outstanding
+  shares_diluted       — diluted weighted-average shares outstanding
+  gross_margin_pct     — gross profit margin percentage
+  operating_margin_pct — operating income margin percentage
+  net_margin_pct       — net income margin percentage
+
+Labels to classify:
+{labels_block}
+
+Return ONLY a JSON object mapping each label to its role (or null):
+{{"<label>": "<role_or_null>", ...}}
+"""
+
+
+def llm_identify_roles(
+    labels: list[str],
+    llm: Any,
+    known_roles: frozenset[str],
+) -> dict[str, str]:
+    """Ask the LLM to map *labels* to known financial metric roles.
+
+    Returns a dict of ``label -> role`` for confident matches only.
+    Roles not in *known_roles* are rejected as hallucinations.
+    """
+    if not labels:
+        return {}
+
+    labels_block = "\n".join(f'  - "{lbl}"' for lbl in labels)
+    prompt = _LLM_ROLE_PROMPT.format(labels_block=labels_block)
+    try:
+        raw = llm.invoke(prompt)
+        if hasattr(raw, "content"):
+            raw = raw.content
+        raw = str(raw).strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        mapping: dict = _json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("llm_identify_roles: LLM call failed: %s", exc)
+        return {}
+
+    result: dict[str, str] = {}
+    for label, role in mapping.items():
+        if not isinstance(role, str):
+            continue
+        if role not in known_roles:
+            logger.debug(
+                "llm_identify_roles: ignoring unknown role %r for label %r",
+                role, label,
+            )
+            continue
+        result[label] = role
+    return result

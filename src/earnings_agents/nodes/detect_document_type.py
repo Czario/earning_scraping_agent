@@ -2,41 +2,20 @@ from __future__ import annotations
 
 import logging
 
-import requests
-
-from earnings_agents.tools.http_client import head as _http_head
 from earnings_agents.workflow_state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
 
-_PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/x-pdf"})
-
 
 def detect_document_type_node(state: EarningsAgentState) -> EarningsAgentState:
-    """Detect the file type of the discovered earnings document.
+    """Confirm the discovered earnings document is an HTML file.
 
-    Uses the URL extension first; if ambiguous, sends a HEAD request to inspect
-    the Content-Type header.
+    SEC 8-K press releases are always served as HTML. This node sets
+    ``file_type='html'`` and advances ``status`` to ``'fetched'``.
     """
     url = state.get("discovered_file_url", "")
     if not url:
         return {**state, "status": "failed", "error": "No file URL to fetch"}
 
-    # Fast path: extension-based detection
-    path = url.split("?")[0].lower()
-    if path.endswith(".pdf"):
-        logger.info("File type (extension): pdf — %s", url)
-        return {**state, "file_type": "pdf", "status": "fetched"}
-    if path.endswith((".htm", ".html")):
-        logger.info("File type (extension): html — %s", url)
-        return {**state, "file_type": "html", "status": "fetched"}
-
-    # Fallback: HEAD request
-    try:
-        response = _http_head(url)
-        content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
-        file_type = "pdf" if content_type in _PDF_CONTENT_TYPES else "html"
-        logger.info("File type (Content-Type %s): %s — %s", content_type, file_type, url)
-        return {**state, "file_type": file_type, "status": "fetched"}
-    except requests.RequestException as exc:
-        return {**state, "status": "failed", "error": f"File type detection failed: {exc}"}
+    logger.info("File type: html — %s", url)
+    return {**state, "file_type": "html", "status": "fetched"}

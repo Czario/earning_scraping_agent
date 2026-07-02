@@ -146,7 +146,7 @@ def _chunk_text(text: str, chunk_size: int = _CHUNK_SIZE, overlap: int = _CHUNK_
 def _section_of_chunk(chunk_text: str) -> str:
     """Recover the section key from a chunk's ``=== LABEL ===`` header.
 
-    Returns ``"unknown"`` for char-split / PDF chunks that carry no header.
+    Returns ``"unknown"`` for char-split chunks that carry no header.
     """
     if not chunk_text.startswith("=== "):
         return "unknown"

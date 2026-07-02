@@ -133,7 +133,7 @@ def test_first_attempt_runs_all_section_chunks(mock_llm_cls):
     """
     mock_llm = MagicMock()
     mock_llm.invoke.side_effect = [
-        '{"Revenues": 1000000000, "Operating expenses": 250000000}',
+        '{"Revenues": 1000000000, "Total operating expenses": 250000000}',
     ]
     mock_llm_cls.return_value = mock_llm
 
@@ -144,7 +144,7 @@ def test_first_attempt_runs_all_section_chunks(mock_llm_cls):
                 {"_id": "c_rev", "concept": "us-gaap:Revenues",
                  "label": "Revenues", "statement_type": "income_statement"},
                 {"_id": "c_opex", "concept": "us-gaap:OperatingExpenses",
-                 "label": "Operating expenses", "statement_type": "income_statement"},
+                 "label": "Total operating expenses", "statement_type": "income_statement"},
             ],
             raw_sections={
                 "income_statement": ["income table"],
@@ -160,7 +160,7 @@ def test_first_attempt_runs_all_section_chunks(mock_llm_cls):
     # With CHUNK_SIZE large enough for both sections → 1 LLM call.
     assert mock_llm.invoke.call_count == 1
     assert result["metrics"]["Revenues"] == pytest.approx(1_000_000_000)
-    assert result["metrics"]["Operating expenses"] == pytest.approx(250_000_000)
+    assert result["metrics"]["Total operating expenses"] == pytest.approx(250_000_000)
 
 
 @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")

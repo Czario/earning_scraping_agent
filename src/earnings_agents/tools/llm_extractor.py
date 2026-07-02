@@ -18,8 +18,9 @@ from typing import Any, Callable
 from earnings_agents.config import (
     GROQ_REQUEST_TIMEOUT,
     OLLAMA_CONCURRENCY,
+    LLM_PROVIDER as _LLM_PROVIDER,
 )
-from earnings_agents.hooks import report_detail, set_detail_callback
+from earnings_agents.hooks import report_detail, report_call, set_detail_callback
 from earnings_agents.llm_factory import build_llm
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ def invoke_chunk_with_retry(
             # Throttle concurrent local Ollama calls via semaphore.
             # Skip for Groq (cloud API with its own rate limiting).
             _ctx = _OLLAMA_SEMAPHORE if provider != "groq" else _nullcontext()
+            report_call(f"  [llm]  chunk {chunk_num}/{total_chunks}  attempt {attempt + 1}  → calling llm  ({provider or _LLM_PROVIDER or 'llm'})")
             with _ctx:
                 response: str = llm.invoke(prefix + prompt)
             logger.debug(
@@ -123,14 +125,18 @@ def invoke_chunk_with_retry(
             )
             parsed = parse_fn(response)
             if parsed is not None:
+                n_keys = len([k for k in parsed if not k.startswith("__")])
+                report_call(f"  chunk {chunk_num}/{total_chunks}  ✓  {n_keys} keys parsed")
                 if report_chunk is not None:
                     report_chunk(chunk_num - 1, "done", attempt + 1)
                 return parsed
+            report_call(f"  chunk {chunk_num}/{total_chunks}  ✗  unparseable response")
             logger.warning(
                 "Chunk %d/%d attempt %d returned unparseable response for %s",
                 chunk_num, total_chunks, attempt + 1, ticker,
             )
         except Exception as exc:  # noqa: BLE001
+            report_call(f"  chunk {chunk_num}/{total_chunks}  ✗  {exc}")
             logger.warning(
                 "Chunk %d/%d attempt %d failed for %s: %s",
                 chunk_num, total_chunks, attempt + 1, ticker, exc,

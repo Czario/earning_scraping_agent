@@ -69,6 +69,60 @@ _CASH_FLOW_TABLE_RX = re.compile(
     re.I,
 )
 
+# ── Deterministic "drop" patterns for 'other' tables ────────────────────────
+# These catch the common junk categories the LLM batch filter decides on, so
+# tables matching any of these are dropped without an LLM call.
+# Only the clearly junk categories are listed — anything ambiguous is left to
+# the LLM fallback (accuracy is never sacrificed for speed).
+
+# Contact / IR info blocks: email addresses, US phone formats, IR keywords.
+_CONTACT_BLOCK_RX = re.compile(
+    r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"   # email
+    r"|\(\d{3}\)\s*\d{3}[\-.\s]\d{4}"                           # (xxx) xxx-xxxx
+    r"|\b\d{3}[\-.\s]\d{3}[\-.\s]\d{4}\b"                       # xxx-xxx-xxxx
+    r"|investor\s+relations"
+    r"|media\s+contact"
+    r"|press\s+(?:contact|release\s+contact)",
+    re.I,
+)
+
+# Footnote annotation tables: >30 % of non-empty rows begin with a lettered /
+# numbered / symbol footnote marker.  Checked in Python (count-based) rather
+# than a single regex so short tables with one real row aren't misclassified.
+_FOOTNOTE_MARKER_RX = re.compile(
+    r"^\s*(?:\([A-Za-z]\)|\([0-9]+\)|\*{1,3}|†|‡|\d+\))\s",
+    re.MULTILINE,
+)
+
+# Stock-based / share-based compensation disclosure tables.
+_STOCK_COMP_RX = re.compile(
+    r"stock[- ]based\s+compensation\s+(?:included\s+in|expense\s+by|by\s+)"
+    r"|share[- ]based\s+(?:compensation|payment)\s+(?:included|expense\s+by)",
+    re.I,
+)
+
+# Guidance / outlook / forecast tables.
+# Uses anchored phrases to avoid false matches on period headers like
+# "Fiscal Year Ended" or narrative like "we expect revenue to grow".
+_GUIDANCE_RX = re.compile(
+    r"\bguidance\b"
+    r"|\boutlook\b"
+    r"|\bfull[- ]year\s+(?:guidance|outlook|target|expectation|range)\b"
+    r"|\bfiscal\s+20\d\d\s+(?:guidance|outlook|target|expectation)\b"
+    r"|\bq[1-4]\s+20\d\d\s+(?:guidance|outlook|target)\b",
+    re.I,
+)
+
+
+def _is_footnote_table(table_text: str) -> bool:
+    """Return True when the majority of non-empty rows are footnote annotations."""
+    lines = [l for l in table_text.splitlines() if l.strip()]
+    if not lines:
+        return False
+    marker_count = sum(1 for l in lines if _FOOTNOTE_MARKER_RX.match(l))
+    return marker_count / len(lines) >= 0.30
+
+
 # Positively identifies supplementary GAAP revenue-detail tables:
 # revenue by segment, geography, product line, business unit, etc.
 #
@@ -245,6 +299,19 @@ def _classify_table(table_text: str, context_text: str) -> str:
     if _SEGMENT_TABLE_RX.search(full_probe):
         return "segment"
 
+    # ── 6. Deterministic drop patterns ───────────────────────────────────────
+    # Catch well-known junk categories without an LLM call.  Only patterns
+    # that are unambiguous are listed here — anything uncertain stays as
+    # "other" and is handled by the LLM batch filter.
+    if _CONTACT_BLOCK_RX.search(full_probe):
+        return "drop"
+    if _STOCK_COMP_RX.search(full_probe):
+        return "drop"
+    if _GUIDANCE_RX.search(context_text):
+        return "drop"
+    if _is_footnote_table(table_text):
+        return "drop"
+
     return "other"
 
 
@@ -345,7 +412,9 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
     ticker = state["ticker"]
 
     try:
+        from earnings_agents.hooks import report_call
         is_sec = "sec.gov" in url
+        report_call(f"  [http]  GET {url[:80]}")
         response = _http_get(url, sec=is_sec)
         html = response.text
 
@@ -357,6 +426,7 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
             quick_text = BeautifulSoup(html, "lxml").get_text(strip=True)
             if len(quick_text) < _MIN_CONTENT_CHARS:
                 logger.info("Static HTML appears JS-rendered for %s — trying Playwright", url)
+                report_call(f"  [playwright]  JS render  {url[:80]}")
                 html = fetch_page_js(url)
 
         soup = BeautifulSoup(html, "lxml")
@@ -424,6 +494,11 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                     entry = f"(in {table_scale})\n{entry}"
             if ttype == "other":
                 _other_pending.append((entry, table_text, context))
+            elif ttype == "drop":
+                logger.debug(
+                    "Table deterministically dropped (regex) — context=%r...",
+                    context[:80],
+                )
             elif ttype == "segment":
                 # Segment/geographic/product revenue tables — always keep;
                 # bypass the LLM batch filter and place directly into "other"
@@ -443,6 +518,8 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
 
         # Batch-classify all 'other' tables in a single LLM call.
         if _other_pending:
+            from earnings_agents.config import LLM_PROVIDER as _LLM_PROVIDER
+            report_call(f"  [llm]  classify {len(_other_pending)} 'other' table(s)  → calling llm  ({_LLM_PROVIDER or 'llm'})")
             llm = build_llm(format_json=True)
             candidates = [(t, c) for _, t, c in _other_pending]
             keep_flags = _llm_classify_other_batch(candidates, llm)

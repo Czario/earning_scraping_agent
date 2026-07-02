@@ -310,6 +310,8 @@ def extract_financial_metrics_node(state: EarningsAgentState) -> EarningsAgentSt
     # the same provider. (Escalation was removed because an unfixable identity
     # violation forced 3 passes onto Groq's free tier and triggered 429s.)
     escalated_provider: str | None = None
+    from earnings_agents.config import LLM_PROVIDER as _LLM_PROVIDER
+    _display_provider: str = _LLM_PROVIDER or "llm"
 
     # Pre-scan the full document once for scale and reporting period.
     # Injecting confirmed values into every chunk prompt eliminates the most
@@ -376,9 +378,10 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         chunk_source = "char"
     total = len(chunks)
     # Section provenance per chunk (parallel to `chunks`). Section chunks carry
-    # a `=== LABEL ===` header identifying their GAAP statement; char/PDF chunks
-    # are "unknown". Threaded into `_merge_metrics` so income-statement values
-    # are never averaged with the same key leaking from a supplementary table.
+    # a `=== LABEL ===` header identifying their GAAP statement; plain char
+    # chunks (fallback) are "unknown". Threaded into `_merge_metrics` so
+    # income-statement values are never averaged with the same key leaking from
+    # a supplementary table.
     chunk_sections_all = (
         [_section_of_chunk(c) for c in chunks]
         if chunk_source == "section"
@@ -674,6 +677,11 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 "— running LLM semantic mapping",
                 len(unmapped_concepts), ticker,
             )
+            from earnings_agents.hooks import report_call
+            report_call(
+                f"  [tier2]  {len(unmapped_concepts)} unmapped concept(s)"
+                f"  → calling llm  ({_display_provider})"
+            )
             map_timeout = _request_timeout_for(escalated_provider)
             map_llm = build_llm(format_json=True, request_timeout=map_timeout, provider=escalated_provider)
             llm_matches = _llm_map_concepts(
@@ -691,30 +699,92 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                         "LLM semantic mapping: %r → concept_id %s for %s",
                         matched_key, concept_id, ticker,
                     )
+            report_call(
+                f"  [tier2]  ✓ mapped {len(llm_matches)}/{len(unmapped_concepts)} concept(s)"
+            )
 
-        # ── Tier 3: Derive calculated/system concepts ────────────────────────
-        # For concepts that have ``calculated: True`` or a ``system:`` prefix
-        # (loaded by load_company_concepts_node into state["calculated_concepts"]),
-        # try to compute values from the already-mapped concept_metrics using
-        # standard income-statement arithmetic identities.  Also fills in any
-        # regular target_concepts still unmapped if their value can be derived.
-        calculated_concepts: list = state.get("calculated_concepts") or []  # type: ignore[assignment]
+        # ── Tier 3: Derive any unmapped concept whose value can be computed ─────
+        # Run derivation for ALL concepts that still lack a value — including
+        # system/calculated ones now folded into target_concepts.  The engine
+        # is a fast no-op when nothing is unmapped, so we always invoke it.
         derived_concept_ids: set[str] = set()
-        if calculated_concepts or (target_concepts and len(concept_metrics) < len(target_concepts)):
-            from earnings_agents.analysis.calculators import derive_missing_concept_metrics
-            all_for_derivation = (target_concepts or []) + calculated_concepts
+        all_for_derivation = target_concepts or []
+        if all_for_derivation:
+            from earnings_agents.analysis.calculators import (
+                derive_missing_concept_metrics,
+                identify_role,
+                ALL_ROLES,
+            )
+            from earnings_agents.tools.llm_concept_mapper import llm_identify_roles
+            from earnings_agents.hooks import report_call
+
+            # LLM role identification for concepts whose labels are not matched
+            # by the regex patterns — e.g. "GP" or "Net Sales" used as Revenue.
+            # Covers both mapped operand concepts and unmapped target concepts.
+            role_overrides: dict[str, str] = {}
+            unrecognized = [
+                c for c in all_for_derivation
+                if identify_role(c.get("label", "")) is None
+            ]
+            if unrecognized:
+                unrecognized_labels = [c.get("label", "") for c in unrecognized]
+                report_call(
+                    f"  [roles]  {len(unrecognized)} unrecognized label(s)"
+                    f"  ({', '.join(unrecognized_labels[:4])}{'…' if len(unrecognized_labels) > 4 else ''})"
+                    f"  → calling llm  ({_display_provider})"
+                )
+                role_timeout = _request_timeout_for(escalated_provider)
+                role_llm = build_llm(
+                    format_json=True,
+                    request_timeout=role_timeout,
+                    provider=escalated_provider,
+                )
+                label_to_role = llm_identify_roles(
+                    unrecognized_labels,
+                    role_llm,
+                    ALL_ROLES,
+                )
+                for c in unrecognized:
+                    role = label_to_role.get(c.get("label", ""))
+                    if role:
+                        role_overrides[c["_id"]] = role
+                        logger.info(
+                            "LLM role identification: '%s' → '%s' (concept_id %s) for %s",
+                            c.get("label", ""), role, c["_id"], ticker,
+                        )
+                if role_overrides:
+                    mapped_roles = [
+                        f"'{c.get('label', '')}' → {role_overrides[c['_id']]}"
+                        for c in unrecognized if c["_id"] in role_overrides
+                    ]
+                    report_call(f"  [roles]  ✓ {', '.join(mapped_roles)}")
+                else:
+                    report_call(f"  [roles]  no roles identified")
+
             before_derivation_ids = set(concept_metrics.keys())
-            concept_metrics = derive_missing_concept_metrics(concept_metrics, all_for_derivation)
+            concept_metrics = derive_missing_concept_metrics(
+                concept_metrics, all_for_derivation, role_overrides=role_overrides,
+            )
             derived_concept_ids = set(concept_metrics.keys()) - before_derivation_ids
+            id_to_label_derive = {c["_id"]: c.get("label", c["_id"]) for c in all_for_derivation}
+            if derived_concept_ids:
+                derived_labels = [id_to_label_derive.get(cid, cid) for cid in derived_concept_ids]
+                report_call(
+                    f"  [derive]  ✓ {len(derived_concept_ids)} value(s) computed:"
+                    f"  {', '.join(derived_labels)}"
+                )
+            else:
+                still_unmapped = [c for c in all_for_derivation if c["_id"] not in concept_metrics]
+                report_call(
+                    f"  [derive]  0 values computed"
+                    f"  ({len(still_unmapped)} concept(s) still unmapped)"
+                )
 
         # ── Final summary table ──────────────────────────────────────────────
-        # Build a single id→label lookup covering both regular and calculated
-        # concepts so every row in concept_metrics can be labelled.
-        all_concepts_for_summary = (target_concepts or []) + calculated_concepts
         id_to_label_summary: dict[str, str] = {
-            c["_id"]: c.get("label", c["_id"]) for c in all_concepts_for_summary
+            c["_id"]: c.get("label", c["_id"]) for c in target_concepts
         }
-        total_concepts = len(target_concepts) + len(calculated_concepts)
+        total_concepts = len(target_concepts)
         absent_labels = sorted(
             c["label"] for c in target_concepts
             if c["_id"] not in concept_metrics

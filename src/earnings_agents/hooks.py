@@ -29,8 +29,10 @@ _thread_local = _threading.local()
 def set_node_callback(callback) -> None:
     """Register a per-thread callback invoked on node events.
 
-    The callback receives ``(node_name: str, event: str, ticker: str)`` where
-    *event* is ``"start"``, ``"end"``, or ``"error"``.
+    The callback receives
+    ``(node_name: str, event: str, ticker: str, node_state=None, elapsed_ms: float | None = None)``
+    where *event* is ``"start"``, ``"end"``, or ``"error"``.
+    *elapsed_ms* is populated on ``"end"`` and ``"error"`` events.
     Pass ``None`` to clear.
     """
     _thread_local.node_callback = callback
@@ -55,6 +57,29 @@ def report_detail(detail: str) -> None:
     cb = getattr(_thread_local, "detail_callback", None)
     if cb:
         cb(detail)
+
+
+def set_call_callback(callback) -> None:
+    """Register a per-thread callback for LLM/tool call events.
+
+    Unlike ``report_detail`` (which drives the spinner), these messages are
+    always printed as a new line above the progress bar so every LLM invoke
+    and DB operation is visible in the scrollback.
+    Pass ``None`` to clear.
+    """
+    _thread_local.call_callback = callback
+
+
+def get_call_callback():
+    """Return the current thread's call callback, if one is registered."""
+    return getattr(_thread_local, "call_callback", None)
+
+
+def report_call(msg: str) -> None:
+    """Fire the thread-local call callback — for LLM and tool call visibility."""
+    cb = getattr(_thread_local, "call_callback", None)
+    if cb:
+        cb(msg)
 
 
 def with_hooks(
@@ -99,7 +124,7 @@ def with_hooks(
             )
             cb = getattr(_thread_local, "node_callback", None)
             if cb:
-                cb(node_name, "error", ticker)
+                cb(node_name, "error", ticker, None, elapsed_ms)
             return {
                 **state,
                 "status": "failed",
@@ -116,7 +141,7 @@ def with_hooks(
         )
         cb = getattr(_thread_local, "node_callback", None)
         if cb:
-            cb(node_name, "end", ticker, new_state)
+            cb(node_name, "end", ticker, new_state, elapsed_ms)
         return new_state
 
     return _wrapper

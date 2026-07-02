@@ -9,7 +9,6 @@ from langgraph.graph import END, StateGraph
 from earnings_agents.nodes.extract_financial_metrics import extract_financial_metrics_node
 from earnings_agents.nodes.detect_document_type import detect_document_type_node
 from earnings_agents.nodes.extract_html_text import extract_html_text_node
-from earnings_agents.nodes.extract_pdf_text import extract_pdf_text_node
 from earnings_agents.nodes.analyze_metrics import analyze_metrics_node
 from earnings_agents.nodes.cleanup_metrics import cleanup_metrics_node
 from earnings_agents.nodes.load_company_concepts_node import load_company_concepts_node
@@ -43,14 +42,6 @@ def _route_after_concepts(
     if state.get("status") in ("failed", "skipped"):
         return "__end__"
     return "detect_document_type"
-
-
-def _route_by_file_type(
-    state: EarningsAgentState,
-) -> Literal["extract_pdf_text", "extract_html_text", "__end__"]:
-    if state.get("status") == "failed":
-        return "__end__"
-    return "extract_pdf_text" if state.get("file_type") == "pdf" else "extract_html_text"
 
 
 def _route_after_extraction(
@@ -117,6 +108,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
         )
 
     concept_metrics: dict = state.get("concept_metrics") or {}
+    derived_ids: set[str] = set(state.get("derived_concept_ids") or [])
     cik: str | None = state.get("company_cik")  # type: ignore[assignment]
     fy_end_month: int | None = state.get("fiscal_year_end_month")  # type: ignore[assignment]
     fy_end_code: str = str(state.get("fiscal_year_end_code") or "1231")
@@ -135,6 +127,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 fiscal_year_end_code=fy_end_code,
                 report_date=sec_rd,
                 period_type_override=detected_period_type,
+                derived_concept_ids=derived_ids,
             )
             logger.info(
                 "normalize_data: upserted %d concept value(s) for %s", n, ticker
@@ -163,7 +156,6 @@ def build_graph():
 
     graph.add_node("load_company_concepts", with_hooks(load_company_concepts_node))
     graph.add_node("detect_document_type", with_hooks(detect_document_type_node))
-    graph.add_node("extract_pdf_text", with_hooks(extract_pdf_text_node))
     graph.add_node("extract_html_text", with_hooks(extract_html_text_node))
     graph.add_node("extract_financial_metrics", with_hooks(extract_financial_metrics_node))
     graph.add_node("analyze_metrics", with_hooks(analyze_metrics_node))
@@ -179,14 +171,9 @@ def build_graph():
     )
     graph.add_conditional_edges(
         "detect_document_type",
-        _route_by_file_type,
-        {
-            "extract_pdf_text": "extract_pdf_text",
-            "extract_html_text": "extract_html_text",
-            "__end__": END,
-        },
+        lambda state: _fail_or(state, "extract_html_text"),
+        {"extract_html_text": "extract_html_text", "__end__": END},
     )
-    graph.add_edge("extract_pdf_text", "extract_financial_metrics")
     graph.add_edge("extract_html_text", "extract_financial_metrics")
     graph.add_conditional_edges(
         "extract_financial_metrics",

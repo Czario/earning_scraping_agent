@@ -75,7 +75,7 @@ _ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("rd_expense",           _R(r"research\s+(?:and|&)\s+development|r&d\s+expense")),
     ("sm_expense",           _R(r"(?:sales|selling)\s+(?:and|&)\s+marketing")),
     ("ga_expense",           _R(r"general\s+(?:and|&)\s+administrative")),
-    ("total_opex",           _R(r"total\s+operating\s+(?:expenses?|costs?)")),
+    ("total_opex",           _R(r"total\s+operating\s+(?:expenses?|costs?)|\boperating\s+(?:expenses?|costs?)\b")),
     ("operating_income",     _R(r"operating\s+(?:income|profit|loss)|income\s+from\s+operations")),
     ("interest_income",      _R(r"^interest\s+(?:and\s+other\s+)?income")),
     ("interest_expense",     _R(r"interest\s+expense")),
@@ -87,8 +87,8 @@ _ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("eps_basic",            _R(r"basic.*(?:per\s+share|eps)|(?:per\s+share|eps).*basic|per\s+basic\s+share")),
     ("eps_diluted",          _R(r"diluted.*(?:per\s+share|eps)|(?:per\s+share|eps).*diluted|per\s+diluted\s+share")),
     ("net_income",           _R(r"net\s+(?:income|earnings|loss)")),
-    ("shares_basic",         _R(r"(?:weighted.{0,20}average\s+)?basic\s+shares|shares.{0,10}basic|basic.{0,10}shares\s+outstanding")),
-    ("shares_diluted",       _R(r"(?:weighted.{0,20}average\s+)?diluted\s+shares|shares.{0,10}diluted|diluted.{0,10}shares\s+outstanding")),
+    ("shares_basic",         _R(r"(?:weighted.{0,20}average\s+)?basic\s+shares|shares.{0,25}basic|basic.{0,10}shares\s+outstanding")),
+    ("shares_diluted",       _R(r"(?:weighted.{0,20}average\s+)?diluted\s+shares|shares.{0,25}diluted|diluted.{0,10}shares\s+outstanding")),
     ("gross_margin_pct",     _R(r"gross\s+(?:profit\s+)?margin\s*%?")),
     ("operating_margin_pct", _R(r"operating\s+(?:income\s+)?margin\s*%?")),
     ("net_margin_pct",       _R(r"net\s+(?:income\s+|profit\s+)?margin\s*%?")),
@@ -105,6 +105,16 @@ def _identify_role(label: str) -> str | None:
         if pattern.search(label):
             return role
     return None
+
+
+def identify_role(label: str) -> str | None:
+    """Public alias for :func:`_identify_role` — for use outside this module."""
+    return _identify_role(label)
+
+
+# All roles this module can derive or use as operands — exposed so callers can
+# build constrained LLM prompts without duplicating the role list.
+ALL_ROLES: frozenset[str] = frozenset(role for role, _ in _ROLE_PATTERNS)
 
 
 # ── Formula functions ─────────────────────────────────────────────────────────
@@ -199,6 +209,23 @@ def _f_net_margin_pct(r: dict) -> float | None:
     return (ni / rev) * 100.0
 
 
+def _f_total_opex_from_gp_oi(r: dict) -> float | None:
+    """Total opex = Gross Profit − Operating Income (reverse derivation)."""
+    gp = r.get("gross_profit")
+    oi = r.get("operating_income")
+    if gp is None or oi is None:
+        return None
+    return gp - oi
+
+
+def _f_total_opex_from_items(r: dict) -> float | None:
+    """Total opex = Σ individual line items (R&D + S&M + G&A)."""
+    items = [r[k] for k in ("rd_expense", "sm_expense", "ga_expense") if r.get(k) is not None]
+    if not items:
+        return None
+    return sum(items)
+
+
 # ── Rules ─────────────────────────────────────────────────────────────────────
 # (target_role, formula_fn) — processed in order so earlier derived values
 # (e.g. gross_profit) are available as operands for later rules.
@@ -206,6 +233,10 @@ _RULES: list[tuple[str, Callable[[dict], float | None]]] = [
     ("gross_profit",         _f_gross_profit),
     ("operating_income",     _f_operating_income_via_total_opex),
     ("operating_income",     _f_operating_income_via_items),    # fallback
+    # total_opex runs AFTER operating_income so it can use a known OI value
+    # (either extracted from the filing or derived above).
+    ("total_opex",           _f_total_opex_from_gp_oi),
+    ("total_opex",           _f_total_opex_from_items),         # fallback
     ("pretax_income",        _f_pretax_income),
     ("net_income",           _f_net_income),
     ("eps_basic",            _f_eps_basic),
@@ -233,6 +264,7 @@ def _is_valid(value: float | None, role: str) -> bool:
 def derive_missing_concept_metrics(
     concept_metrics: dict[str, float],
     all_concepts: list[dict[str, Any]],
+    role_overrides: dict[str, str] | None = None,
 ) -> dict[str, float]:
     """Fill in calculated concept values from already-mapped metrics.
 
@@ -244,6 +276,11 @@ def derive_missing_concept_metrics(
     all_concepts:
         Combined list of regular + calculated concept dicts.  Each dict must
         have ``_id`` (str) and ``label`` (str) fields.
+    role_overrides:
+        Optional ``{concept_id → role}`` mapping from LLM-based role
+        identification for concepts whose labels did not match any regex
+        pattern in ``_ROLE_PATTERNS``.  Used as a fallback when
+        ``_identify_role(label)`` returns ``None``.
 
     Returns
     -------
@@ -260,12 +297,13 @@ def derive_missing_concept_metrics(
     id_to_label: dict[str, str] = {c["_id"]: c.get("label", "") for c in all_concepts}
 
     # Step 1 — populate role_values from already-mapped concepts.
+    _overrides = role_overrides or {}
     role_values: dict[str, float] = {}
     for cid, value in result.items():
         if not isinstance(value, (int, float)):
             continue
         label = id_to_label.get(cid, "")
-        role = _identify_role(label)
+        role = _identify_role(label) or _overrides.get(cid)
         if role and role not in role_values:
             role_values[role] = value
 
@@ -282,10 +320,12 @@ def derive_missing_concept_metrics(
     # Step 3 — apply rules in order; new derived values enrich role_values for
     # subsequent rules (enabling chained derivation: GP → OI → NI).
     for target_role, formula in _RULES:
-        # Find unmapped concepts that match this rule's target role.
+        # Find unmapped concepts that match this rule's target role — try regex
+        # first, fall back to LLM-supplied role_overrides for unrecognized labels.
         targets = [
             c for c in unmapped
-            if c["_id"] not in result and _identify_role(c.get("label", "")) == target_role
+            if c["_id"] not in result
+            and (_identify_role(c.get("label", "")) or _overrides.get(c["_id"])) == target_role
         ]
         if not targets:
             continue
@@ -317,4 +357,44 @@ def derive_missing_concept_metrics(
                 concept.get("label", ""), concept["_id"], computed, target_role,
             )
 
+    _audit_derivation_gaps(role_values, [c for c in unmapped if c["_id"] not in result], _overrides)
     return result
+
+
+# ── Operand requirements per derivation rule ──────────────────────────────────
+_RULE_OPERANDS: dict[str, list[str]] = {
+    "gross_profit":         ["revenue", "cost_of_revenue"],
+    "operating_income":     ["gross_profit", "total_opex"],  # primary path
+    "total_opex":           ["gross_profit", "operating_income"],  # reverse derivation
+    "pretax_income":        ["operating_income"],
+    "net_income":           ["pretax_income", "tax_expense"],
+    "eps_basic":            ["net_income", "shares_basic"],
+    "eps_diluted":          ["net_income", "shares_diluted"],
+    "gross_margin_pct":     ["gross_profit", "revenue"],
+    "operating_margin_pct": ["operating_income", "revenue"],
+    "net_margin_pct":       ["net_income", "revenue"],
+}
+
+_DERIVABLE_ROLES = frozenset(_RULE_OPERANDS)
+
+
+def _audit_derivation_gaps(
+    role_values: dict[str, float],
+    still_unmapped: list[dict],
+    role_overrides: dict[str, str] | None = None,
+) -> None:
+    """Log a warning for each unmapped concept whose derivation was blocked."""
+    _overrides = role_overrides or {}
+    for concept in still_unmapped:
+        cid = concept.get("_id", "")
+        label = concept.get("label", cid or "?")
+        role = _identify_role(label) or _overrides.get(cid)
+        if role not in _DERIVABLE_ROLES:
+            continue
+        missing = [op for op in _RULE_OPERANDS[role] if op not in role_values]
+        if missing:
+            logger.warning(
+                "derive_missing_concept_metrics: could not derive '%s' (%s) — "
+                "missing operand(s): %s",
+                label, role, ", ".join(missing),
+            )

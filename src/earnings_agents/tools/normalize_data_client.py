@@ -156,12 +156,20 @@ def get_statement_concepts(
         else "normalized_concepts_quarterly"
     )
     db = _get_client()[_NORMALIZE_DB]
+    from earnings_agents.hooks import report_call as _report_call
+    _report_call(f"  [db]  query {collection_name}  concepts for CIK {cik}")
     cursor = db[collection_name].find(
         {
             "company_cik": cik,
             "statement_type": {"$in": statement_types},
-            "abstract": {"$ne": True},
-            "hide": {"$ne": True},
+            "active": {"$ne": False},
+            "$or": [
+                # Regular concepts: not abstract, not hidden
+                {"abstract": {"$ne": True}, "hide": {"$ne": True}},
+                # Calculated/system: include regardless of abstract/hide flag
+                {"concept": {"$regex": "^system:", "$options": "i"}},
+                {"calculated": {"$in": [True, "True", "true"]}},
+            ],
         },
         {
             "_id": 1,
@@ -253,6 +261,8 @@ def get_calculated_concepts(
         else "normalized_concepts_quarterly"
     )
     db = _get_client()[_NORMALIZE_DB]
+    from earnings_agents.hooks import report_call as _report_call
+    _report_call(f"  [db]  query {collection_name}  calculated concepts for CIK {cik}")
     cursor = db[collection_name].find(
         {
             "company_cik": cik,
@@ -633,6 +643,7 @@ def upsert_concept_values(
     statement_type: str = "income_statement",
     report_date: date | None = None,
     period_type_override: str | None = None,
+    derived_concept_ids: set[str] | None = None,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
@@ -750,7 +761,7 @@ def upsert_concept_values(
             "earning_data": True,
             "created_at": now,
             "dimension_value": False,
-            "calculated": False,
+            "calculated": concept_id_str in (derived_concept_ids or set()),
         }
         filter_doc: dict[str, Any] = {
             "concept_id": concept_oid,
@@ -771,7 +782,11 @@ def upsert_concept_values(
     if not ops:
         return 0
 
+    from earnings_agents.hooks import report_call
+    period_label = f"FY{fiscal_year} Q{quarter}" if period_type == "quarterly" else f"FY{fiscal_year}"
+    report_call(f"  [db]  upsert {len(ops)} concept(s) → {collection_name}  {period_label}")
     collection.bulk_write(ops, ordered=False)
+    report_call(f"  [db]  ✓ upserted {len(ops)} concept(s)")
     if period_type == "quarterly":
         logger.info(
             "upsert_concept_values: %d concept(s) → %s  CIK %s FY%d Q%d",

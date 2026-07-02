@@ -293,7 +293,7 @@ def _merge_metrics(
       the two corrupts it (the historical "median of two = phantom average"
       bug).  *sections* is a list parallel to *results* giving each chunk's
       section key (``"income_statement"``, ``"balance_sheet"``, ``"cash_flow"``,
-      ``"other"`` or ``"unknown"``); when absent (char-split / PDF), all chunks
+      ``"other"`` or ``"unknown"``); when absent (char-split), all chunks
       share equal authority and the prior median-of-values behaviour applies.
       Within the single winning section, the median is used as a defensive
       tie-breaker if that section was split across multiple chunks.
