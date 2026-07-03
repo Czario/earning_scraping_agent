@@ -14,7 +14,7 @@ from earnings_agents.config import (
     GROQ_REQUEST_TIMEOUT,
     LLM_PROVIDER,
 )
-from earnings_agents.hooks import get_detail_callback, report_detail
+from earnings_agents.hooks import get_detail_callback, report_call, report_detail
 from earnings_agents.llm_factory import build_llm
 from earnings_agents.workflow_state import EarningsAgentState
 from earnings_agents.analysis.validators import validate_metrics
@@ -473,6 +473,46 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
 
     # Build all chunk prompts up front
     target_concepts: list[dict] = state.get("target_concepts") or []  # type: ignore[assignment]
+
+    # ── Launch roles identification in parallel with extraction ──────────────
+    # The roles call only needs concept labels (available now, before extraction
+    # starts) — it is independent of extraction output.  Starting it here means
+    # its latency overlaps with the extraction LLM call so the critical path
+    # shrinks from sum(extraction + roles) to max(extraction, roles).
+    #
+    # Dimensional/segment concepts ("|" in taxonomy_key) are excluded: they are
+    # never P&L derivation operands, so role identification is meaningless for
+    # them and sending them inflates the prompt with noise.
+    from concurrent.futures import Future as _Future, ThreadPoolExecutor as _RolesTPE
+    from earnings_agents.analysis.calculators import identify_role as _identify_role_pre, ALL_ROLES
+    from earnings_agents.tools.llm_concept_mapper import llm_identify_roles as _llm_identify_roles
+
+    _roles_need_llm: list[dict] = [
+        c for c in target_concepts
+        if "|" not in (c.get("taxonomy_key") or "")
+        and _identify_role_pre(c.get("label", "")) is None
+    ]
+    _roles_future: "_Future | None" = None
+    _roles_executor: "_RolesTPE | None" = None
+    if _roles_need_llm:
+        _unrecognized_labels_pre = [c.get("label", "") for c in _roles_need_llm]
+        report_call(
+            f"  [roles]  {len(_roles_need_llm)} unrecognized label(s)"
+            f"  ({', '.join(_unrecognized_labels_pre[:4])}"
+            f"{'…' if len(_unrecognized_labels_pre) > 4 else ''})"
+            f"  → calling llm in parallel  ({_display_provider})"
+        )
+        _role_timeout = _request_timeout_for(escalated_provider)
+        _role_llm = build_llm(
+            format_json=True,
+            request_timeout=_role_timeout,
+            provider=escalated_provider,
+        )
+        _roles_executor = _RolesTPE(max_workers=1)
+        _roles_future = _roles_executor.submit(
+            _llm_identify_roles, _unrecognized_labels_pre, _role_llm, ALL_ROLES
+        )
+    # ── End parallel roles launch ─────────────────────────────────────────────
     concept_list_str = _build_concept_prompt_list(target_concepts)
     prompts = [
         _TARGETED_PROMPT_TEMPLATE.format(
@@ -677,7 +717,6 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 "— running LLM semantic mapping",
                 len(unmapped_concepts), ticker,
             )
-            from earnings_agents.hooks import report_call
             report_call(
                 f"  [tier2]  {len(unmapped_concepts)} unmapped concept(s)"
                 f"  → calling llm  ({_display_provider})"
@@ -715,37 +754,19 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 identify_role,
                 ALL_ROLES,
             )
-            from earnings_agents.tools.llm_concept_mapper import llm_identify_roles
-            from earnings_agents.hooks import report_call
 
             # LLM role identification for concepts whose labels are not matched
-            # by the regex patterns — e.g. "GP" or "Net Sales" used as Revenue.
-            # Covers both mapped operand concepts and unmapped target concepts.
+            # by the regex patterns.  The LLM call was launched in parallel with
+            # extraction above — collect the result here (typically already done).
             role_overrides: dict[str, str] = {}
-            unrecognized = [
-                c for c in all_for_derivation
-                if identify_role(c.get("label", "")) is None
-            ]
-            if unrecognized:
-                unrecognized_labels = [c.get("label", "") for c in unrecognized]
-                report_call(
-                    f"  [roles]  {len(unrecognized)} unrecognized label(s)"
-                    f"  ({', '.join(unrecognized_labels[:4])}{'…' if len(unrecognized_labels) > 4 else ''})"
-                    f"  → calling llm  ({_display_provider})"
-                )
-                role_timeout = _request_timeout_for(escalated_provider)
-                role_llm = build_llm(
-                    format_json=True,
-                    request_timeout=role_timeout,
-                    provider=escalated_provider,
-                )
-                label_to_role = llm_identify_roles(
-                    unrecognized_labels,
-                    role_llm,
-                    ALL_ROLES,
-                )
-                for c in unrecognized:
-                    role = label_to_role.get(c.get("label", ""))
+            if _roles_future is not None:
+                try:
+                    _label_to_role = _roles_future.result()
+                finally:
+                    if _roles_executor is not None:
+                        _roles_executor.shutdown(wait=False)
+                for c in _roles_need_llm:
+                    role = _label_to_role.get(c.get("label", ""))
                     if role:
                         role_overrides[c["_id"]] = role
                         logger.info(
@@ -755,7 +776,7 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 if role_overrides:
                     mapped_roles = [
                         f"'{c.get('label', '')}' → {role_overrides[c['_id']]}"
-                        for c in unrecognized if c["_id"] in role_overrides
+                        for c in _roles_need_llm if c["_id"] in role_overrides
                     ]
                     report_call(f"  [roles]  ✓ {', '.join(mapped_roles)}")
                 else:

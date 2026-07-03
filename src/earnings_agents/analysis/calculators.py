@@ -74,14 +74,14 @@ _ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("gross_profit",         _R(r"gross\s+profit(?!\s*margin)")),
     ("rd_expense",           _R(r"research\s+(?:and|&)\s+development|r&d\s+expense")),
     ("sm_expense",           _R(r"(?:sales|selling)\s+(?:and|&)\s+marketing")),
-    ("ga_expense",           _R(r"general\s+(?:and|&)\s+administrative")),
+    ("ga_expense",           _R(r"general\s*,?\s*(?:and|&)\s+administrative")),  # comma variant: "Selling, general, and administrative"
     ("total_opex",           _R(r"total\s+operating\s+(?:expenses?|costs?)|\boperating\s+(?:expenses?|costs?)\b")),
     ("operating_income",     _R(r"operating\s+(?:income|profit|loss)|income\s+from\s+operations")),
     ("interest_income",      _R(r"^interest\s+(?:and\s+other\s+)?income")),
     ("interest_expense",     _R(r"interest\s+expense")),
     ("other_income_net",     _R(r"other\s+(?:income|expense)|non.?operating\s+income")),
     ("pretax_income",        _R(r"income\s+before\s+(?:income\s+)?tax|pre.?tax\s+income")),
-    ("tax_expense",          _R(r"income\s+tax\s+(?:expense|provision)|provision\s+for\s+(?:income\s+)?tax")),
+    ("tax_expense",          _R(r"income\s+tax\s+(?:expense|provision)|provision\s+for\s+(?:income\s+)?tax|\bincome\s+taxes?\b")),
     # EPS patterns must appear before net_income — "Diluted net income per share"
     # contains "net income" but should map to eps_diluted, not net_income.
     ("eps_basic",            _R(r"basic.*(?:per\s+share|eps)|(?:per\s+share|eps).*basic|per\s+basic\s+share")),
