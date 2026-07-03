@@ -1,0 +1,25 @@
+# Python byte-code — prevents __pycache__ changes from invalidating COPY src/
+**/__pycache__
+**/*.py[cod]
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Dev / test artefacts
+tests/
+docs/
+data/
+*.egg-info/
+.venv/
+.env
+*.env
+
+# Git
+.git
+.gitignore
+
+# Editor
+.vscode/
+.idea/
+*.swp

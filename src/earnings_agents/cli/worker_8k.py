@@ -19,8 +19,9 @@ import argparse
 import json
 import logging
 import os
+import signal
 import time
-from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from bson import ObjectId
@@ -28,14 +29,14 @@ from pymongo import MongoClient
 from redis import Redis
 
 from earnings_agents.cli.earnings import (
-    _format_step_line,
     _has_existing_period_data,
     _is_period_already_stored,
 )
 from earnings_agents.config import REDIS_URL
 from earnings_agents.hooks import set_call_callback, set_detail_callback, set_node_callback
-from earnings_agents.tools.edgar_client import _find_exhibit_99_in_index, normalize_cik
+from earnings_agents.tools.edgar_client import get_latest_earnings_url
 from earnings_agents.tools.redis_queue import get_redis_client, serialize_message
+from earnings_agents.worker_progress import WorkerProgressPublisher, make_call_callback, make_node_callback
 from earnings_agents.workflow import build_graph
 
 logging.basicConfig(
@@ -46,8 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Dedicated queue — admin_backend publishes 8-K messages here only.
-_DEFAULT_QUEUE    = "sec:filings:8k"
-_EVENTS_CHANNEL   = "sec:worker:events"
+_DEFAULT_QUEUE = "sec:filings:8k"
 
 
 # ── MongoDB helper ─────────────────────────────────────────────────────────────
@@ -69,53 +69,6 @@ def _update_load_request_status(payload: dict[str, Any], status: str) -> None:
         logger.warning("Failed to update load_request status → %s: %s", status, exc)
 
 
-# ── Real-time progress publishing ──────────────────────────────────────────────
-
-class _ProgressPublisher:
-    """Publishes pipeline node progress to the Redis ``sec:worker:events`` pub/sub
-    channel so admin_backend can stream them to the frontend in real time.
-
-    Uses a separate Redis connection from the queue consumer so publish calls
-    never block the main processing thread.  Best-effort — any error is logged
-    and silently swallowed.
-    """
-
-    def __init__(self, redis_url: str, ticker: str, load_request_id: str | None) -> None:
-        self._ticker = ticker
-        self._load_request_id = load_request_id
-        self._client: Redis | None = None
-        try:
-            self._client = Redis.from_url(
-                redis_url, decode_responses=True, socket_connect_timeout=5
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("ProgressPublisher: could not connect to Redis: %s", exc)
-
-    def publish(self, node_name: str, message: str, elapsed_ms: float | None = None) -> None:
-        if not self._client:
-            return
-        event = {
-            "event":           "worker_progress",
-            "ticker":          self._ticker,
-            "load_request_id": self._load_request_id,
-            "node":            node_name,
-            "message":         message,
-            "elapsed_ms":      round(elapsed_ms, 1) if elapsed_ms is not None else None,
-            "timestamp":       datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            self._client.publish(_EVENTS_CHANNEL, json.dumps(event))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("ProgressPublisher: publish failed: %s", exc)
-
-    def close(self) -> None:
-        try:
-            if self._client:
-                self._client.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
 # ── Core processing — mirrors CLI's _build_initial_state + _run_company ───────
 
 def _process_payload(graph, payload: dict[str, Any]) -> bool:
@@ -135,44 +88,46 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     label = payload.get("company_name") or ticker or cik or "?"
     period = payload.get("period_of_report") or ""
 
-    # ── 1. Resolve Exhibit 99.1 from the specific accession ──────────────────
-    # The RSS payload carries the filing INDEX url; we need the actual Exhibit
-    # 99.1 document — the same URL that get_latest_earnings_url() returns in
-    # the CLI.  Using the specific accession from the RSS feed is more precise
-    # than re-scanning EDGAR for the "latest" 8-K.
-    if not cik or not accession:
-        logger.warning("8-K message for %s missing cik/accession — skipping", label)
-        return True  # not a processing failure
+    # Create publisher immediately so every exit path can report status.
+    redis_url = os.getenv("REDIS_URL", REDIS_URL)
+    pub = WorkerProgressPublisher(redis_url, ticker or cik, payload.get("load_request_id"))
 
-    cik_int = str(int(normalize_cik(cik)))
-    acc_nodash = accession.replace("-", "")
-    filing_url = _find_exhibit_99_in_index(cik_int, accession, acc_nodash)
+    # ── 1. Resolve Exhibit 99.1 + corrected period end date ──────────────────
+    if not cik:
+        pub.publish("skip", "message missing cik — cannot look up filing")
+        pub.close()
+        logger.warning("8-K message for %s missing cik — skipping", label)
+        return True
+
+    filing_url, period = get_latest_earnings_url(cik)
 
     if not filing_url:
-        # No Exhibit 99.1 means this 8-K is not an earnings press release
-        # (e.g. executive changes, amendments, material agreements).
+        pub.publish("skip", "no Exhibit 99.1 on EDGAR — not an earnings release")
+        pub.close()
         logger.info(
-            "8-K for %s (accession %s) has no Exhibit 99.1 — not an earnings release, skipping",
-            label, accession,
+            "8-K for %s has no Exhibit 99.1 on EDGAR — not an earnings release, skipping",
+            label,
         )
-        return True  # graceful skip — not a failure
+        return True  # graceful skip — not every 8-K is an earnings press release
 
     # ── 2. Guard: skip if no prior normalize_data period data for this ticker ─
-    # The load_company_concepts node needs existing concept mappings to work.
     if ticker and not _has_existing_period_data(ticker):
+        pub.publish("skip", f"skipped — no existing normalize_data period data for {ticker}")
+        pub.close()
         logger.info("8-K skipped for %s — no existing normalize_data period data", label)
         return True
 
     # ── 3. Guard: skip if this exact period is already stored ─────────────────
     if ticker and period and _is_period_already_stored(ticker, period):
+        pub.publish("skip", f"✓ already up to date — period {period} is already in normalize_data")
+        pub.close()
         logger.info("8-K skipped for %s — period %s already stored in normalize_data", label, period)
         return True
 
     # ── 4. Run the pipeline ───────────────────────────────────────────────────
-    # Initial state mirrors CLI's _build_initial_state SEC path exactly:
-    #   status="discovered" → skips discover_earnings_release node
-    #   company_cik pre-set → skips CIK resolution in load_company_concepts
-    logger.info("Processing 8-K for %s  accession=%s  url=%s", label, accession, filing_url)
+    # State mirrors CLI's _build_initial_state SEC path exactly.
+    # period comes from get_latest_earnings_url (inferred, not raw RSS date).
+    logger.info("Processing 8-K for %s  url=%s  period=%s", label, filing_url, period)
 
     # State mirrors CLI's _build_initial_state SEC path exactly — no extra keys.
     # company_cik is set so load_company_concepts skips its own CIK resolution.
@@ -193,38 +148,65 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         "status": "discovered",
     }
 
-    # ── Set up progress callbacks (same format as the CLI output) ─────────────
-    redis_url = os.getenv("REDIS_URL", REDIS_URL)
-    pub = _ProgressPublisher(redis_url, ticker or cik, payload.get("load_request_id"))
+    # ── Set up progress callbacks using the shared worker_progress module ────────
+    # make_node_callback fires on both start (▶ stage) and end (step summary),
+    # mirroring the CLI's rich progress output exactly.
+    # make_call_callback forwards every LLM/DB/HTTP call event so the UI shows
+    # the same intermediate lines the CLI prints.
+    llm_call_count: list[int] = [0]
+    set_node_callback(make_node_callback(pub, ticker or cik))
+    set_call_callback(make_call_callback(pub, ticker or cik, llm_call_count))
+    set_detail_callback(None)   # spinner text — not needed in worker
 
-    def _node_cb(node_name: str, event: str, _ticker: str,
-                 node_state=None, elapsed_ms: float | None = None) -> None:
-        if event != "end" or node_state is None:
-            return
-        msg = _format_step_line(node_name, node_state)
-        if msg:
-            for line in msg.splitlines():
-                pub.publish(node_name, line.strip(), elapsed_ms)
-                logger.info("[%s]  %s", ticker or cik, line.strip())
-
-    set_node_callback(_node_cb)
-    set_detail_callback(None)   # detail (chunk ticks) not needed in worker
-    set_call_callback(None)
-
+    t0 = perf_counter()
     try:
         final = graph.invoke(state)
+    except BaseException as exc:
+        # Catches Exception (LLM errors etc.), KeyboardInterrupt, and SystemExit
+        # (SIGTERM converted below) — publishes a visible failure line to the UI
+        # so the user sees why the log stopped rather than an empty spinner.
+        elapsed_s = perf_counter() - t0
+        elapsed_str = (
+            f"{elapsed_s:.1f}s"
+            if elapsed_s < 60
+            else f"{int(elapsed_s // 60)}m {elapsed_s % 60:.0f}s"
+        )
+        reason = (
+            "worker stopped (SIGTERM)"
+            if isinstance(exc, SystemExit)
+            else "interrupted"
+            if isinstance(exc, KeyboardInterrupt)
+            else str(exc)[:120]
+        )
+        pub.publish(
+            "summary",
+            f"✗ {reason}  {elapsed_str}",
+            kind="summary",
+        )
+        raise
     finally:
         set_node_callback(None)
         set_call_callback(None)
         pub.close()
 
+    elapsed_s = perf_counter() - t0
+    elapsed_str = (
+        f"{elapsed_s:.1f}s"
+        if elapsed_s < 60
+        else f"{int(elapsed_s // 60)}m {elapsed_s % 60:.0f}s"
+    )
     status = final.get("status", "")
+    llm_tag = f"  ({llm_call_count[0]} LLM calls)" if llm_call_count[0] else ""
 
     if status == "saved":
         n = len(final.get("concept_metrics") or {})
+        period_out = final.get("sec_report_date") or ""
+        year = period_out[:4] if period_out else "?"
+        summary = f"✓ {ticker or cik}_{year}_latest saved  ({n} concepts){llm_tag}  {elapsed_str}"
+        pub.publish("summary", summary, kind="summary")
         logger.info(
-            "8-K saved for %s — period=%s  concepts=%d",
-            label, final.get("sec_report_date"), n,
+            "8-K saved for %s — period=%s  concepts=%d  llm_calls=%d  elapsed=%s",
+            label, final.get("sec_report_date"), n, llm_call_count[0], elapsed_str,
         )
         return True
 
@@ -286,6 +268,15 @@ def main(argv: list[str] | None = None) -> None:
     dead_letter_queue: str = args.dead_letter_queue
     redis_url: str = args.redis_url
 
+    # Convert SIGTERM (docker stop / docker-compose down) into SystemExit so it
+    # propagates through finally blocks and the except BaseException handler in
+    # _process_payload — this lets us publish a failure event and mark the DB
+    # record as failed before the process exits.
+    def _sigterm(_signum, _frame):  # noqa: ANN001
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm)
+
     client = _make_client(redis_url, args.poll_timeout)
     graph = build_graph()
     logger.info("8-K worker listening on Redis queue '%s'", queue_name)
@@ -333,6 +324,16 @@ def main(argv: list[str] | None = None) -> None:
 
         try:
             success = _process_payload(graph, payload)
+        except (KeyboardInterrupt, SystemExit):
+            # Worker is shutting down (Ctrl-C or docker stop) mid-job.
+            # _process_payload already published the ✗ summary event; we just
+            # need to persist the failed status before the process exits.
+            _update_load_request_status(payload, "failed")
+            logger.info(
+                "Worker shutdown mid-job — marked %s as failed",
+                payload.get("ticker"),
+            )
+            raise  # let the process exit normally
         except Exception as exc:  # noqa: BLE001
             payload["last_error"] = str(exc)
             logger.exception("Unhandled error processing 8-K job for %s", payload.get("ticker"))

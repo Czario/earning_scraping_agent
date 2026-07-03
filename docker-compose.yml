@@ -1,24 +1,18 @@
-# Standalone compose file for the 8-K earnings extraction worker.
-# Runs independently — no dependency on admin_backend's compose stack.
+# Distributed 8-K extraction worker.
+#
+# Networking:
+#   MongoDB — joins backend_true_grids_backend_network (shared with admin_backend)
+#             so the replica-set hostname "mongo" resolves correctly.
+#   Redis   — reaches admin_backend's Redis via the host port (6379).
+#             host.docker.internal always resolves to the Docker host.
 #
 # Usage:
-#   cp env.example .env          # fill in MONGODB_URI, LLM keys
-#   docker compose up -d
+#   docker compose up -d          # first time (or after dep / Dockerfile changes)
+#   docker compose up -d --build  # after pyproject.toml / uv.lock changes
+#   docker compose restart worker-8k  # after any src/ code change (no rebuild needed)
 #   docker compose logs -f worker-8k
 
 services:
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redis-data:/data
-    restart: always
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-
   worker-8k:
     build:
       context: .
@@ -27,18 +21,28 @@ services:
       - path: .env
         required: false
     environment:
-      REDIS_URL:        redis://redis:6379/0
-      REDIS_QUEUE_NAME: ${REDIS_QUEUE_NAME:-sec:filings:8k}
-      MONGODB_URI:      ${MONGODB_URI:-mongodb://host.docker.internal:27017/}
-      DATABASE_NAME:    ${DATABASE_NAME:-normalize_data}
+      # Redis: use host-published port — Redis is in admin_backend's internal network.
+      REDIS_URL:        redis://host.docker.internal:6379/0
+      REDIS_QUEUE_NAME: sec:filings:8k
+      # MongoDB: use the Docker service name — worker is on the shared backend network.
+      # directConnection=true bypasses replica-set redirect to internal hostname.
+      MONGODB_URI:      mongodb://mongo:27017/?directConnection=true
+      DATABASE_NAME:    normalize_data
       LLM_PROVIDER:     ${LLM_PROVIDER:-deepseek}
       PYTHONUNBUFFERED: "1"
+    volumes:
+      # Mount source directly so code edits are reflected without rebuilding the
+      # image.  uv sync installs the project in editable mode, so Python reads
+      # from this mount at runtime.  After editing, run:
+      #   docker compose restart worker-8k
+      - ./src:/app/src
     restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
+    networks:
+      - backend_true_grids_backend_network
     extra_hosts:
+      # Resolves host.docker.internal on Linux hosts (no-op on Docker Desktop).
       - "host.docker.internal:host-gateway"
 
-volumes:
-  redis-data:
+networks:
+  backend_true_grids_backend_network:
+    external: true
