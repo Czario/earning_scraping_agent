@@ -1,0 +1,44 @@
+# Standalone compose file for the 8-K earnings extraction worker.
+# Runs independently — no dependency on admin_backend's compose stack.
+#
+# Usage:
+#   cp env.example .env          # fill in MONGODB_URI, LLM keys
+#   docker compose up -d
+#   docker compose logs -f worker-8k
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker-8k:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL:        redis://redis:6379/0
+      REDIS_QUEUE_NAME: ${REDIS_QUEUE_NAME:-sec:filings:8k}
+      MONGODB_URI:      ${MONGODB_URI:-mongodb://host.docker.internal:27017/}
+      DATABASE_NAME:    ${DATABASE_NAME:-normalize_data}
+      LLM_PROVIDER:     ${LLM_PROVIDER:-deepseek}
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  redis-data:

@@ -9,6 +9,9 @@ only ever sees its own messages — no re-queue loops.
 Pipeline mirrors ``uv run earnings --ticker X`` exactly:
   CLI    → ticker arg → EDGAR lookup → Exhibit 99.1 → pipeline
   Worker → Redis msg  → accession  → Exhibit 99.1 → pipeline
+
+Progress events are published to the ``sec:worker:events`` Redis pub/sub
+channel so admin_backend can stream them to the frontend in real time.
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from bson import ObjectId
@@ -24,10 +28,12 @@ from pymongo import MongoClient
 from redis import Redis
 
 from earnings_agents.cli.earnings import (
+    _format_step_line,
     _has_existing_period_data,
     _is_period_already_stored,
 )
 from earnings_agents.config import REDIS_URL
+from earnings_agents.hooks import set_call_callback, set_detail_callback, set_node_callback
 from earnings_agents.tools.edgar_client import _find_exhibit_99_in_index, normalize_cik
 from earnings_agents.tools.redis_queue import get_redis_client, serialize_message
 from earnings_agents.workflow import build_graph
@@ -35,12 +41,13 @@ from earnings_agents.workflow import build_graph
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,  # override earnings.py which calls basicConfig(WARNING) on import
 )
 logger = logging.getLogger(__name__)
 
 # Dedicated queue — admin_backend publishes 8-K messages here only.
-# 10-K/10-Q go to sec:filings:10kq consumed by the filings-extractor worker.
-_DEFAULT_QUEUE = "sec:filings:8k"
+_DEFAULT_QUEUE    = "sec:filings:8k"
+_EVENTS_CHANNEL   = "sec:worker:events"
 
 
 # ── MongoDB helper ─────────────────────────────────────────────────────────────
@@ -60,6 +67,53 @@ def _update_load_request_status(payload: dict[str, Any], status: str) -> None:
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to update load_request status → %s: %s", status, exc)
+
+
+# ── Real-time progress publishing ──────────────────────────────────────────────
+
+class _ProgressPublisher:
+    """Publishes pipeline node progress to the Redis ``sec:worker:events`` pub/sub
+    channel so admin_backend can stream them to the frontend in real time.
+
+    Uses a separate Redis connection from the queue consumer so publish calls
+    never block the main processing thread.  Best-effort — any error is logged
+    and silently swallowed.
+    """
+
+    def __init__(self, redis_url: str, ticker: str, load_request_id: str | None) -> None:
+        self._ticker = ticker
+        self._load_request_id = load_request_id
+        self._client: Redis | None = None
+        try:
+            self._client = Redis.from_url(
+                redis_url, decode_responses=True, socket_connect_timeout=5
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ProgressPublisher: could not connect to Redis: %s", exc)
+
+    def publish(self, node_name: str, message: str, elapsed_ms: float | None = None) -> None:
+        if not self._client:
+            return
+        event = {
+            "event":           "worker_progress",
+            "ticker":          self._ticker,
+            "load_request_id": self._load_request_id,
+            "node":            node_name,
+            "message":         message,
+            "elapsed_ms":      round(elapsed_ms, 1) if elapsed_ms is not None else None,
+            "timestamp":       datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self._client.publish(_EVENTS_CHANNEL, json.dumps(event))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ProgressPublisher: publish failed: %s", exc)
+
+    def close(self) -> None:
+        try:
+            if self._client:
+                self._client.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ── Core processing — mirrors CLI's _build_initial_state + _run_company ───────
@@ -120,11 +174,12 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     #   company_cik pre-set → skips CIK resolution in load_company_concepts
     logger.info("Processing 8-K for %s  accession=%s  url=%s", label, accession, filing_url)
 
+    # State mirrors CLI's _build_initial_state SEC path exactly — no extra keys.
+    # company_cik is set so load_company_concepts skips its own CIK resolution.
     state = {
         "ticker": ticker or cik,
         "company_name": label,
         "company_cik": cik or None,
-        "ir_url": "",
         "discovered_file_url": filing_url,
         "sec_report_date": period or None,
         "file_type": None,
@@ -138,7 +193,31 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         "status": "discovered",
     }
 
-    final = graph.invoke(state)
+    # ── Set up progress callbacks (same format as the CLI output) ─────────────
+    redis_url = os.getenv("REDIS_URL", REDIS_URL)
+    pub = _ProgressPublisher(redis_url, ticker or cik, payload.get("load_request_id"))
+
+    def _node_cb(node_name: str, event: str, _ticker: str,
+                 node_state=None, elapsed_ms: float | None = None) -> None:
+        if event != "end" or node_state is None:
+            return
+        msg = _format_step_line(node_name, node_state)
+        if msg:
+            for line in msg.splitlines():
+                pub.publish(node_name, line.strip(), elapsed_ms)
+                logger.info("[%s]  %s", ticker or cik, line.strip())
+
+    set_node_callback(_node_cb)
+    set_detail_callback(None)   # detail (chunk ticks) not needed in worker
+    set_call_callback(None)
+
+    try:
+        final = graph.invoke(state)
+    finally:
+        set_node_callback(None)
+        set_call_callback(None)
+        pub.close()
+
     status = final.get("status", "")
 
     if status == "saved":
@@ -185,21 +264,44 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
+def _make_client(redis_url: str, poll_timeout: int) -> Redis:
+    """Create a Redis client suitable for blocking blpop.
+
+    socket_timeout must be None (no socket-level deadline) so the blocking
+    BLPOP command can wait the full poll_timeout seconds without the socket
+    layer raising TimeoutError.  socket_connect_timeout is kept short so a
+    bad URL fails fast at startup.
+    """
+    return Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=10,
+        socket_timeout=None,  # no socket-level timeout — blpop controls waiting
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     queue_name: str = args.queue_name
     dead_letter_queue: str = args.dead_letter_queue
+    redis_url: str = args.redis_url
 
-    client: Redis = (
-        get_redis_client()
-        if args.redis_url == REDIS_URL
-        else Redis.from_url(args.redis_url, decode_responses=True, socket_connect_timeout=10)
-    )
+    client = _make_client(redis_url, args.poll_timeout)
     graph = build_graph()
     logger.info("8-K worker listening on Redis queue '%s'", queue_name)
 
     while True:
-        item = client.blpop(queue_name, timeout=args.poll_timeout)
+        try:
+            item = client.blpop(queue_name, timeout=args.poll_timeout)
+        except Exception as exc:
+            logger.warning("Redis blpop error (%s) — reconnecting in 5s", exc)
+            time.sleep(5)
+            try:
+                client = _make_client(redis_url, args.poll_timeout)
+            except Exception:
+                pass
+            continue
+
         if not item:
             if args.once:
                 break
