@@ -605,12 +605,17 @@ def _is_already_saved(ticker: str) -> bool:
 
 
 def _is_period_already_stored(ticker: str, sec_report_date_str: str | None) -> bool:
-    """Return True when *sec_report_date_str* is already the latest period in normalize_data.
+    """Return True when *sec_report_date_str* is already covered by normalize_data.
 
-    Compares the EDGAR-reported period-end date against the most recently
-    stored ``end_date`` in ``concept_values_quarterly`` or
-    ``concept_values_annual`` for *ticker*'s CIK.  Returns False on any DB
-    error or missing data (fail-safe: never skips on ambiguity).
+    Skips the filing when its period-end date is NOT newer than the most
+    recently stored ``end_date`` for *ticker*'s CIK — same semantics as the
+    10-K/Q worker's incremental guard (``report_date <= latest_stored``).
+
+    Using ``<=`` (not ``==``) means an older filing that arrives after a newer
+    one has already been stored is also correctly skipped.
+
+    Returns False on any DB error or missing data (fail-safe: never skips on
+    ambiguity).
     """
     if not sec_report_date_str or not ticker:
         return False
@@ -628,7 +633,7 @@ def _is_period_already_stored(ticker: str, sec_report_date_str: str | None) -> b
             return False
         report_date = date.fromisoformat(sec_report_date_str)
         stored_end = latest["end_date"].date()
-        return stored_end == report_date
+        return report_date <= stored_end   # skip if not newer than stored
     except Exception:  # noqa: BLE001 — fail safe: never skip on ambiguity
         return False
 

@@ -52,18 +52,25 @@ _DEFAULT_QUEUE = "sec:filings:8k"
 
 # ── MongoDB helper ─────────────────────────────────────────────────────────────
 
-def _update_load_request_status(payload: dict[str, Any], status: str) -> None:
-    """Update StockLoadRequest.status in MongoDB. Best-effort — never raises."""
+def _update_load_request_status(
+    payload: dict[str, Any],
+    status: str,
+    period_of_report: str | None = None,
+) -> None:
+    """Update StockLoadRequest.status (and optionally sec_period_of_report) in MongoDB."""
     load_request_id = payload.get("load_request_id")
     if not load_request_id:
         return
     try:
         uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
         db_name = os.getenv("DATABASE_NAME", "normalize_data")
+        fields: dict[str, Any] = {"status": status}
+        if period_of_report:
+            fields["sec_period_of_report"] = period_of_report
         with MongoClient(uri, serverSelectionTimeoutMS=5000) as mongo:
             mongo[db_name]["stock_load_requests"].update_one(
                 {"_id": ObjectId(load_request_id)},
-                {"$set": {"status": status}},
+                {"$set": fields},
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to update load_request status → %s: %s", status, exc)
@@ -205,6 +212,31 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         year = period_out[:4] if period_out else "?"
         summary = f"✓ {ticker or cik}_{year}_latest saved  ({n} concepts){llm_tag}  {elapsed_str}"
         pub.publish("summary", summary, kind="summary")
+        # Build a human period label (FY2026 Q1 / FY2026 Annual) by reading
+        # fiscal_year + quarter that normalize_data already stored — no
+        # calculation here, just reading what was written by the pipeline.
+        _period_label: str | None = None
+        try:
+            from earnings_agents.tools.normalize_data_client import (
+                get_company_by_ticker,
+                get_latest_period,
+            )
+            _company = get_company_by_ticker(ticker) if ticker else None
+            if _company:
+                _lp = get_latest_period(_company["cik"])
+                if _lp:
+                    _fy = _lp.get("fiscal_year")
+                    _q  = _lp.get("quarter")
+                    _pt = _lp.get("period_type", "annual")
+                    if _pt == "quarterly" and _q and _fy:
+                        _period_label = f"FY{_fy} Q{_q}"
+                    elif _fy:
+                        _period_label = f"FY{_fy} Annual"
+        except Exception:  # noqa: BLE001
+            pass
+        # Store in payload so main() passes it to _update_load_request_status.
+        if _period_label:
+            payload["_sec_period_label"] = _period_label
         logger.info(
             "8-K saved for %s — period=%s  concepts=%d  llm_calls=%d  elapsed=%s",
             label, final.get("sec_report_date"), n, llm_call_count[0], elapsed_str,
@@ -340,7 +372,16 @@ def main(argv: list[str] | None = None) -> None:
             logger.exception("Unhandled error processing 8-K job for %s", payload.get("ticker"))
 
         if success:
-            _update_load_request_status(payload, "completed")
+            # Write sec_period_of_report so the pipeline table shows the period.
+            # _sec_period_label (e.g. "FY2026 Q1" / "FY2026 Annual") is set by
+            # _process_payload after reading normalize_data; fall back to the
+            # raw EDGAR date if it wasn't computable.
+            _period = (
+                payload.pop("_sec_period_label", None)
+                or payload.get("sec_report_date")
+                or payload.get("period_of_report")
+            )
+            _update_load_request_status(payload, "completed", period_of_report=_period)
         else:
             payload["attempts"] = attempts + 1
             payload["failed_at"] = time.time()
