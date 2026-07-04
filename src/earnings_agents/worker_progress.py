@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -197,3 +198,51 @@ def make_call_callback(
         logger.info("[%s]  %s", ticker, stripped)
 
     return _callback
+
+
+class WorkerHeartbeat:
+    """Context manager that publishes a ``kind='heartbeat'`` event every
+    *interval_s* seconds while the pipeline is running.
+
+    The frontend uses these to distinguish a slow-but-alive LLM call from a
+    crashed worker: as long as heartbeats arrive, ``lastEvt.timestamp`` stays
+    fresh and the "Stalled" badge never fires.  Heartbeat events are filtered
+    from the visible log in the UI.
+
+    Usage::
+
+        with WorkerHeartbeat(pub, ticker, interval_s=60):
+            final = graph.invoke(state)
+    """
+
+    def __init__(
+        self,
+        pub: WorkerProgressPublisher,
+        ticker: str,
+        interval_s: int = 60,
+    ) -> None:
+        self._pub = pub
+        self._ticker = ticker
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _run(self) -> None:
+        elapsed = 0
+        while not self._stop.wait(timeout=self._interval_s):
+            elapsed += self._interval_s
+            self._pub.publish(
+                "heartbeat",
+                f"\u2665 alive  ({elapsed}s)",
+                kind="heartbeat",
+            )
+
+    def __enter__(self) -> "WorkerHeartbeat":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)

@@ -36,7 +36,7 @@ from earnings_agents.config import REDIS_URL
 from earnings_agents.hooks import set_call_callback, set_detail_callback, set_node_callback
 from earnings_agents.tools.edgar_client import get_latest_earnings_url
 from earnings_agents.tools.redis_queue import get_redis_client, serialize_message
-from earnings_agents.worker_progress import WorkerProgressPublisher, make_call_callback, make_node_callback
+from earnings_agents.worker_progress import WorkerProgressPublisher, make_call_callback, make_node_callback, WorkerHeartbeat
 from earnings_agents.workflow import build_graph
 
 logging.basicConfig(
@@ -160,7 +160,8 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
 
     t0 = perf_counter()
     try:
-        final = graph.invoke(state)
+        with WorkerHeartbeat(pub, ticker or cik, interval_s=60):
+            final = graph.invoke(state)
     except BaseException as exc:
         # Catches Exception (LLM errors etc.), KeyboardInterrupt, and SystemExit
         # (SIGTERM converted below) — publishes a visible failure line to the UI
