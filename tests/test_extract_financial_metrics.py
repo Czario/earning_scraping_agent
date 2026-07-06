@@ -1241,6 +1241,34 @@ class TestTaxonomyKeyMapping:
         assert cm.get("bbb222") == pytest.approx(3_900_000_000)
 
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_bracket_taxonomy_key_matched_at_tier0(self, mock_build_llm):
+        """Tier 0b: LLM returns [bracket] keys — matched without needing tier2.
+
+        The new mandatory prompt format instructs the LLM to ALWAYS use the
+        bracketed XBRL key as the JSON key (e.g. [us-gaap:Revenues]).  Tier-0b
+        looks up the bracket-wrapped form directly, so these keys never become
+        orphans and tier2 is skipped entirely.
+        """
+        mock_llm = MagicMock()
+        # LLM obeys the new prompt and returns bracket keys
+        mock_llm.invoke.return_value = (
+            '{"__scale__": "as-is", "__period__": null,'
+            ' "[us-gaap:Revenues]": 5234000000,'
+            ' "[us-gaap:CostOfRevenue]": 3900000000}'
+        )
+        mock_build_llm.return_value = mock_llm
+
+        state = _base_state(target_concepts=self._TARGET_CONCEPTS)
+        result = extract_financial_metrics_node(state)
+
+        cm = result.get("concept_metrics", {})
+        # Both mapped at tier0b — no tier2 LLM call needed
+        assert cm.get("aaa111") == pytest.approx(5_234_000_000)
+        assert cm.get("bbb222") == pytest.approx(3_900_000_000)
+        # Only one LLM call (extraction) — no tier2 call
+        assert mock_llm.invoke.call_count == 1
+
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
     def test_llm_semantic_mapping_used_for_residual(self, mock_build_llm):
         """Tier 2: LLM mapping resolves semantically similar but unmatched keys."""
         # First call (extraction): LLM returns a synonym key not in target labels

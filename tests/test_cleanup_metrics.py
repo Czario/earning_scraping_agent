@@ -183,3 +183,60 @@ def test_cleanup_disabled_returns_state_unchanged(monkeypatch):
     state = _base_state(metrics)
     result = cleanup_metrics_node(state)
     assert result is state
+
+
+@patch("earnings_agents.nodes.cleanup_metrics.build_llm")
+def test_cleanup_skipped_when_all_equal_pairs_are_protected(mock_build_llm):
+    """Regression: GIS-style false trigger — equal-value pairs where both keys are
+    concept-mapped must NOT trigger the LLM call (guardrail would block it anyway).
+
+    GIS had two segment revenue values that happened to be equal and were both
+    concept-mapped.  needs_cleanup() fired → LLM ran for ~48s → guardrail blocked
+    both removals → 0 keys removed.  With protected_keys awareness the pre-check
+    now correctly returns False and skips the LLM.
+    """
+    metrics = {
+        # Two segment revenues that happen to be equal — both concept-mapped.
+        "North America Retail Segment Revenue": 3_100_000_000,
+        "International Segment Revenue":        3_100_000_000,
+        "Net income":                           500_000_000,
+    }
+    state = _base_state(metrics)
+    # Both equal-value keys are concept-mapped → guardrail would block removal.
+    state["mapped_metric_keys"] = [
+        "North America Retail Segment Revenue",
+        "International Segment Revenue",
+        "Net income",
+    ]
+
+    result = cleanup_metrics_node(state)
+
+    # LLM must NOT have been called.
+    mock_build_llm.assert_not_called()
+    # Metrics unchanged.
+    assert result["metrics"] == metrics
+
+
+@patch("earnings_agents.nodes.cleanup_metrics.build_llm")
+def test_cleanup_still_triggers_when_one_equal_pair_key_is_unprotected(mock_build_llm):
+    """If one key in an equal-value pair is NOT concept-mapped, the LLM must still run."""
+    metrics = {
+        "Net sales":     5_000_000_000,
+        "GAAP Net sales": 5_000_000_000,   # NOT concept-mapped → removable
+        "Net income":    500_000_000,
+    }
+    state = _base_state(metrics)
+    state["mapped_metric_keys"] = ["Net sales", "Net income"]  # GAAP variant unprotected
+
+    mock_llm = MagicMock()
+    mock_llm.invoke.return_value = (
+        '{"remove": ["GAAP Net sales"], '
+        '"reasons": {"GAAP Net sales": "Rule A: duplicate of Net sales"}}'
+    )
+    mock_build_llm.return_value = mock_llm
+
+    result = cleanup_metrics_node(state)
+
+    mock_build_llm.assert_called_once()
+    assert "GAAP Net sales" not in result["metrics"]
+    assert result["metrics"]["Net sales"] == 5_000_000_000

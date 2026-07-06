@@ -58,7 +58,7 @@ def _build_compact_metrics(metrics: dict) -> dict:
     return {k: _compact_value(v) for k, v in metrics.items()}
 
 
-def needs_cleanup(metrics: dict) -> bool:
+def needs_cleanup(metrics: dict, protected_keys: set[str] | None = None) -> bool:
     """Return True when *metrics* contains any plausible cleanup candidate.
 
     A cheap Python pre-check that avoids an LLM call on already-clean dicts.
@@ -67,7 +67,13 @@ def needs_cleanup(metrics: dict) -> bool:
       - Two keys whose numeric values are equal within 0.1 %.
       - Two keys that differ only by case.
       - Any ``per share`` / ``EPS`` value above $10,000 (scale Rule B).
+
+    ``protected_keys`` is the set of concept-mapped metric keys (from
+    ``state["mapped_metric_keys"]``).  The cleanup guardrail blocks removal of
+    any protected key, so if ALL candidates in a heuristic involve only
+    protected keys the LLM call can never produce a removal — skip it.
     """
+    _protected = protected_keys or set()
     numeric_items = [
         (k, float(v)) for k, v in metrics.items()
         if isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -76,22 +82,30 @@ def needs_cleanup(metrics: dict) -> bool:
     # Rule B candidate: implausible per-share value.
     for k, v in numeric_items:
         if _PER_SHARE_RX.search(k) and abs(v) > 10_000:
-            return True
+            if k not in _protected:          # protected key → guardrail blocks → skip
+                return True
 
     # Case-only duplicates ("Net income" vs "Net Income").
     lower_keys: dict[str, list[str]] = {}
     for k in metrics:
         lower_keys.setdefault(k.lower(), []).append(k)
-    if any(len(v) > 1 for v in lower_keys.values()):
-        return True
+    for variants in lower_keys.values():
+        if len(variants) > 1:
+            # If every variant is protected the guardrail blocks all removals → skip.
+            if not all(v in _protected for v in variants):
+                return True
 
     # Rule A candidate: any two non-zero values within 0.1%.
+    # Skip pairs where BOTH keys are protected — the guardrail would block any
+    # removal from such a pair, so the LLM call can never act on them.
     nonzero = [(k, v) for k, v in numeric_items if v != 0]
     nonzero.sort(key=lambda kv: kv[1])
     for i in range(1, len(nonzero)):
-        a = nonzero[i - 1][1]
-        b = nonzero[i][1]
+        k_a, a = nonzero[i - 1]
+        k_b, b = nonzero[i]
         if abs(b - a) <= 0.001 * max(abs(a), abs(b)):
+            if _protected and k_a in _protected and k_b in _protected:
+                continue  # both protected → guardrail blocks → not actionable
             return True
 
     return False
@@ -308,8 +322,10 @@ def cleanup_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
     # Fix 2: skip the LLM call entirely when there are no plausible cleanup
     # candidates (no near-equal values, no case dupes, no implausible per-share).
-    # Saves ~3.5K tokens / ~3 s on already-clean documents.
-    if not needs_cleanup(metrics):
+    # Protected (concept-mapped) keys are passed so pairs/candidates that the
+    # guardrail would block anyway don't needlessly trigger the LLM call.
+    protected_keys = set(state.get("mapped_metric_keys") or [])
+    if not needs_cleanup(metrics, protected_keys):
         logger.info(
             "Cleanup skipped for %s — no duplicate / scale candidates detected", ticker,
         )
@@ -360,7 +376,7 @@ def cleanup_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     # These keys are verified real document metrics (Tier 1 label match or Tier 2
     # LLM semantic match against the company's XBRL taxonomy).  The cleanup LLM
     # has no access to that mapping and cannot be trusted to override it.
-    protected_keys = set(state.get("mapped_metric_keys") or [])
+    # (protected_keys already computed above for the needs_cleanup() pre-check)
     if protected_keys:
         concept_blocked = [k for k in remove if k in protected_keys]
         if concept_blocked:

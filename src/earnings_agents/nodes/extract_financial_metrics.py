@@ -13,6 +13,7 @@ from earnings_agents.config import (
     GEMINI_REQUEST_TIMEOUT,
     GROQ_REQUEST_TIMEOUT,
     LLM_PROVIDER,
+    SOURCE_GROUNDING,
 )
 from earnings_agents.hooks import get_detail_callback, report_call, report_detail
 from earnings_agents.llm_factory import build_llm
@@ -80,10 +81,10 @@ logger = logging.getLogger(__name__)
 # ── Targeted extraction (normalize_data mode) ────────────────────────────────
 
 # Prompt used when target_concepts are loaded from normalize_data.
-# The LLM is given the company's display label as the JSON key (reliable echo)
-# and the XBRL taxonomy key as a bracketed hint for semantic grounding.
-# Mapping back to concept_id uses normalized label matching (case/whitespace
-# insensitive) so minor label drift does not break the round-trip.
+# The LLM must always use the XBRL bracket key as the JSON key — never the
+# filing's own row label.  Tier-0 mapping then strips the brackets for a
+# direct taxonomy_key → concept_id lookup, eliminating orphaned keys and the
+# need for tier-2 semantic matching in the common case.
 _TARGETED_PROMPT_TEMPLATE = """\
 You are a financial data extraction assistant.
 
@@ -91,9 +92,12 @@ Extract ONLY the income statement metrics listed below from the text excerpt for
 This is chunk {chunk_num} of {total_chunks} of the full document.
 {focus_hint}{scale_hint}{period_hint}
 SCOPE — extract ONLY the concepts listed below.
-Use the bracketed key [ ] as your JSON key when one is shown; otherwise use
-the quoted label exactly. For dimensional concepts (bracket contains "|"), the
-bracket encodes what metric AND what segment/dimension is being measured —
+JSON KEY RULE — MANDATORY: ALWAYS use the bracketed key [ ] exactly as shown
+as your JSON key. NEVER use the document's own row label as a key — even if
+the document label looks different from the quoted label, the bracketed key
+is the only accepted format. If no bracket is shown, use the quoted label.
+For dimensional concepts (bracket contains "|"), the bracket encodes what
+metric AND what segment/dimension is being measured —
 e.g. [us-gaap:Revenues|aapl:AmericasSegmentMember] means: find the Americas
 segment row under Revenue and return it with that exact bracketed string as
 the JSON key.
@@ -138,9 +142,18 @@ INTERNAL CONSISTENCY — sanity-check before returning:
   WRONG column or the wrong row — re-read the statement and correct it.
 
 Return ONLY a flat JSON object — no markdown fences, no extra text.
-Every value must be a plain number or null. NEVER write arithmetic expressions or
-formulas as a value (e.g. do NOT write "15929 - 540 + 102" — use null if you cannot
-determine the exact number from the table directly).
+
+EFFICIENCY RULE — OMIT what is not present:
+  Extract ONLY the concepts you can actually locate in the text below. If a
+  concept from the list does NOT appear in the filing, OMIT its key entirely —
+  do NOT include it with a null, 0, or placeholder value. Most earnings press
+  releases contain only a subset of the concept list (segment/dimensional rows
+  and rarely-reported line items are usually absent). A short JSON containing
+  only the metrics that are truly present is the CORRECT answer — do not pad it.
+
+Every value must be a plain number. NEVER write arithmetic expressions or
+formulas as a value (e.g. do NOT write "15929 - 540 + 102" — omit the key if you
+cannot determine the exact number from the table directly).
 
 FIRST field must be "__scale__":
   "millions", "thousands", "billions", or "as-is" (no table).
@@ -175,7 +188,17 @@ IMPORTANT — scale handling:
   • Negative values: parentheses mean negative — "(1,234)" = −1234.
   • EPS, share prices, and percentages are always reported as-is (never
     scaled by __scale__), regardless of the table caption.
+{sources_hint}
+Text excerpt:
+\"\"\"
+{text}
+\"\"\"
+"""
 
+# Optional trailing block requesting per-metric source snippets. Included only
+# when SOURCE_GROUNDING is enabled (config), because it roughly doubles the LLM
+# output size. When omitted, check_source_grounding degrades to a no-op.
+_SOURCES_HINT_BLOCK = """
 LAST field must be "__sources__" (verification / "show me"):
   A JSON object mapping EACH metric key you returned above to the EXACT
   verbatim text snippet from the excerpt where you read its value — the row
@@ -184,11 +207,6 @@ LAST field must be "__sources__" (verification / "show me"):
   Copy the text character-for-character from the excerpt; do NOT paraphrase,
   reformat, or invent. If you cannot point to the exact source text for a
   value, return null for that value instead of guessing.
-
-Text excerpt:
-\"\"\"
-{text}
-\"\"\"
 """
 
 # _TAXONOMY_PREFIXES, _LLM_MAP_PROMPT, _llm_map_concepts, _build_concept_prompt_list
@@ -487,10 +505,14 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
     from earnings_agents.analysis.calculators import identify_role as _identify_role_pre, ALL_ROLES
     from earnings_agents.tools.llm_concept_mapper import llm_identify_roles as _llm_identify_roles
 
+    # Only identify roles for concepts the company actually reports recently —
+    # a concept with no recent history is never extracted, so its role is moot.
+    _recent_ids_for_roles = set(state.get("recent_concept_ids") or [])
     _roles_need_llm: list[dict] = [
         c for c in target_concepts
         if "|" not in (c.get("taxonomy_key") or "")
-        and _identify_role_pre(c.get("label", "")) is None
+        and (not _recent_ids_for_roles or c.get("_id") in _recent_ids_for_roles)
+        and _identify_role_pre(c.get("label", ""), c.get("taxonomy_key", "")) is None
     ]
     _roles_future: "_Future | None" = None
     _roles_executor: "_RolesTPE | None" = None
@@ -513,7 +535,36 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
             _llm_identify_roles, _unrecognized_labels_pre, _role_llm, ALL_ROLES
         )
     # ── End parallel roles launch ─────────────────────────────────────────────
-    concept_list_str = _build_concept_prompt_list(target_concepts)
+    # Prompt pruning: drop concepts the company has NOT reported in its recent
+    # periods (dimensional [Member] rows, retired line items).  These bloat the
+    # prompt and are almost never in the current filing.  target_concepts stays
+    # full for mapping + derivation; only the LLM prompt is trimmed.  When
+    # recent_concept_ids is empty (bootstrap / disabled) the full list is used.
+    recent_ids = set(state.get("recent_concept_ids") or [])
+    if recent_ids:
+        prompt_concepts = [c for c in target_concepts if c.get("_id") in recent_ids]
+        # Safety: never send an empty prompt — fall back to full list if the
+        # filter would remove everything (e.g. id-format mismatch).
+        if not prompt_concepts:
+            prompt_concepts = target_concepts
+        else:
+            _dropped = len(target_concepts) - len(prompt_concepts)
+            if _dropped > 0:
+                logger.info(
+                    "Prompt pruning for %s: %d concept(s) kept, %d dropped "
+                    "(no value in recent periods)",
+                    ticker, len(prompt_concepts), _dropped,
+                )
+                report_call(
+                    f"  [prompt]  {len(prompt_concepts)}/{len(target_concepts)} concepts"
+                    f"  ({_dropped} unreported in recent periods, pruned)"
+                )
+    else:
+        prompt_concepts = target_concepts
+    concept_list_str = _build_concept_prompt_list(prompt_concepts)
+    # Source-grounding block is opt-in (SOURCE_GROUNDING): it roughly doubles
+    # the LLM output size, so it is omitted by default for speed.
+    sources_hint = _SOURCES_HINT_BLOCK if SOURCE_GROUNDING else ""
     prompts = [
         _TARGETED_PROMPT_TEMPLATE.format(
             company_name=state["company_name"],
@@ -524,6 +575,7 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
             scale_hint=scale_hint,
             period_hint=period_hint,
             concept_list=concept_list_str,
+            sources_hint=sources_hint,
             text=chunk,
         )
         for i, chunk in enumerate(chunks, start=1)
@@ -681,10 +733,19 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         norm_label_to_id: dict[str, str] = {
             _norm_label(c["label"]): c["_id"] for c in target_concepts
         }
-        # Tier-0 lookup: taxonomy_key → concept_id (for dimensional concepts
-        # where the LLM uses the taxonomy_key as the JSON key directly).
+        # Tier-0 lookup: taxonomy_key → concept_id.
+        # Handles two formats the LLM may return for the same XBRL concept:
+        #   bare key:    us-gaap:NoninterestIncome     (old prompt behaviour)
+        #   bracket key: [us-gaap:NoninterestIncome]   (new mandatory format)
+        # Both resolve to the same concept_id so either format works.
         taxonomy_key_to_id: dict[str, str] = {
             c["taxonomy_key"]: c["_id"]
+            for c in target_concepts
+            if c.get("taxonomy_key")
+        }
+        # Bracket-wrapped form — the primary format after the prompt change.
+        bracket_key_to_id: dict[str, str] = {
+            f"[{c['taxonomy_key']}]": c["_id"]
             for c in target_concepts
             if c.get("taxonomy_key")
         }
@@ -694,8 +755,13 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
             if not isinstance(value, (int, float)):
                 continue
             if key in taxonomy_key_to_id:
-                # Tier 0: LLM returned taxonomy_key as JSON key
+                # Tier 0a: bare taxonomy key (legacy / fallback)
                 cid = taxonomy_key_to_id[key]
+                concept_metrics[cid] = float(value)
+                concept_id_to_metric_key[cid] = key
+            elif key in bracket_key_to_id:
+                # Tier 0b: bracket-wrapped key [us-gaap:X] — new primary format
+                cid = bracket_key_to_id[key]
                 concept_metrics[cid] = float(value)
                 concept_id_to_metric_key[cid] = key
             elif key in exact_label_to_id:
@@ -708,38 +774,106 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 concept_id_to_metric_key[cid] = key
 
         # ── Tier 2: LLM semantic mapping for residual unmapped concepts ─────
+        #
+        # Tier 2's only job: the extraction LLM sometimes echoes the filing's
+        # own row label instead of the concept label we gave it.  Those keys
+        # are extracted but not tier1-matched ("orphaned").  Tier 2 asks the
+        # LLM to match those orphaned keys to the remaining unmapped concepts.
+        #
+        # If there are NO orphaned keys (every extracted value is already used
+        # by a concept), tier 2 can never find a new match → skip it entirely.
+        # This is the key insight: the extraction LLM already saw every concept
+        # label; anything it returned null for genuinely isn't in the filing.
         mapped_ids = set(concept_metrics.keys())
         unmapped_concepts = [c for c in target_concepts if c["_id"] not in mapped_ids]
-        numeric_keys = [k for k, v in metrics.items() if isinstance(v, (int, float))]
-        if unmapped_concepts and numeric_keys:
+        all_numeric_keys = [k for k, v in metrics.items() if isinstance(v, (int, float))]
+        # Keys already consumed by tier0/tier1 — a concept's value; re-assigning
+        # them to a different concept would be wrong.
+        used_keys: set[str] = set(concept_id_to_metric_key.values())
+        # Only orphaned keys (extracted but not yet mapped to any concept) can
+        # possibly match an unmapped concept in tier 2.
+        orphaned_keys = [k for k in all_numeric_keys if k not in used_keys]
+
+        if unmapped_concepts and orphaned_keys:
+            # Pre-filter: drop concepts that can never appear in earnings press
+            # releases so the LLM prompt stays small and the call can be skipped
+            # entirely when nothing matchable remains.
+            #
+            # (a) OCI / comprehensive-income items — full-statement-only
+            #     disclosures, universally absent from press releases.
+            _OCI_SKIP_RX = re.compile(
+                r"other\s+comprehensive\s+(?:income|loss)"
+                r"|comprehensive\s+(?:income|loss)"
+                r"|unrealized\s+(?:gain|loss)"
+                r"|foreign\s+currency\s+translation"
+                r"|accumulated\s+other\s+comprehensive",
+                re.IGNORECASE,
+            )
+            # (b) Dimensional segment concepts (taxonomy_key contains '|') —
+            #     require segment-level extraction; a flat extracted key can
+            #     never map to them.
+            tier2_candidates = [
+                c for c in unmapped_concepts
+                if not _OCI_SKIP_RX.search(c.get("label", ""))
+                and "|" not in (c.get("taxonomy_key") or "")
+            ]
+
+            if tier2_candidates:
+                logger.info(
+                    "Targeted mode: %d concept(s) unmatched after label lookup for %s "
+                    "— running LLM semantic mapping (%d matchable, %d orphaned key(s))",
+                    len(unmapped_concepts), ticker, len(tier2_candidates), len(orphaned_keys),
+                )
+                report_call(
+                    f"  [tier2]  {len(unmapped_concepts)} unmapped concept(s)"
+                    f"  ({len(tier2_candidates)} matchable,"
+                    f" {len(orphaned_keys)}/{len(all_numeric_keys)} orphaned keys)"
+                    f"  → calling llm  ({_display_provider})"
+                )
+                map_timeout = _request_timeout_for(escalated_provider)
+                map_llm = build_llm(format_json=True, request_timeout=map_timeout, provider=escalated_provider)
+                llm_matches = _llm_map_concepts(
+                    orphaned_keys,       # only unmapped keys — already-used keys excluded
+                    tier2_candidates,
+                    map_llm,
+                    already_used_keys=used_keys,
+                )
+                for concept_id, matched_key in llm_matches.items():
+                    value = metrics.get(matched_key)
+                    if isinstance(value, (int, float)):
+                        concept_metrics[concept_id] = float(value)
+                        concept_id_to_metric_key[concept_id] = matched_key
+                        logger.debug(
+                            "LLM semantic mapping: %r → concept_id %s for %s",
+                            matched_key, concept_id, ticker,
+                        )
+                report_call(
+                    f"  [tier2]  ✓ mapped {len(llm_matches)}/{len(tier2_candidates)} concept(s)"
+                )
+            else:
+                logger.info(
+                    "Tier2 skipped for %s: all %d unmapped concept(s) are "
+                    "OCI/dimensional — not extractable from press releases",
+                    ticker, len(unmapped_concepts),
+                )
+                report_call(
+                    f"  [tier2]  skipped ({len(unmapped_concepts)} unmapped, "
+                    f"all OCI/dimensional — not extractable from press releases)"
+                )
+        elif unmapped_concepts and not orphaned_keys:
+            # All extracted keys were already consumed by tier0/tier1.
+            # The extraction LLM saw every concept label in its prompt and
+            # returned null — the filing genuinely doesn't contain those values.
+            # Tier 2 can find nothing new → skip it.
             logger.info(
-                "Targeted mode: %d concept(s) unmatched after label lookup for %s "
-                "— running LLM semantic mapping",
-                len(unmapped_concepts), ticker,
+                "Tier2 skipped for %s: 0 orphaned keys (%d/%d extracted keys already "
+                "mapped at tier0/tier1) — unmapped concepts are absent from filing",
+                ticker, len(used_keys), len(all_numeric_keys),
             )
             report_call(
-                f"  [tier2]  {len(unmapped_concepts)} unmapped concept(s)"
-                f"  → calling llm  ({_display_provider})"
-            )
-            map_timeout = _request_timeout_for(escalated_provider)
-            map_llm = build_llm(format_json=True, request_timeout=map_timeout, provider=escalated_provider)
-            llm_matches = _llm_map_concepts(
-                numeric_keys,
-                unmapped_concepts,
-                map_llm,
-                already_used_keys=set(concept_id_to_metric_key.values()),
-            )
-            for concept_id, matched_key in llm_matches.items():
-                value = metrics.get(matched_key)
-                if isinstance(value, (int, float)):
-                    concept_metrics[concept_id] = float(value)
-                    concept_id_to_metric_key[concept_id] = matched_key
-                    logger.debug(
-                        "LLM semantic mapping: %r → concept_id %s for %s",
-                        matched_key, concept_id, ticker,
-                    )
-            report_call(
-                f"  [tier2]  ✓ mapped {len(llm_matches)}/{len(unmapped_concepts)} concept(s)"
+                f"  [tier2]  skipped (0 orphaned keys — all {len(all_numeric_keys)}"
+                f" extracted values already matched; {len(unmapped_concepts)}"
+                f" concepts absent from filing)"
             )
 
         # ── Tier 3: Derive any unmapped concept whose value can be computed ─────

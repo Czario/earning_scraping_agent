@@ -72,14 +72,22 @@ _ROLE_EXCLUSION_RX = _R(
 _ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("cost_of_revenue",      _R(r"cost\s+of\s+(?:revenue|sales|goods)")),
     ("gross_profit",         _R(r"gross\s+profit(?!\s*margin)")),
-    ("rd_expense",           _R(r"research\s+(?:and|&)\s+development|r&d\s+expense")),
+    ("rd_expense",           _R(r"research\s+(?:and|&)\s+development|r&d\s+expense"
+                                r"|technology\s+(?:and\s+product\s+development|costs?|expense)")),
     ("sm_expense",           _R(r"(?:sales|selling)\s+(?:and|&)\s+marketing")),
     ("ga_expense",           _R(r"general\s*,?\s*(?:and|&)\s+administrative")),  # comma variant: "Selling, general, and administrative"
     ("total_opex",           _R(r"total\s+operating\s+(?:expenses?|costs?)|\boperating\s+(?:expenses?|costs?)\b")),
     ("operating_income",     _R(r"operating\s+(?:income|profit|loss)|income\s+from\s+operations")),
     ("interest_income",      _R(r"^interest\s+(?:and\s+other\s+)?income")),
+    # Banking/fintech — net/total interest income (label does not start with
+    # "interest" so the pattern above misses it).
+    ("interest_income",      _R(r"(?:total|net)\s+interest\s+(?:income|revenue)")),
     ("interest_expense",     _R(r"interest\s+expense")),
     ("other_income_net",     _R(r"other\s+(?:income|expense)|non.?operating\s+income")),
+    # Banking/fintech — noninterest income variants (also catch "non-interest").
+    ("other_income_net",     _R(r"(?:total\s+)?non.?interest\s+(?:income|revenue)")),
+    # Banking/fintech — noninterest expense = total operating expenses for banks.
+    ("total_opex",           _R(r"(?:total\s+)?non.?interest\s+expense")),
     ("pretax_income",        _R(r"income\s+before\s+(?:income\s+)?tax|pre.?tax\s+income")),
     ("tax_expense",          _R(r"income\s+tax\s+(?:expense|provision)|provision\s+for\s+(?:income\s+)?tax|\bincome\s+taxes?\b")),
     # EPS patterns must appear before net_income — "Diluted net income per share"
@@ -107,8 +115,105 @@ def _identify_role(label: str) -> str | None:
     return None
 
 
-def identify_role(label: str) -> str | None:
-    """Public alias for :func:`_identify_role` — for use outside this module."""
+# ── Taxonomy-key role patterns ────────────────────────────────────────────────
+# XBRL taxonomy keys encode the accounting concept in CamelCase (e.g.
+# ── XBRL taxonomy-key → role lookup ─────────────────────────────────────────
+# Exact match is always better than regex: the XBRL name IS the semantics.
+# Priority: XBRL exact lookup  >  label regex patterns  >  LLM override.
+#
+# Every entry maps one canonical XBRL key to a derivation role.  Add new keys
+# here when a new taxonomy variant is encountered; no regex needed.
+#
+# Notes:
+# - EarningsPerShareBasicAndDiluted maps to eps_diluted so it acts as the
+#   "diluted" operand for EPS derivation (the more conservative value).
+# - RevenuesNetOfInterestExpense is SoFi's/banks' top-line revenue key.
+# - Dimensional keys (containing "|") are excluded at the call site.
+_XBRL_TO_ROLE: dict[str, str] = {
+    # Revenue
+    "us-gaap:Revenues":                                                        "revenue",
+    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax":             "revenue",
+    "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax":             "revenue",
+    "us-gaap:RevenuesNetOfInterestExpense":                                    "revenue",  # banks
+    "us-gaap:SalesRevenueNet":                                                 "revenue",
+    "us-gaap:SalesRevenueGoodsNet":                                            "revenue",
+    # Cost of revenue
+    "us-gaap:CostOfRevenue":                                                   "cost_of_revenue",
+    "us-gaap:CostOfGoodsAndServicesSold":                                      "cost_of_revenue",
+    "us-gaap:CostOfGoodsSold":                                                 "cost_of_revenue",
+    # Gross profit
+    "us-gaap:GrossProfit":                                                     "gross_profit",
+    # R&D
+    "us-gaap:ResearchAndDevelopmentExpense":                                   "rd_expense",
+    "us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost":     "rd_expense",
+    # Sales & marketing
+    "us-gaap:SellingAndMarketingExpense":                                      "sm_expense",
+    "us-gaap:MarketingExpense":                                                "sm_expense",
+    # G&A
+    "us-gaap:GeneralAndAdministrativeExpense":                                 "ga_expense",
+    # Total opex
+    "us-gaap:OperatingExpenses":                                               "total_opex",
+    "us-gaap:CostsAndExpenses":                                                "total_opex",
+    "us-gaap:NoninterestExpense":                                              "total_opex",  # banks
+    # Operating income
+    "us-gaap:OperatingIncomeLoss":                                             "operating_income",
+    "us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": "pretax_income",
+    "us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments": "pretax_income",
+    # Interest income / expense (banks)
+    "us-gaap:InterestIncomeExpenseNet":                                        "interest_income",
+    "us-gaap:InterestIncomeOperating":                                         "interest_income",
+    "us-gaap:InterestAndDividendIncomeOperating":                              "interest_income",
+    "us-gaap:InterestExpense":                                                 "interest_expense",
+    "us-gaap:InterestExpenseOperating":                                        "interest_expense",
+    # Non-interest / other income
+    "us-gaap:NoninterestIncome":                                               "other_income_net",
+    "us-gaap:OtherNonoperatingIncomeExpense":                                  "other_income_net",
+    # Tax
+    "us-gaap:IncomeTaxExpenseBenefit":                                         "tax_expense",
+    # Net income
+    "us-gaap:NetIncomeLoss":                                                   "net_income",
+    "us-gaap:ProfitLoss":                                                      "net_income",
+    "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic":                 "net_income",
+    # EPS
+    "us-gaap:EarningsPerShareBasic":                                           "eps_basic",
+    "us-gaap:EarningsPerShareDiluted":                                         "eps_diluted",
+    "us-gaap:EarningsPerShareBasicAndDiluted":                                 "eps_diluted",
+    # Shares
+    "us-gaap:WeightedAverageNumberOfSharesOutstandingBasic":                   "shares_basic",
+    "us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding":                 "shares_diluted",
+    "us-gaap:WeightedAverageNumberOfSharesOutstandingDiluted":                 "shares_diluted",
+    # Margins
+    "us-gaap:GrossProfit":                                                     "gross_profit",  # already above; explicit for clarity
+}
+
+
+def _role_from_xbrl(taxonomy_key: str) -> str | None:
+    """Return the derivation role for an exact XBRL taxonomy key.
+
+    Strips dimensional member suffixes (e.g. ``us-gaap:Revenues|aapl:Member``)
+    before lookup.  Returns ``None`` for unknown or company-specific keys.
+    """
+    if not taxonomy_key:
+        return None
+    base = taxonomy_key.split("|")[0]
+    return _XBRL_TO_ROLE.get(base)
+
+
+def identify_role(label: str, taxonomy_key: str = "") -> str | None:
+    """Return the semantic role for a concept, or ``None``.
+
+    Lookup priority:
+    1. Exact XBRL taxonomy-key match (``_XBRL_TO_ROLE``) — zero ambiguity,
+       handles all standard US-GAAP variants explicitly.
+    2. Label regex patterns (``_ROLE_PATTERNS``) — catches display-name
+       conventions and company-specific labels.
+
+    The LLM override (``role_overrides`` in ``derive_missing_concept_metrics``)
+    is applied by the caller as a final fallback.
+    """
+    role = _role_from_xbrl(taxonomy_key)
+    if role is not None:
+        return role
     return _identify_role(label)
 
 
@@ -293,17 +398,22 @@ def derive_missing_concept_metrics(
 
     result = dict(concept_metrics)
 
-    # Build concept_id → label lookup for role identification.
+    # Build concept_id → label + taxonomy_key lookups for role identification.
     id_to_label: dict[str, str] = {c["_id"]: c.get("label", "") for c in all_concepts}
+    id_to_tkey: dict[str, str] = {c["_id"]: c.get("taxonomy_key", "") for c in all_concepts}
 
     # Step 1 — populate role_values from already-mapped concepts.
+    # Use both label patterns AND taxonomy-key patterns so banking/fintech
+    # concepts with company-specific labels (e.g. sofi:InterestIncomeServicing)
+    # are correctly identified without an LLM call.
     _overrides = role_overrides or {}
     role_values: dict[str, float] = {}
     for cid, value in result.items():
         if not isinstance(value, (int, float)):
             continue
         label = id_to_label.get(cid, "")
-        role = _identify_role(label) or _overrides.get(cid)
+        tkey  = id_to_tkey.get(cid, "")
+        role = identify_role(label, tkey) or _overrides.get(cid)
         if role and role not in role_values:
             role_values[role] = value
 
@@ -325,7 +435,10 @@ def derive_missing_concept_metrics(
         targets = [
             c for c in unmapped
             if c["_id"] not in result
-            and (_identify_role(c.get("label", "")) or _overrides.get(c["_id"])) == target_role
+            and (
+                identify_role(c.get("label", ""), c.get("taxonomy_key", ""))
+                or _overrides.get(c["_id"])
+            ) == target_role
         ]
         if not targets:
             continue

@@ -46,6 +46,10 @@ class EarningsAgentState(TypedDict):
     # triggering the generic extraction path.
     company_cik: NotRequired[Optional[str]]
     target_concepts: NotRequired[Optional[list]]    # concept dicts from normalized_concepts_quarterly
+    # concept_id strings (subset of target_concepts) that had a value in the
+    # last N stored periods. Used to prune the extraction prompt to concepts the
+    # company actually reports. Empty/None means no pruning (bootstrap / disabled).
+    recent_concept_ids: NotRequired[Optional[list[str]]]
     calculated_concepts: NotRequired[Optional[list]]  # system:/calculated concept dicts for derivation
     concept_metrics: NotRequired[Optional[dict]]    # concept_id → float for normalize_data upsert
     derived_concept_ids: NotRequired[Optional[list[str]]]  # concept_ids filled by Tier-3 derivation

@@ -1,339 +1,504 @@
-# Project Flow
+# Earnings Pipeline — Project Flow
 
-End-to-end trace of the earnings extraction pipeline as currently implemented
-in [src/earnings_agents/workflow.py](src/earnings_agents/workflow.py).
-
-The graph is the same for SEC and IR sources; only the *discovery* node behaves
-differently. SEC mode pre-resolves the filing URL in the CLI and short-circuits
-discovery; IR mode performs discovery inside the graph.
+End-to-end trace of the SEC EDGAR path for one ticker.  
+**Example throughout: `SOFI` Q1 2026 (period end 2026-03-31, "in thousands" filing).**
 
 ---
 
-## Graph topology
+## Pipeline overview
 
 ```
-discover_earnings_release
-        │
-        ▼
-load_company_concepts        ← skips run when company absent from normalize_data
-        │
-        ▼
-detect_document_type
-        │
-   ┌────┴────┐
-   ▼         ▼
-extract_pdf  extract_html         ← html path also classifies GAAP tables
-   │         │
-   └────┬────┘
-        ▼
-extract_financial_metrics  ◄─────┐
-        │                        │
-        ▼                        │
-analyze_metrics  ────────────────┘   (loops while high-severity findings &
-        │                              extraction_attempts < MAX_EXTRACTION_ATTEMPTS=3)
-        ▼
-cleanup_metrics            ← deterministic case-dedup + constrained LLM pass
-        │
-        ▼
-mongodb_save               ← upsert concept values into normalize_data
+CLI  →  load_company_concepts_node
+     →  detect_document_type_node
+     →  extract_html_text_node
+     →  extract_financial_metrics_node   ← 3 LLM calls happen here
+     →  analyze_metrics_node
+     →  cleanup_metrics_node
+     →  mongodb_save_node
 ```
 
-All routing is implemented by the `_route_*` helpers in
-[workflow.py](src/earnings_agents/workflow.py). Any node that sets
-`status="failed"` short-circuits to `END`.
+---
+
+## Node 1 — `load_company_concepts_node`
+
+Queries `normalize_data.normalized_concepts_quarterly` for the ticker's
+income-statement concepts.  No LLM call.
+
+**Output stored in state:**
+```python
+state["target_concepts"] = [
+    {"_id": "6a4b4f2ac5b985524d4e7111", "label": "Earnings Per Share, Basic",
+     "taxonomy_key": "us-gaap:EarningsPerShareBasic",
+     "concept": "us-gaap:EarningsPerShareBasic", "path": "009"},
+    {"_id": "6a4b4f2ac5b985524d4e7118", "label": "Total net revenue",
+     "taxonomy_key": "us-gaap:RevenuesNetOfInterestExpense",
+     "concept": "us-gaap:RevenuesNetOfInterestExpense", "path": "001"},
+    # ... 43 more concepts (45 total for SOFI)
+]
+```
 
 ---
 
-## 1. CLI input and company resolution
+## Node 2 — `detect_document_type_node`
 
-Entry point: [src/earnings_agents/cli/earnings.py](src/earnings_agents/cli/earnings.py).
-
-- Accepts `--ticker`, `--cik`, `--source {sec|ir}`, optional `--ir-url`.
-- Ticker/CIK resolution goes through
-  [company_registry.py](src/earnings_agents/company_registry.py), backed by
-  [data/reference/tickers.json](data/reference/tickers.json).
-- Multi-ticker runs execute in parallel via `ThreadPoolExecutor`.
-- A rich progress UI tracks per-company stage transitions through the
-  hooks system ([hooks.py](src/earnings_agents/hooks.py)).
-
-### SEC mode (default)
-- The CLI calls `get_latest_earnings_url(cik)` from
-  [tools/edgar_client.py](src/earnings_agents/tools/edgar_client.py) and
-  pre-fills `discovered_file_url` on the initial state.
-- Initial `status="discovered"` so the graph skips IR discovery.
-
-### IR mode
-- CLI leaves `discovered_file_url=None` and provides `ir_url`.
-- The `discover_earnings_release` node does the LLM-driven URL search.
+Inspects the URL extension / HTTP Content-Type.  No LLM call.  
+Sets `state["file_type"] = "html"` for SoFi's Exhibit 99.1.
 
 ---
 
-## 2. EDGAR filing URL discovery (SEC mode only)
+## Node 3 — `extract_html_text_node`
 
-[tools/edgar_client.py](src/earnings_agents/tools/edgar_client.py):
+Downloads and parses the HTML press release.  No LLM call.  
+- Strips SGML wrappers (SEC EDGAR).  
+- Identifies GAAP tables (income statement, balance sheet, cash flow).  
+- Prepends scale captions like `"(in thousands)"` to each table chunk.  
+- Populates `state["raw_text"]` and `state["raw_sections"]`.
 
-1. Fetch the SEC submissions JSON for the CIK.
-2. Find the latest 8-K with Item 2.02 (Results of Operations).
-3. Open the filing index and locate `EX-99.1` (the earnings release exhibit).
-4. Fall back to the primary document when EX-99.1 is missing.
-
-Uses the SEC-compliant `User-Agent` and never relies on JS rendering.
-
----
-
-## 3. `discover_earnings_release_node`
-
-[nodes/discover_earnings_release.py](src/earnings_agents/nodes/discover_earnings_release.py).
-
-- Short-circuits when `discovered_file_url` is already set (SEC mode).
-- Otherwise fetches the IR page via
-  [tools/static_scraper.py](src/earnings_agents/tools/static_scraper.py),
-  falls back to Playwright via
-  [tools/playwright_scraper.py](src/earnings_agents/tools/playwright_scraper.py)
-  if the static response is too small.
-- Extracts anchor links and asks the LLM to identify the earnings release URL.
-- On success: sets `discovered_file_url` and `status="discovered"`.
+**Output (abbreviated):**
+```
+state["raw_sections"] = {
+    "income_statement": "=== GAAP INCOME STATEMENT ===\n"
+                        "(in thousands)\n"
+                        "Total net revenue     771,000\n"
+                        "Net interest income   425,000\n"
+                        "...",
+    "balance_sheet":    "=== GAAP BALANCE SHEET ===\n...",
+    ...
+}
+```
 
 ---
 
-## 4. `load_company_concepts_node`
+## Node 4 — `extract_financial_metrics_node`
 
-[nodes/load_company_concepts_node.py](src/earnings_agents/nodes/load_company_concepts_node.py).
+This node makes **up to 3 LLM calls**. Two run sequentially on the critical
+path; one runs in a background thread in parallel with the main extraction.
 
-- Looks up the company by ticker in `normalize_data.companies`.
-- Infers `detected_period_type` (`"annual"` or `"quarterly"`) using a
-  two-signal strategy:
-  - **Cadence-based** (primary): queries `get_next_period_type` for the
-    company's filing cycle (Q1→Q2→Q3→annual→Q1…) stored in the DB. Most
-    reliable when historical documents exist.
-  - **Date-based** (safety net): compares `sec_report_date` month against the
-    company's `fiscal_year_end_month`. Used for bootstrap (no stored history)
-    and as an override when the period-end date unambiguously lands on the
-    fiscal year-end (covers 52/53-week filers with ±7-day drift tolerance).
-- Pulls income-statement concepts from the appropriate collection
-  (`normalized_concepts_quarterly` or `normalized_concepts_annual`) and
-  populates `company_cik`, `target_concepts`, `calculated_concepts`,
-  `fiscal_year_end_month`, `fiscal_year_end_code`, `detected_period_type`.
-- **Skips the run** (`status="skipped"` + clear `error`) when the company is
-  absent from `normalize_data`, the DB lookup/concept query fails, or no
-  income-statement concepts are stored — there is no generic extraction
-  fallback. The router `_route_after_concepts` ends the run on a skip.
+```
+[roles LLM]  launched in background thread ─────────────────────────────────┐
+[extraction LLM]  ~45s (critical path)                                       │
+                 ↓                                                           │
+[tier2 LLM]  ~25s sequential after extraction (critical path)               │
+                 ↓                                                           │
+[roles result collected]  instant — thread already finished ←───────────────┘
+[derivation]  instant pure Python
+```
 
----
+### Step 4a — Document prescan (no LLM)
 
-## 5. `detect_document_type_node`
+Scans `raw_text` for the scale caption before any LLM call.
 
-[nodes/detect_document_type.py](src/earnings_agents/nodes/detect_document_type.py).
-
-- Extension-first (`.htm`/`.html`/`.pdf`), HEAD-request fallback otherwise.
-- Sets `state["file_type"]` and routes to `extract_html_text` or
-  `extract_pdf_text` via `_route_by_file_type`.
+```
+Input:  "(in thousands, except per share data)"  ← found in the HTML
+Output: doc_scale = "thousands"
+        dollar_multiplier = 1_000
+        shares_multiplier = 1_000   (no separate share scale declared)
+```
 
 ---
 
-## 6. Raw text extraction
+### LLM Call 1 — `[roles]` (background thread)
 
-### `extract_html_text_node`
-[nodes/extract_html_text.py](src/earnings_agents/nodes/extract_html_text.py).
+**Purpose:** Assign a standard financial role (e.g., `revenue`, `net_income`,
+`eps_basic`) to each concept label that the regex patterns in
+`calculators.py` could not classify.  Launched as a background thread
+immediately before the extraction call so its latency is hidden.
 
-- SEC-compliant `User-Agent` for `sec.gov` URLs.
-- Strips SGML wrappers from EDGAR archive responses.
-- Playwright JS fallback is **disabled** for `sec.gov` (filings are static HTML).
-- **Table classification**: tables are sorted into
-  `income_statement`, `balance_sheet`, `cash_flow`, `non_gaap`, `other`
-  using regex matchers over each table's preceding-sibling context and body
-  text. The non-GAAP probe runs first so reconciliation tables sharing GAAP
-  metric names ("Net income as reported") are diverted correctly.
-- The classified tables are placed on
-  `state["raw_sections"]` as a dict of section → list of markdown tables.
-  When this is present, `extract_financial_metrics` issues one LLM call per
-  GAAP table instead of char-window chunking — eliminating numeric splits
-  across chunk boundaries.
+**When:** Concepts whose label has no regex match in `_ROLE_PATTERNS`.
 
-### `extract_pdf_text_node`
-[nodes/extract_pdf_text.py](src/earnings_agents/nodes/extract_pdf_text.py).
+**Prompt template** (`_LLM_ROLE_PROMPT` in `tools/llm_concept_mapper.py`):
+```
+You are a financial metric role classifier.
 
-- Downloads the PDF, extracts text, sets `state["raw_text"]`. PDFs always
-  go through the char-window chunk path (no table classification).
+Map each label below to the closest standard financial metric role.
+Only assign a role when you are confident — return null if unsure.
 
----
+Known roles and their meaning:
+  revenue              — total net revenue or sales
+  cost_of_revenue      — cost of goods/products/services sold
+  gross_profit         — gross profit (revenue minus cost of revenue)
+  rd_expense           — research and development expense
+  sm_expense           — sales and marketing expense
+  ga_expense           — general and administrative expense
+  total_opex           — total operating expenses or costs
+  operating_income     — income/profit/loss from operations
+  interest_income      — interest and other income
+  interest_expense     — interest expense
+  other_income_net     — other non-operating income or expense (net)
+  pretax_income        — income before income taxes
+  tax_expense          — income tax expense / provision for taxes
+  net_income           — net income, net earnings, or net loss
+  eps_basic            — basic earnings per share
+  eps_diluted          — diluted earnings per share
+  shares_basic         — basic weighted-average shares outstanding
+  shares_diluted       — diluted weighted-average shares outstanding
+  gross_margin_pct     — gross profit margin percentage
+  operating_margin_pct — operating income margin percentage
+  net_margin_pct       — net income margin percentage
 
-## 7. `extract_financial_metrics_node`
+Labels to classify:
+  - "Loans and securitizations"
+  - "Securitizations"
+  - "Related party notes"
+  - "Other interest income"
+  - "Securitizations and warehouses"
+  - "Deposits"
+  - "Corporate borrowings"
+  - "Other interest expense"
+  - "Loan origination, sales, securitizations and servicing"
+  ... (remaining unrecognized labels)
 
-[nodes/extract_financial_metrics.py](src/earnings_agents/nodes/extract_financial_metrics.py).
+Return ONLY a JSON object mapping each label to its role (or null):
+{"<label>": "<role_or_null>", ...}
+```
 
-Targeted extraction prompt (`target_concepts` present): supplies the concrete
-list of `"Label" (GAAP: LocalName)` strings and instructs the LLM to use those
-label strings verbatim as keys, enabling lossless mapping to `concept_id`
-for `normalize_data` upserts. (Generic extraction has been removed; a run that
-reaches this node without `target_concepts` fails defensively — in production
-`load_company_concepts` has already skipped it.)
+**Real SoFi input — 24 unrecognized labels (after today's banking patterns fix,
+labels like "Net interest income" and "Technology and product development" are
+now matched by regex and no longer sent to the LLM):**
+```json
+Labels sent to roles LLM:
+  "Loans and securitizations", "Securitizations",
+  "Related party notes", "Securitizations and warehouses",
+  "Deposits", "Corporate borrowings",
+  "Loan origination, sales, securitizations and servicing",
+  "Loan platform fees", "Net crypto transaction revenue",
+  "Credit Card", "Commercial and consumer banking",
+  ... (highly specific banking sub-items)
+```
 
-The prompt requires two leading fields:
+**LLM response (SoFi example):**
+```json
+{
+  "Total interest income":              "interest_income",
+  "Other interest income":              "interest_income",
+  "Other noninterest income":           "other_income_net",
+  "Technology and product development": "rd_expense",
+  "Loans and securitizations":          null,
+  "Securitizations":                    null,
+  "Deposits":                           null,
+  "Credit Card":                        null
+}
+```
 
-- `__scale__` ∈ `{"millions","thousands","billions","as-is"}`.
-- `__period__` — the most recent period column label exactly as printed.
-
-Per-call mechanics:
-
-- Each pass increments `extraction_attempts`.
-- The optional `extraction_notes` hint block (produced by `analyze_metrics`)
-  is injected into the prompt to focus the next pass on missing metrics.
-- Inputs are either (a) one chunk per classified GAAP table from
-  `raw_sections`, or (b) char-window chunks of `raw_text` with overlap.
-- A process-wide `Semaphore(OLLAMA_CONCURRENCY)` throttles concurrent
-  Ollama calls.
-- Per-chunk JSON is parsed, `__scale__` is applied in Python after merging,
-  and `_validate_metrics` runs accounting sanity checks (populating
-  `identity_warnings`).
-- Special-cased keys: EPS / per-share / percentage / share-count / physical
-  unit metrics are never multiplied by the table scale.
-
----
-
-## 8. `analyze_metrics_node` (the loop controller)
-
-[nodes/analyze_metrics.py](src/earnings_agents/nodes/analyze_metrics.py).
-
-Runs every deterministic checker from the **skill catalog**
-([analysis/skills.py](src/earnings_agents/analysis/skills.py) — `iter_detectors()`).
-Each checker is defined in [analysis/findings.py](src/earnings_agents/analysis/findings.py)
-and paired in the catalog with stable metadata and curated remediation guidance:
-
-- `check_presence` — tiered coverage against `TIER1/2/3_REGISTRY` (special-invocation).
-- `check_case_duplicates`
-- `check_composite_keys`
-- `check_gaap_nongaap_leakage`
-- `check_gross_profit_identity`
-- `check_operating_vs_gross`
-- `check_eps_dilution_ordering`
-- `check_suspect_round`
-- `check_opex_label_collision`
-- `check_source_grounding` (special-invocation)
-
-Browse the catalog: `uv run earnings-skills`.
-
-Deterministic auto-correction:
-
-- When the OPEX/Operating-income collision is detected, the node calls
-  `derive_corrected_total_opex` and replaces the bad value with
-  `Cost of revenue + Operating expenses`.
-
-Output:
-
-- `state["findings"]` — list of `Finding.to_dict()` entries.
-- `state["needs_reextract"]` — routing flag (replaces the deleted
-  `reflect_metrics` node).
-- `state["extraction_notes"]` — cumulative hint block for the next pass
-  (prepends the previous attempt's notes so the LLM keeps context).
-- `state["previous_high_finding_keys"]` — snapshot used to detect
-  no-progress loops (identical high-severity messages between consecutive
-  passes break the loop early).
-
-Loop policy:
-
-- Loops back to `extract_financial_metrics` only when **all** of the
-  following hold: at least one `high`-severity finding,
-  `extraction_attempts < MAX_EXTRACTION_ATTEMPTS (=3)`, and the new
-  high-severity messages differ from the previous pass.
-- **Targeted (normalize_data) mode tweak**: `missing_critical` findings are
-  demoted from `high` to `medium` because the truth set is `target_concepts`,
-  not the hard-coded TIER1 registry — a company that genuinely doesn't
-  report a TIER1 metric (e.g. BJ Wholesale Club has no standalone Gross
-  Profit) must not loop indefinitely.
+**Post-processing:**
+- Null values and unknown roles are discarded.
+- Valid results stored as `role_overrides = {concept_id → role}`.
+- Used in Step 4d (derivation) to compute EPS, margins, etc.
 
 ---
 
-## 9. `cleanup_metrics_node`
+### LLM Call 2 — `[llm]` extraction (critical path, ~45s)
 
-[nodes/cleanup_metrics.py](src/earnings_agents/nodes/cleanup_metrics.py).
+**Purpose:** Extract numeric values for all target concepts from the raw text.
 
-Two-phase, constrained, **drop-only** cleanup:
+**Prompt template** (`_TARGETED_PROMPT_TEMPLATE` in
+`nodes/extract_financial_metrics.py`):
+```
+You are a financial data extraction assistant.
 
-1. **Deterministic case-dedup pass**: removes obvious case duplicates and
-   structural artifacts. Driven by the `findings` produced upstream.
-2. **Optional LLM pass** (`CLEANUP_METRICS=1`, default on): the LLM can
-   only return a `remove` set, which is enforced to be a subset of the
-   current keys. Surviving values are kept byte-for-byte. The cleanup is
-   rejected if `_validate_metrics` raises a new blocking warning on the
-   cleaned dict.
-   - Metric values are encoded in a compact form (`"82.9B"`, `"315M"`,
-     `"24.3K"`) for prompt efficiency; the LLM operates on original keys.
-   - A `_needs_cleanup` pre-check skips the LLM call when the metrics look
-     obviously clean (no near-equal value pairs, no case duplicates, no
-     implausible per-share values).
+Extract ONLY the income statement metrics listed below from the text excerpt
+for {company_name} ({ticker}).
+This is chunk {chunk_num} of {total_chunks} of the full document.
 
-Cleanup never renames keys, never edits values, never adds keys. Dropped
-keys go to `state["cleanup_removed"]` for visibility.
+CONFIRMED SCALE: document header says "(In thousands)" —
+set __scale__ = "thousands" for this chunk.
+
+CONFIRMED PERIOD: most-recent period is "Three Months Ended March 31, 2026" —
+extract ONLY the column for that period.
+
+SCOPE — extract ONLY the concepts listed below.
+Use the bracketed key [ ] as your JSON key when one is shown; otherwise use
+the quoted label exactly.
+
+  • "Total net revenue"                       [us-gaap:RevenuesNetOfInterestExpense]
+  • "Net interest income"                     [us-gaap:InterestIncomeExpenseNet]
+  • "Total interest income"                   [us-gaap:InterestIncomeOperating]
+  • "Loans and securitizations"               [us-gaap:InterestAndFeeIncomeLoansAndLeases]
+  • "Securitizations"                         [sofi:InterestIncomeSecuritizations]
+  • "Technology and product development"      [us-gaap:ResearchAndDevelopmentExpense]
+  • "Sales and marketing"                     [us-gaap:SellingAndMarketingExpense]
+  • "General and administrative"              [us-gaap:GeneralAndAdministrativeExpense]
+  • "Net income (loss)"                       [us-gaap:NetIncomeLoss]
+  • "Earnings Per Share, Basic"               [us-gaap:EarningsPerShareBasic]
+  • "Earnings Per Share, Diluted"             [us-gaap:EarningsPerShareDiluted]
+  • "Weighted Average Number of Shares Outstanding, Basic"
+                                              [us-gaap:WeightedAverageNumberOfSharesOutstandingBasic]
+  ... (all 45 concepts)
+
+IGNORE — do NOT extract:
+  • Balance sheet items, cash flow items, non-GAAP metrics, guidance / forecasts.
+  • Values from FOOTNOTES or parenthetical sub-tables.
+
+PERIOD RULE — extract ONLY from the most-recent column ("Three Months Ended
+March 31, 2026"). NEVER take a value from the prior-year comparison column.
+
+INTERNAL CONSISTENCY:
+  Revenue − Cost of revenue = Gross profit (verify before returning).
+
+Return ONLY a flat JSON object. First field: "__scale__". Second: "__period__".
+Last field: "__sources__" mapping each key to its verbatim source snippet.
+
+Text excerpt:
+"""
+(in thousands)
+                                Three Months Ended    Three Months Ended
+                                  March 31, 2026        March 31, 2025
+Total net revenue                    771,000               621,000
+Net interest income                  425,000               318,000
+Total interest income                594,000               460,000
+  Loans and securitizations          523,000               405,000
+  Securitizations                     36,000                30,000
+  ...
+Technology and product development   197,584               165,000
+Sales and marketing                  138,255               115,000
+General and administrative            68,812                58,000
+Net income (loss)                    121,593                71,000
+Earnings Per Share, Basic               0.13                  0.08
+Earnings Per Share, Diluted             0.12                  0.07
+...
+"""
+```
+
+**LLM response (SoFi Q1 2026):**
+```json
+{
+  "__scale__":   "thousands",
+  "__period__":  "Three Months Ended March 31, 2026",
+
+  "Total net revenue":                                   771000,
+  "Net interest income":                                 425000,
+  "Total interest income":                               594000,
+  "Loans and securitizations":                           523000,
+  "Securitizations":                                      36000,
+  "Technology and product development":                  197584,
+  "Sales and marketing":                                 138255,
+  "General and administrative":                           68812,
+  "Net income (loss)":                                   121593,
+  "Earnings Per Share, Basic":                             0.13,
+  "Earnings Per Share, Diluted":                           0.12,
+  "Weighted Average Number of Shares Outstanding, Basic": 932184,
+
+  "__sources__": {
+    "Total net revenue":          "Total net revenue 771,000",
+    "Earnings Per Share, Basic":  "Earnings Per Share, Basic 0.13",
+    ...
+  }
+}
+```
+
+**Post-processing (Python, no LLM):**
+
+1. `__scale__` popped → `multiplier = 1_000` (confirmed by prescan → overrides LLM).
+2. `__sources__` popped → stored in `state["metric_source_snippets"]`.
+3. Scale applied to each key:
+   - `_PCT_OR_PER_SHARE_PATTERNS` checked per key.
+   - `"Total net revenue"` → scaled: `771000 × 1000 = 771,000,000` ✓
+   - `"Earnings Per Share, Basic"` → **NOT scaled** (matches `per share` pattern): stays `0.13` ✓
+   - `"[us-gaap:EarningsPerShareBasic]"` → **NOT scaled** (matches `per\w*share` pattern): stays as-is ✓
+4. `_merge_metrics` picks the highest-authority section value per key (income_statement wins over other).
 
 ---
 
-## 10. `mongodb_save_node`
+### Step 4b — Tier-0 / Tier-1 mapping (no LLM, instant)
 
-Defined in [workflow.py](src/earnings_agents/workflow.py).
+Maps each extracted key to a `concept_id` deterministically.
 
-- Refuses to save when `identity_warnings` is non-empty AND
-  `STRICT_ACCURACY=1` (the default) — returns `status="failed"`.
-- Logs a warning (but does not abort) when unresolved `high`-severity
-  findings remain in `state["findings"]` after the loop.
-- Calls `upsert_concept_values` from
-  [tools/normalize_data_client.py](src/earnings_agents/tools/normalize_data_client.py)
-  to record `concept_id → value` entries keyed by company CIK, period,
-  fiscal-year-end month, and fiscal-year-end code. Rows are routed to
-  `concept_values_quarterly` or `concept_values_annual` based on the
-  `detected_period_type` inferred at concept-load time.
-- When `concept_metrics`, `company_cik`, or `fiscal_year_end_month` are
-  missing the normalize_data upsert is skipped with a warning (run still
-  ends as `status="saved"`).
-- Returns `status="saved"` on success.
+```
+Tier 0  exact taxonomy_key match:
+        "us-gaap:RevenuesNetOfInterestExpense" in metrics
+            → concept_id "6a4b4f2ac5b985524d4e7118"  ✓
+
+Tier 1a  exact label match:
+        "Total net revenue" == concept.label
+            → concept_id "6a4b4f2ac5b985524d4e7118"  ✓
+
+Tier 1b  normalised label match (lowercase + collapsed whitespace):
+        "total net revenue" == normalize("Total net revenue")
+            → concept_id "6a4b4f2ac5b985524d4e7118"  ✓
+```
+
+**SoFi result:** 31 of 45 concepts matched → `concept_metrics = {concept_id: value, ...}`.  
+The remaining **13 concepts** could not be matched by any label.
 
 ---
 
-## State progression cheat-sheet
+### LLM Call 3 — `[tier2]` semantic mapping (critical path, ~25s)
 
-`pending → discovered → fetched → text_extracted → extracted → saved | failed`
+**Purpose:** For concepts that tier0/tier1 couldn't match (label in the filing
+differs from the stored label), ask the LLM to find the closest semantic match
+from the pool of already-extracted keys.
 
-Routing-specific state fields (not part of the linear status):
+**Pre-filter applied first (no LLM):**
+Removes concepts that can never appear in earnings press releases:
+- OCI / comprehensive-income items (`"Comprehensive income (loss)"`,
+  `"Unrealized gains on AFS securities"`, `"Foreign currency translation"`)
+- Dimensional segment concepts (`|` in `taxonomy_key`)
 
-| Field | Set by | Consumed by |
+SoFi: 13 unmapped → 9 matchable candidates after filter.
+
+**Prompt template** (`_LLM_MAP_PROMPT` in `tools/llm_concept_mapper.py`):
+```
+You are a financial concept mapper.
+
+Below are metric keys extracted from an earnings press release and a list of
+target concepts (XBRL tag + display label + concept_id) that we want to map to.
+
+For each target concept, decide which extracted key best matches it (if any).
+
+Rules:
+  1. Each extracted key may be assigned to AT MOST ONE concept.
+  2. Only assign a key when you are confident — do NOT guess.
+  3. If no extracted key fits a concept, return null for that concept.
+  4. Do not invent new keys; only use keys from the extracted list.
+
+Extracted metric keys:
+  - "Total net revenue"
+  - "Net interest income"
+  - "Total interest income"
+  - "Loans and securitizations"
+  - "Technology and product development"
+  - "Sales and marketing"
+  - "Net income (loss)"
+  - "Earnings Per Share, Basic"
+  ... (all 44 numeric keys)
+
+Target concepts:
+  - concept_id: "6a4b4f2ac5b985524d4e71aa"  GAAP: sofi:CreditCardLoanPortfolioSegmentMember  label: "Credit Card"
+  - concept_id: "6a4b4f2ac5b985524d4e71bb"  GAAP: sofi:CommercialAndConsumerBankingPortfolioSegmentMember  label: "Commercial and consumer banking"
+  - concept_id: "6a4b4f2ac5b985524d4e71cc"  GAAP: us-gaap:GoodwillImpairmentLoss  label: "Goodwill impairment"
+  - concept_id: "6a4b4f2ac5b985524d4e71dd"  GAAP: us-gaap:NoninterestIncome  label: "Total noninterest income"
+  ... (9 matchable concepts)
+
+Return ONLY a flat JSON object mapping concept_id -> matched extracted key (or null):
+{"<concept_id>": "<extracted_key_or_null>", ...}
+```
+
+**LLM response (SoFi Q1 2026):**
+```json
+{
+  "6a4b4f2ac5b985524d4e71aa": null,
+  "6a4b4f2ac5b985524d4e71bb": null,
+  "6a4b4f2ac5b985524d4e71cc": null,
+  "6a4b4f2ac5b985524d4e71dd": null
+}
+```
+All null — the concepts genuinely don't appear in the Q1 2026 press release
+(segment breakdown of credit loss provision not reported; no goodwill impairment).
+
+**Post-processing:** Null entries discarded. `concept_metrics` unchanged.
+
+---
+
+### Step 4c — Roles result collected (instant)
+
+The background roles thread (started at step 4a) has been running for ~40s
+during extraction + tier2.  Its result is collected immediately.
+
+```
+role_overrides = {
+    "6a4b4f2ac5b985524d4e7109": "interest_income",   # "Total interest income"
+    "6a4b4f2ac5b985524d4e7107": "interest_income",   # "Other interest income"
+    "6a4b4f2ac5b985524d4e7108": "other_income_net",  # "Other noninterest income"
+    "6a4b4f2ac5b985524d4e710a": "rd_expense",        # "Technology and product development"
+}
+```
+
+---
+
+### Step 4d — Derivation (no LLM, instant)
+
+`derive_missing_concept_metrics` in `analysis/calculators.py` computes values
+using accounting identities for any concept still absent from `concept_metrics`.
+
+**SoFi example — 1 value derived:**
+```
+concept:  "Earnings Per Share, Basic and Diluted"  (us-gaap:EarningsPerShareBasicAndDiluted)
+formula:  eps = net_income / shares_basic
+inputs:   net_income  = 121,593,000  (from concept_metrics, role: net_income)
+          shares_basic = 932,184,000  (from concept_metrics, role: shares_basic)
+result:   121,593,000 / 932,184,000 = 0.1304  → stored as 0.13
+```
+
+**Final `concept_metrics` for SoFi Q1 2026:**  32 values (31 tier1 + 1 derived).
+
+---
+
+## Node 5 — `analyze_metrics_node`
+
+Runs pure-Python QC checkers. No LLM call.
+
+- **Presence check:** are all Tier-1 XBRL concepts present? (Revenue, Net Income, EPS, etc.)
+- **Gross profit identity:** Revenue − Cost of revenue = Gross profit (SoFi is a bank, so Cost of revenue check is skipped when that concept is absent)
+- **EPS dilution ordering:** Diluted EPS ≤ Basic EPS (when both positive)
+- **Source grounding:** each metric's `__sources__` snippet must be findable in `raw_text`
+
+If any **high-severity** finding and `extraction_attempts < 3` → sets
+`needs_reextract = True` → loops back to Node 4 with `extraction_notes`
+containing the specific error.
+
+**SoFi Q1 2026:** No high-severity findings → `needs_reextract = False`.
+
+---
+
+## Node 6 — `cleanup_metrics_node`
+
+Deduplicates metric keys (case-insensitive). No LLM call in the deterministic
+pass; optional LLM pass removes Rule-A/B/C duplicates.
+
+---
+
+## Node 7 — `mongodb_save_node`
+
+Upserts each entry in `concept_metrics` into `normalize_data.concept_values_quarterly`:
+
+```python
+# One document per concept per company per period
+{
+    "_id":          ObjectId("..."),
+    "company_cik":  "0001818874",
+    "concept_id":   ObjectId("6a4b4f2ac5b985524d4e7118"),
+    "value":        771000000,        # 771,000 thousands = $771M
+    "reporting_period": {
+        "end_date":    datetime(2026, 3, 31),
+        "period_date": "2026-03-31",
+        "form_type":   "10-Q",
+        "quarter":     1,
+        "fiscal_year": 2026,
+    },
+    "earning_data": True,
+    "statement_type": "income_statement",
+    "created_at":  datetime(2026, 7, 6, 3, 44, 27),
+}
+```
+
+Document ID format for the earnings pipeline legacy path: `{TICKER}_{YEAR}_latest`
+(e.g. `SOFI_2026_latest`).
+
+---
+
+## LLM call summary table
+
+| Call | Prompt size | Typical time | Parallel? | SoFi result |
+|---|---|---|---|---|
+| `[roles]` identify roles | ~1K tokens | ~8s | ✅ background thread | 4/24 mapped |
+| `[llm]` extraction | ~8K tokens | ~45s | ❌ critical path | 44 keys extracted |
+| `[tier2]` semantic mapping | ~3K tokens | ~25s | ❌ critical path (after extraction) | 0/9 mapped |
+
+**Total wall time:** ~70s (extraction 45s + tier2 25s; roles hidden behind extraction).
+
+---
+
+## State fields touched at each stage
+
+| Field | Set by | Read by |
 |---|---|---|
-| `needs_reextract` | `analyze_metrics` | `_route_after_analysis` |
-| `extraction_notes` | `analyze_metrics` | `extract_financial_metrics` |
-| `previous_high_finding_keys` | `analyze_metrics` | `analyze_metrics` (next pass) |
-| `skill_effectiveness` | `analyze_metrics` | observability only (never routes) |
-| `findings` | `analyze_metrics` | `cleanup_metrics`, save doc |
-| `identity_warnings` | `extract_financial_metrics` | `mongodb_save` (gate) |
-| `cleanup_removed` | `cleanup_metrics` | informational |
-| `raw_sections` | `extract_html_text` | `extract_financial_metrics` |
-| `chunk_metric_sources` | `extract_financial_metrics` | `analyze_metrics` (scoped retry) |
-| `metric_source_snippets` | `extract_financial_metrics` | `analyze_metrics` (source grounding) |
-| `mapped_metric_keys` | `extract_financial_metrics` | `cleanup_metrics` (protected set) |
-| `concept_metrics` | `extract_financial_metrics` | `mongodb_save` (normalize_data upsert) |
-| `derived_concept_ids` | `extract_financial_metrics` | informational |
-| `target_concepts` / `calculated_concepts` / `company_cik` / `fiscal_year_end_*` | `load_company_concepts` | `extract_financial_metrics`, `mongodb_save` |
-| `sec_report_date` | CLI (SEC path) | `load_company_concepts`, `mongodb_save` |
-| `detected_period_type` | `load_company_concepts` | `mongodb_save` |
-
-The document `status` field at pipeline end is one of `"saved"` (normalize_data
-upsert succeeded or was skipped due to missing conditions) or `"failed"` (when
-`STRICT_ACCURACY` blocks the save due to identity warnings, or when the
-normalize_data upsert itself fails).
-
----
-
-## Key configuration knobs
-
-From [config.py](src/earnings_agents/config.py):
-
-- `LLM_PROVIDER` — `ollama` (default) | `groq` | `gemini` | `deepseek`.
-- `OLLAMA_*` — Ollama base URL, model, context window, concurrency.
-- `GROQ_*` — Groq API key, model, base URL, request timeout, RPM/TPM rate-limit budgets.
-- `DEEPSEEK_*` — DeepSeek API key, model (`deepseek-chat` default or `deepseek-reasoner`), base URL, timeout.
-- `GEMINI_*` — Google Gemini API key, model (`gemini-2.5-flash` default), timeout.
-- `OLLAMA_CONCURRENCY` — global cap on concurrent LLM calls.
-- `MONGODB_URI` / `MONGODB_DB` / `MONGODB_COLLECTION`.
-- `CHUNK_SIZE`, `CHUNK_OVERLAP`, `EXTRACTION_MAX_CHARS`.
-- `MAX_EXTRACTION_ATTEMPTS` (default 3).
-- `STRICT_ACCURACY` (default on) — blocks save on identity failures.
-- `CLEANUP_METRICS` (default on) — enables the constrained LLM cleanup pass.
-- `LLM_CACHE_ENABLED` / `LLM_CACHE_DIR` — opt-in dev cache for LLM responses (keyed by sha256 of provider+model+prompt); never enabled in production.
+| `target_concepts` | `load_company_concepts_node` | `extract_financial_metrics_node` |
+| `raw_text`, `raw_sections` | `extract_html_text_node` | `extract_financial_metrics_node`, `analyze_metrics_node` |
+| `metrics` | `extract_financial_metrics_node` | `analyze_metrics_node`, `cleanup_metrics_node` |
+| `concept_metrics` | `extract_financial_metrics_node` | `mongodb_save_node` |
+| `metric_source_snippets` | `extract_financial_metrics_node` | `analyze_metrics_node` (grounding check) |
+| `findings` | `analyze_metrics_node` | `extract_financial_metrics_node` (retry hints), `cleanup_metrics_node` |
+| `needs_reextract` | `analyze_metrics_node` | `workflow.py` routing |
+| `extraction_notes` | `analyze_metrics_node` | `extract_financial_metrics_node` (retry prompt) |
+| `extraction_attempts` | `extract_financial_metrics_node` | routing guard (max 3) |
+| `identity_warnings` | `extract_financial_metrics_node` | `mongodb_save_node` (STRICT_ACCURACY gate) |

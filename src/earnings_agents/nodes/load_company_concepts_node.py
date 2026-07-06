@@ -23,9 +23,11 @@ from __future__ import annotations
 import logging
 from datetime import date
 
+from earnings_agents.config import PROMPT_HISTORY_PERIODS
 from earnings_agents.tools.normalize_data_client import (
     get_company_by_ticker,
     get_next_period_type,
+    get_recently_valued_concept_ids,
     get_statement_concepts,
 )
 from earnings_agents.workflow_state import EarningsAgentState
@@ -225,10 +227,35 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             detected_period_type=period_type,
         )
 
+    # Prompt-pruning signal: which concepts has the company actually reported in
+    # its last N periods?  Concepts with no recent history (dimensional [Member]
+    # rows, retired line items) are dropped from the extraction prompt by
+    # extract_financial_metrics_node.  Best-effort — an empty set disables pruning.
+    recent_concept_ids: list[str] = []
+    if PROMPT_HISTORY_PERIODS > 0:
+        try:
+            recent = get_recently_valued_concept_ids(
+                cik, period_type=period_type, n_periods=PROMPT_HISTORY_PERIODS
+            )
+            recent_concept_ids = sorted(recent)
+            logger.info(
+                "load_company_concepts: %s has %d concept(s) with values in the "
+                "last %d %s period(s) (of %d total) — prompt will be pruned",
+                ticker, len(recent_concept_ids), PROMPT_HISTORY_PERIODS,
+                period_type, len(concepts),
+            )
+        except Exception as exc:  # noqa: BLE001 — pruning is best-effort
+            logger.debug(
+                "load_company_concepts: recent-concept lookup failed for %s (%s) "
+                "— extraction prompt will use the full concept list",
+                ticker, exc,
+            )
+
     return {
         **state,
         "company_cik": cik,
         "target_concepts": concepts,
+        "recent_concept_ids": recent_concept_ids,
         "calculated_concepts": [],
         "fiscal_year_end_month": fy_end_month,
         "fiscal_year_end_code": company.get("fiscal_year_end_code"),

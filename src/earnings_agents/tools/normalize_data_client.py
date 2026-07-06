@@ -567,6 +567,44 @@ def get_latest_period(cik: str) -> dict[str, Any] | None:
     return best
 
 
+def get_recently_valued_concept_ids(
+    cik: str,
+    period_type: str = "quarterly",
+    n_periods: int = 3,
+) -> set[str]:
+    """Return concept_id strings that had a value in the last *n_periods* periods.
+
+    Queries the ``concept_values_{annual|quarterly}`` collection for *cik*,
+    finds the *n_periods* most recent distinct ``reporting_period.end_date``
+    values, and returns the set of ``concept_id`` values (as strings) that had
+    at least one stored value in any of those periods.
+
+    Purpose: prune the extraction prompt.  A concept that has not been reported
+    in any of the recent periods is very unlikely to appear in the current
+    filing, so it is dropped from the LLM prompt (keeping the prompt small and
+    the LLM focused).  The concept remains in ``target_concepts`` for mapping
+    and derivation, so nothing downstream is affected.
+
+    Returns an **empty set** when no history exists (a brand-new company), which
+    the caller must treat as "no filter — use the full concept list" (bootstrap).
+    """
+    col_name = (
+        "concept_values_annual" if period_type == "annual"
+        else "concept_values_quarterly"
+    )
+    db = _get_client()[_NORMALIZE_DB]
+    col = db[col_name]
+    periods = col.distinct("reporting_period.end_date", {"company_cik": cik})
+    periods = sorted([p for p in periods if p is not None], reverse=True)[:n_periods]
+    if not periods:
+        return set()
+    ids = col.distinct(
+        "concept_id",
+        {"company_cik": cik, "reporting_period.end_date": {"$in": periods}},
+    )
+    return {str(i) for i in ids if i is not None}
+
+
 def get_next_period_type(
     cik: str, current_period_end: date | None = None
 ) -> str | None:

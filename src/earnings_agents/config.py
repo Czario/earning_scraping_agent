@@ -78,6 +78,23 @@ CLEANUP_METRICS: bool = os.getenv("CLEANUP_METRICS", "1").strip().lower() not in
     "0", "false", "no", "off", ""
 }
 
+# When True, the extraction prompt asks the LLM to echo a verbatim source
+# snippet for every metric (the ``__sources__`` field) which the
+# ``check_source_grounding`` checker uses to catch hallucinated values.
+# This roughly doubles the LLM output size (and generation time), so it is
+# OFF by default for speed. Enable (SOURCE_GROUNDING=1) for accuracy-critical
+# runs where anti-hallucination verification matters more than latency.
+SOURCE_GROUNDING: bool = os.getenv("SOURCE_GROUNDING", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+# Number of most-recent stored periods used to prune the extraction prompt.
+# A concept that had NO value in any of the last N periods is dropped from the
+# LLM prompt (it stays in target_concepts for mapping/derivation).  This filters
+# out dimensional/segment [Member] concepts and stale line items that bloat the
+# prompt.  Set to 0 to disable pruning entirely.
+PROMPT_HISTORY_PERIODS: int = int(os.getenv("PROMPT_HISTORY_PERIODS", "3"))
+
 # Maximum extraction passes in the agentic loop (initial pass + retries).
 # Override with the MAX_EXTRACTION_ATTEMPTS environment variable.
 MAX_EXTRACTION_ATTEMPTS: int = int(os.getenv("MAX_EXTRACTION_ATTEMPTS", "3"))
