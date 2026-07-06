@@ -20,6 +20,10 @@ _PCT_OR_PER_SHARE_PATTERNS = re.compile(
     r"|\bgross margin\b|\boperating margin\b|\bnet margin\b|\bprofit margin\b|\bmargin\s*%"
     # XBRL-style per-share suffixes: "Per Basic Share", "Per Diluted Share", etc.
     r"|\bper\s+(?:basic|diluted|basic\s+and\s+diluted|common)\s+share\b"
+    # camelCase XBRL keys such as [us-gaap:EarningsPerShareDiluted] or
+    # IncomeLossFromContinuingOperationsPerBasicShare — "Per...Share" contains
+    # no spaces so the human-readable "per share" pattern above never fires.
+    r"|per\w*share"
     # Operational unit counts -- physical quantities, never dollar-scaled
     r"|\bproduction\b|\bdeliveries\b|\bdelivered\b"
     r"|(?:super)?charger.{0,12}(?:station|connector)"

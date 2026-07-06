@@ -573,6 +573,36 @@ def test_scale_millions_applied_by_python():
     assert result["Diluted EPS"] == pytest.approx(4.27)   # EPS not multiplied
 
 
+def test_xbrl_eps_keys_not_scaled_in_thousands_document():
+    """XBRL-format EPS keys must not be multiplied by the document scale.
+
+    Regression: SoFi Q1-2026 8-K reported in thousands.  The targeted prompt
+    uses bracketed XBRL keys (e.g. [us-gaap:EarningsPerShareDiluted]) as JSON
+    keys.  Those camelCase keys contain "PerShare" (no space) so the human-
+    readable "per share" guard in _PCT_OR_PER_SHARE_PATTERNS never fired,
+    causing EPS to be multiplied by 1 000 (0.13 → 130, 0.12 → 120).
+    The fix adds |per\\w*share to the pattern so all XBRL per-share variants
+    are excluded from dollar-scale multiplication.
+    """
+    from earnings_agents.nodes.extract_financial_metrics import _parse_llm_response
+
+    raw = (
+        '{"__scale__": "thousands",'
+        ' "Net Revenue": 771000,'
+        ' "[us-gaap:EarningsPerShareBasic]": 0.13,'
+        ' "[us-gaap:EarningsPerShareDiluted]": 0.12,'
+        ' "[us-gaap:EarningsPerShareBasicAndDiluted]": 0.13}'
+    )
+    result = _parse_llm_response(raw)
+    assert result is not None
+    # Dollar line scaled correctly.
+    assert result["Net Revenue"] == pytest.approx(771_000_000)
+    # EPS keys must NOT be multiplied regardless of XBRL bracket format.
+    assert result["[us-gaap:EarningsPerShareBasic]"] == pytest.approx(0.13)
+    assert result["[us-gaap:EarningsPerShareDiluted]"] == pytest.approx(0.12)
+    assert result["[us-gaap:EarningsPerShareBasicAndDiluted]"] == pytest.approx(0.13)
+
+
 def test_scale_thousands_large_annual_values_still_scaled():
     """Thousands-scale multi-billion annual figures must all be scaled consistently.
 
