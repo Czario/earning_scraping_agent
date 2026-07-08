@@ -562,6 +562,37 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
     else:
         prompt_concepts = target_concepts
     concept_list_str = _build_concept_prompt_list(prompt_concepts)
+    # Per-chunk scale detection: each section chunk carries its own scale caption
+    # (injected by extract_html_text for each GAAP table, or present in the
+    # original HTML).  Running _prescan_document on the individual chunk text
+    # gives the most accurate multiplier for that specific table — immune to
+    # other sections of the document using a different scale.
+    #
+    # Example: a press release whose primary GAAP statements are "(In thousands)"
+    # but whose supplemental segment table is "(In millions)" will produce the
+    # correct ×1 000 or ×1 000 000 multiplier for each chunk independently.
+    # Falls back to the document-level scale when the chunk has no recognisable
+    # scale caption (e.g. plain char-split chunks from PDF paths).
+    #
+    # shares_multiplier stays document-level: the "except shares in thousands"
+    # clause is a document-wide declaration that lives in the primary statement
+    # caption and need not repeat in every section.
+    chunk_dollar_multipliers: list[int] = []
+    chunk_scale_hints: list[str] = []
+    for _chunk in chunks:
+        _chunk_scale, _, _ = _prescan_document(_chunk)
+        if _chunk_scale:
+            _cm = _SCALE_MULTIPLIERS.get(_chunk_scale, 1)
+            _ch = (
+                f"CONFIRMED SCALE: this table is labelled \"(In {_chunk_scale})\" — "
+                f"set __scale__ = \"{_chunk_scale}\" for this chunk.\n"
+            )
+        else:
+            _cm = dollar_multiplier
+            _ch = scale_hint
+        chunk_dollar_multipliers.append(_cm)
+        chunk_scale_hints.append(_ch)
+
     # Source-grounding block is opt-in (SOURCE_GROUNDING): it roughly doubles
     # the LLM output size, so it is omitted by default for speed.
     sources_hint = _SOURCES_HINT_BLOCK if SOURCE_GROUNDING else ""
@@ -572,7 +603,7 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
             chunk_num=i,
             total_chunks=total,
             focus_hint=focus_hint,
-            scale_hint=scale_hint,
+            scale_hint=chunk_scale_hints[i - 1],
             period_hint=period_hint,
             concept_list=concept_list_str,
             sources_hint=sources_hint,
@@ -597,7 +628,7 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                     total,
                     ticker,
                     shares_multiplier,
-                    dollar_multiplier,
+                    chunk_dollar_multipliers[i],
                     _CHUNK_MAX_RETRIES,
                     detail_callback,
                     _report_chunk,
@@ -624,7 +655,7 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 total,
                 ticker,
                 shares_multiplier,
-                dollar_multiplier,
+                chunk_dollar_multipliers[i],
                 _CHUNK_MAX_RETRIES,
                 detail_callback,
                 _report_chunk,

@@ -1070,6 +1070,27 @@ class TestPrescanDocument:
         scale, _, _ = _prescan_document(text)
         assert scale == "millions"
 
+    def test_earliest_caption_wins_over_later_outlook_caption(self):
+        """Primary statement caption wins over a later secondary caption (PENG).
+
+        Penguin Solutions' Q3-26 press release presents its financial
+        statements in thousands but also carries a Non-GAAP Business Outlook
+        reconciliation labelled "(in millions)" further down the document.
+        The earliest (statement) caption is authoritative — a later
+        "(in millions)" caption must NOT override it, otherwise every dollar
+        and share value is inflated 1000x.
+        """
+        text = (
+            "Penguin Solutions, Inc. Consolidated Statements of Operations\n"
+            "(In thousands, except per share amounts)\n"
+            "Total net sales 478713\nNet income 44689\n"
+            "Business Outlook\n"
+            "Non-GAAP adjustments (in millions)\n"
+            "(A) Stock-based compensation 30\n"
+        )
+        scale, _, _ = _prescan_document(text)
+        assert scale == "thousands"
+
     # -- Non-ASCII whitespace inside the caption (CrowdStrike regression). -----
     #    HTML earnings releases routinely separate the words of a scale caption
     #    with a non-breaking space (\xa0) or other Unicode space, which the
@@ -1108,6 +1129,90 @@ class TestPrescanDocument:
         text = "CONSOLIDATED STATEMENTS OF INCOME\nDollars\xa0in\xa0millions\nNet sales 124300\n"
         scale, _, _ = _prescan_document(text)
         assert scale == "millions"
+
+
+# ---------------------------------------------------------------------------
+# Per-chunk scale detection
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Per-chunk scale detection
+# ---------------------------------------------------------------------------
+
+class TestPerChunkScaleDetection:
+    """Each section chunk gets its own scale multiplier, not the document-level one.
+
+    When a document contains sections with different scale captions
+    (e.g. primary GAAP statements in thousands, supplemental segment data in
+    millions), each chunk must be parsed with its own prescan-derived multiplier.
+    """
+
+    def test_section_chunk_thousands_caption_detected(self):
+        """_prescan_document finds '(In thousands)' inside a section chunk."""
+        chunk = (
+            "=== Income Statement ===\n"
+            "(In thousands, except per share amounts)\n"
+            "Net sales 478713\n"
+        )
+        scale, _, _ = _prescan_document(chunk)
+        assert scale == "thousands"
+
+    def test_section_chunk_millions_caption_detected(self):
+        """_prescan_document finds '(In millions)' inside a supplemental chunk."""
+        chunk = "=== Other ===\n(In millions)\nSegment A Revenue 479\n"
+        scale, _, _ = _prescan_document(chunk)
+        assert scale == "millions"
+
+    @patch("earnings_agents.nodes.extract_financial_metrics._invoke_chunk_with_retry")
+    @patch("earnings_agents.nodes.extract_financial_metrics._build_section_chunks")
+    @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
+    def test_per_chunk_multiplier_passed_to_invoke(
+        self, mock_build_llm, mock_build_sections, mock_invoke
+    ):
+        """Each _invoke_chunk_with_retry call receives the multiplier from THAT
+        chunk's own scale caption, not the document-level scale.
+
+        Chunks:
+          chunk 0 — '(In thousands)' → prescan_dollar_multiplier = 1_000
+          chunk 1 — '(In millions)'  → prescan_dollar_multiplier = 1_000_000
+
+        The document-level raw_text is intentionally left without a scale caption
+        so doc_scale = None, confirming the per-chunk prescan is what drives the
+        multipliers (not a doc-level fallback).
+        """
+        thousands_chunk = (
+            "=== Income Statement ===\n(In thousands)\nNet sales 478713\n"
+        )
+        millions_chunk = (
+            "=== Other ===\n(In millions)\nSegment A Revenue 479\n"
+        )
+        # Force exactly these two chunks regardless of chunker internals
+        mock_build_sections.return_value = [thousands_chunk, millions_chunk]
+
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = "{}"   # parseable empty JSON
+        mock_build_llm.return_value = mock_llm
+        mock_invoke.return_value = {}          # parseable empty result per chunk
+
+        state = _base_state(
+            # No scale caption in raw_text → doc-level prescan returns None
+            raw_text="Net sales 478713\nSegment A Revenue 479\n",
+            raw_sections={"income_statement": ["Net sales 478713"]},
+            target_concepts=[
+                {"_id": "c_rev", "concept": "us-gaap:Revenues",
+                 "label": "Net sales", "statement_type": "income_statement"},
+            ],
+        )
+
+        extract_financial_metrics_node(state)
+
+        # Sequential path: two calls, one per chunk
+        assert mock_invoke.call_count == 2
+        # Positional arg index 5 is prescan_dollar_multiplier
+        call0_dollar_mult = mock_invoke.call_args_list[0].args[5]
+        call1_dollar_mult = mock_invoke.call_args_list[1].args[5]
+        assert call0_dollar_mult == 1_000        # thousands chunk
+        assert call1_dollar_mult == 1_000_000    # millions chunk
 
 
 # ---------------------------------------------------------------------------

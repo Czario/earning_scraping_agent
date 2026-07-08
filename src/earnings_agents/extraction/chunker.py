@@ -56,25 +56,33 @@ _PRESCAN_HEADING_PREFIX = (
     r"in[^\S\n]+"
 )
 
-_PRESCAN_SCALE: list[tuple[re.Pattern, str]] = [
-    # Parenthesised table captions take priority — they are the strongest,
-    # least ambiguous scale signal. Match "(in millions)",
-    # "(Amounts in millions, except ...)", "($ in thousands)" etc.
+# Parenthesised table captions take priority — they are the strongest,
+# least ambiguous scale signal. Match "(in millions)",
+# "(Amounts in millions, except ...)", "($ in thousands)" etc.
+_PRESCAN_SCALE_PARENS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\([^)]{0,30}?\bin millions\b", re.I), "millions"),
     (re.compile(r"\([^)]{0,30}?\bin thousands\b", re.I), "thousands"),
     (re.compile(r"\([^)]{0,30}?\bin billions\b", re.I), "billions"),
-    # Non-parenthesised scale headings that sit on their OWN line above a
-    # table, e.g. "Dollars in thousands", "$ in millions",
-    # "In thousands, except per share data",
-    # "All figures in millions unless otherwise noted".
-    # Anchored at line start (re.MULTILINE) with only finance qualifier words
-    # allowed before "in <unit>", so narrative prose such as
-    # "Revenue was $132.4 million in the quarter" (a number precedes the unit,
-    # and the line does not begin with "in <unit>") never matches.
+]
+
+# Non-parenthesised scale headings that sit on their OWN line above a
+# table, e.g. "Dollars in thousands", "$ in millions",
+# "In thousands, except per share data",
+# "All figures in millions unless otherwise noted".
+# Anchored at line start (re.MULTILINE) with only finance qualifier words
+# allowed before "in <unit>", so narrative prose such as
+# "Revenue was $132.4 million in the quarter" (a number precedes the unit,
+# and the line does not begin with "in <unit>") never matches.
+_PRESCAN_SCALE_HEADINGS: list[tuple[re.Pattern, str]] = [
     (re.compile(_PRESCAN_HEADING_PREFIX + r"millions\b", re.I | re.M), "millions"),
     (re.compile(_PRESCAN_HEADING_PREFIX + r"thousands\b", re.I | re.M), "thousands"),
     (re.compile(_PRESCAN_HEADING_PREFIX + r"billions\b", re.I | re.M), "billions"),
 ]
+
+# Backward-compatible flat list (parens first, then headings). Re-exported.
+_PRESCAN_SCALE: list[tuple[re.Pattern, str]] = (
+    _PRESCAN_SCALE_PARENS + _PRESCAN_SCALE_HEADINGS
+)
 
 # Detects when share counts use a DIFFERENT scale than dollar amounts.
 # e.g. "(In millions, except number of shares which are reflected in thousands"
@@ -182,11 +190,44 @@ def _prescan_document(raw_text: str) -> tuple[str | None, str | None, str | None
     # heading patterns (re.MULTILINE) stay line-scoped.
     text = re.sub(r"[^\S\n]+", " ", raw_text)
 
-    scale: str | None = None
-    for pattern, scale_name in _PRESCAN_SCALE:
-        if pattern.search(text):
-            scale = scale_name
-            break
+    # Scale detection uses FREQUENCY then POSITION, not list-order.
+    #
+    # A press release routinely mixes scale captions:
+    #   • The primary GAAP financial statements (income, balance sheet, cash
+    #     flows) each carry their own "(In thousands…)" caption → typically
+    #     3–6 matches for the dominant scale.
+    #   • Supplemental sections (Non-GAAP reconciliation, business outlook)
+    #     may use a different scale ("(in millions)") → usually 1–2 matches.
+    #
+    # Rule: the scale with the MOST parenthesised-caption occurrences is the
+    # authoritative document scale.  Ties (rare) break by earliest occurrence.
+    # If no parenthesised caption exists, fall back to the earliest
+    # non-parenthesised heading that matches a known scale.
+    #
+    # This is strictly more robust than position-only:
+    #   • Position-only still works when the primary statements come first
+    #     (the common case, including PENG Q3-26).
+    #   • Frequency-over-position additionally handles filings where a
+    #     supplemental/outlook section appears *before* the GAAP statements
+    #     but those statements contain many more matching captions.
+    def _dominant_scale(patterns: list[tuple[re.Pattern, str]]) -> str | None:
+        counts: dict[str, int] = {}
+        first_pos: dict[str, int] = {}
+        for pattern, scale_name in patterns:
+            for m in pattern.finditer(text):
+                counts[scale_name] = counts.get(scale_name, 0) + 1
+                if scale_name not in first_pos or m.start() < first_pos[scale_name]:
+                    first_pos[scale_name] = m.start()
+        if not counts:
+            return None
+        max_count = max(counts.values())
+        candidates = [s for s, c in counts.items() if c == max_count]
+        # Tie-break: earliest occurrence wins among equally frequent scales.
+        return min(candidates, key=lambda s: first_pos[s])
+
+    scale: str | None = _dominant_scale(_PRESCAN_SCALE_PARENS) or _dominant_scale(
+        _PRESCAN_SCALE_HEADINGS
+    )
 
     shares_scale: str | None = None
     if _PRESCAN_SHARES_IN_THOUSANDS_RX.search(text):
