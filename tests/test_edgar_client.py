@@ -74,7 +74,8 @@ def test_finds_exhibit_99_from_8k_item_202(mock_get):
         items=["2.02,9.01", ""],
         accessions=["0000320193-26-000011", "0000320193-25-000010"],
         primary_docs=["aapl-20260430.htm", "aapl-10q.htm"],
-        report_dates=["2026-03-29", ""],
+        report_dates=["2026-03-29", "2025-12-27"],
+        filing_dates=["2026-03-30", "2026-02-01"],
     )
 
     index_resp = MagicMock()
@@ -153,11 +154,12 @@ def test_falls_back_to_primary_doc_when_index_fails(mock_get):
     submissions_resp = MagicMock()
     submissions_resp.raise_for_status = MagicMock()
     submissions_resp.json.return_value = _mock_submissions(
-        forms=["8-K"],
-        items=["2.02,9.01"],
-        accessions=["0000320193-26-000011"],
-        primary_docs=["aapl-20260430.htm"],
-        report_dates=["2026-03-29"],
+        forms=["8-K", "10-Q"],
+        items=["2.02,9.01", ""],
+        accessions=["0000320193-26-000011", "0000320193-25-000010"],
+        primary_docs=["aapl-20260430.htm", "aapl-10q.htm"],
+        report_dates=["2026-03-29", "2025-12-27"],
+        filing_dates=["2026-03-30", "2026-02-01"],
     )
 
     # Provide enough RequestExceptions to exhaust all retry attempts, then the
@@ -171,6 +173,8 @@ def test_falls_back_to_primary_doc_when_index_fails(mock_get):
 
     assert url is not None
     assert "aapl-20260430.htm" in url
+    # raw 8-K reportDate passes validation (between prior 10-Q reportDate
+    # and 8-K filing date), so it is accepted.
     assert report_date == "2026-03-29"
 
 
@@ -245,8 +249,10 @@ def test_uses_prior_year_10k_for_fast_annual_reporter(mock_get):
 
 
 @patch("earnings_agents.tools.edgar_client.requests.get")
-def test_falls_back_to_raw_report_date_when_no_prior_year_10q(mock_get):
-    """When no matching prior-year 10-Q exists, the raw EDGAR reportDate is used."""
+def test_keeps_raw_report_date_when_no_prior_periodic_filings(mock_get):
+    """When no prior 10-Q/10-K exists, the raw reportDate is kept for the skip
+    guard (best-effort).  The upsert now prefers the LLM's __period__ date, so
+    keeping the raw date here is safe — it only affects the skip decision."""
     submissions_resp = MagicMock()
     submissions_resp.raise_for_status = MagicMock()
     submissions_resp.json.return_value = _mock_submissions(
@@ -267,7 +273,7 @@ def test_falls_back_to_raw_report_date_when_no_prior_year_10q(mock_get):
     url, report_date = get_latest_earnings_url("0000320193")
 
     assert url is not None
-    # No prior-year 10-Q in mock — raw reportDate returned unchanged
+    # No prior 10-Q/10-K — raw reportDate kept for skip guard (best-effort).
     assert report_date == "2026-03-29"
 
 

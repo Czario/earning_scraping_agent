@@ -30,7 +30,7 @@ from redis import Redis
 
 from earnings_agents.cli.earnings import (
     _has_existing_period_data,
-    _is_period_already_stored,
+    _resolve_8k_skip_guard,
 )
 from earnings_agents.config import REDIS_URL
 from earnings_agents.hooks import set_call_callback, set_detail_callback, set_node_callback
@@ -124,11 +124,13 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         logger.info("8-K skipped for %s — no existing normalize_data period data", label)
         return True
 
-    # ── 3. Guard: skip if this exact period is already stored ─────────────────
-    if ticker and period and _is_period_already_stored(ticker, period):
-        pub.publish("skip", f"✓ already up to date — period {period} is already in normalize_data")
+    # ── 3. Guard: skip if this fiscal period is already stored ────────────────
+    # Uses fiscal_year_end_month + SEC submissions API to determine
+    # (fiscal_year, quarter) and checks concept_values_quarterly / _annual.
+    if ticker and cik and _resolve_8k_skip_guard(ticker, cik) is not None:
+        pub.publish("skip", f"✓ already up to date — period already in normalize_data")
         pub.close()
-        logger.info("8-K skipped for %s — period %s already stored in normalize_data", label, period)
+        logger.info("8-K skipped for %s — period already stored in normalize_data", label)
         return True
 
     # ── 4. Run the pipeline ───────────────────────────────────────────────────

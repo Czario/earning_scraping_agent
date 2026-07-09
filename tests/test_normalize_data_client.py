@@ -610,92 +610,100 @@ def test_load_concepts_rerun_q3_not_reclassified_as_annual():
 
 
 
-# ── _is_period_already_stored (CLI helper) ────────────────────────────────────
+# ── _resolve_8k_skip_guard (CLI helper) ─────────────────────────────────────
 
-from earnings_agents.cli.earnings import _is_period_already_stored  # noqa: E402
+from earnings_agents.cli.earnings import _resolve_8k_skip_guard  # noqa: E402
 
 
-def _make_latest_period(end_date_str: str) -> dict:
-    from datetime import datetime, timezone
-    dt = datetime.fromisoformat(end_date_str).replace(tzinfo=timezone.utc)
-    m = MagicMock()
-    m.date.return_value = dt.date()
-    return {
-        "period_type": "quarterly",
-        "fiscal_year": 2026,
-        "quarter": 1,
-        "end_date": m,
+def _mock_submissions_resp(*, forms, report_dates=None, filing_dates=None, items=None):
+    """Build a minimal SEC submissions JSON response mock."""
+    data = {
+        "filings": {
+            "recent": {
+                "form": forms,
+                "reportDate": report_dates or [""] * len(forms),
+                "filingDate": filing_dates or [""] * len(forms),
+                "items": items or [""] * len(forms),
+                "accessionNumber": ["acc"] * len(forms),
+                "primaryDocument": ["doc.htm"] * len(forms),
+            }
+        }
     }
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = data
+    return resp
 
 
-def test_is_period_already_stored_match():
-    """Returns True when EDGAR sec_report_date equals the latest stored end_date."""
-    company = {"cik": "000123", "fiscal_year_end_month": 12, "fiscal_year_end_code": "1231"}
-    latest = _make_latest_period("2025-09-30")
-
-    with patch("earnings_agents.cli.earnings._is_period_already_stored.__module__"):
-        pass  # ensure import path works
-
+def test_skip_guard_skips_when_fiscal_period_exists():
+    """Returns a state dict (skip) when the same FY+Q already exists in the DB."""
+    company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
+    submissions = _mock_submissions_resp(
+        forms=["8-K", "10-Q"],
+        report_dates=["", "2025-09-30"],
+        filing_dates=["2025-10-15", "2025-10-15"],
+        items=["2.02,9.01", ""],
+    )
     with (
         patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
-        patch("earnings_agents.tools.normalize_data_client.get_latest_period", return_value=latest),
+        patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=True),
+        patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
     ):
-        # Import inside patch context so the patched functions are used
-        from importlib import import_module
-        mod = import_module("earnings_agents.cli.earnings")
-        result = mod._is_period_already_stored("AAPL", "2025-09-30")
-
-    assert result is True
+        result = _resolve_8k_skip_guard("AAPL", "000123")
+    assert result is not None
+    assert result["status"] == "already_stored"
 
 
-def test_is_period_already_stored_mismatch():
-    """Returns False when EDGAR sec_report_date differs from stored end_date (new 8-K available)."""
-    company = {"cik": "000123", "fiscal_year_end_month": 12, "fiscal_year_end_code": "1231"}
-    latest = _make_latest_period("2025-06-30")  # Q2 stored
-
+def test_skip_guard_proceeds_when_fiscal_period_not_found():
+    """Returns None (proceed) when the FY+Q is not yet in the DB."""
+    company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
+    submissions = _mock_submissions_resp(
+        forms=["8-K", "10-Q"],
+        report_dates=["", "2025-06-30"],
+        filing_dates=["2025-07-25", "2025-07-25"],
+        items=["2.02,9.01", ""],
+    )
     with (
         patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
-        patch("earnings_agents.tools.normalize_data_client.get_latest_period", return_value=latest),
+        patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=False),
+        patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
     ):
-        from importlib import import_module
-        mod = import_module("earnings_agents.cli.earnings")
-        result = mod._is_period_already_stored("AAPL", "2025-09-30")  # Q3 EDGAR
-
-    assert result is False
+        result = _resolve_8k_skip_guard("AAPL", "000123")
+    assert result is None
 
 
-def test_is_period_already_stored_no_data_yet():
-    """Returns False when normalize_data has no data at all for the company."""
-    company = {"cik": "000123", "fiscal_year_end_month": 12}
-
-    with (
-        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
-        patch("earnings_agents.tools.normalize_data_client.get_latest_period", return_value=None),
-    ):
-        from importlib import import_module
-        mod = import_module("earnings_agents.cli.earnings")
-        result = mod._is_period_already_stored("AAPL", "2025-09-30")
-
-    assert result is False
-
-
-def test_is_period_already_stored_company_not_in_db():
-    """Returns False (don't skip) when ticker not found in normalize_data."""
+def test_skip_guard_returns_none_when_company_missing():
+    """Returns None (proceed) when company not found in normalize_data."""
     with patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=None):
-        from importlib import import_module
-        mod = import_module("earnings_agents.cli.earnings")
-        result = mod._is_period_already_stored("UNKN", "2025-09-30")
-
-    assert result is False
+        result = _resolve_8k_skip_guard("UNKN", "000999")
+    assert result is None
 
 
-def test_is_period_already_stored_missing_args():
-    """Returns False when ticker or sec_report_date is falsy — never skip on missing data."""
-    from importlib import import_module
-    mod = import_module("earnings_agents.cli.earnings")
-    assert mod._is_period_already_stored("", "2025-09-30") is False
-    assert mod._is_period_already_stored("AAPL", None) is False
-    assert mod._is_period_already_stored("", None) is False
+def test_skip_guard_returns_none_when_fy_end_month_missing():
+    """Returns None (proceed) when company has no fiscal_year_end_month."""
+    company = {"cik": "000123", "name": "TestCo"}  # no fiscal_year_end_month
+    with patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company):
+        result = _resolve_8k_skip_guard("AAPL", "000123")
+    assert result is None
+
+
+def test_skip_guard_returns_none_on_missing_args():
+    """Returns None when ticker or CIK is missing."""
+    assert _resolve_8k_skip_guard("", "000123") is None
+    assert _resolve_8k_skip_guard("AAPL", "") is None
+    assert _resolve_8k_skip_guard("", "") is None
+
+
+def test_skip_guard_returns_none_on_sec_api_error():
+    """Returns None (fail-safe) when the SEC API call fails."""
+    company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
+    import requests as req
+    with (
+        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
+        patch("earnings_agents.tools.edgar_client._edgar_get", side_effect=req.RequestException("timeout")),
+    ):
+        result = _resolve_8k_skip_guard("AAPL", "000123")
+    assert result is None
 
 
 def test_print_latest_data_status_reports_next_quarter_needed():
@@ -773,15 +781,12 @@ def test_print_latest_data_status_reports_next_annual_needed():
     assert "need: FY2026 Q1 8-K" in joined
 
 
-def test_is_period_already_stored_db_error_returns_false():
-    """Returns False on DB error — fail safe, never skip on ambiguity."""
+def test_skip_guard_returns_none_on_db_error():
+    """Returns None on DB error — fail safe, never skip on ambiguity."""
     with patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker",
                side_effect=Exception("DB down")):
-        from importlib import import_module
-        mod = import_module("earnings_agents.cli.earnings")
-        result = mod._is_period_already_stored("AAPL", "2025-09-30")
-
-    assert result is False
+        result = _resolve_8k_skip_guard("AAPL", "000123")
+    assert result is None
 
 
 def test_build_initial_state_skips_sec_path_without_history():

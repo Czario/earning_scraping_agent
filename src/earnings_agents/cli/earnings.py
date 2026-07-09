@@ -446,6 +446,13 @@ def _build_initial_state(info: dict, printer=print) -> dict:
             "error": "no existing normalize_data period data found for this company; skipping 8-K path.",
         }
 
+    # ── Skip guard: check if the 8-K's fiscal period is already stored ──────
+    # Uses fiscal_year_end_month + SEC submissions API to determine
+    # (fiscal_year, quarter) and checks concept_values_quarterly / _annual.
+    skip_state = _resolve_8k_skip_guard(ticker, cik, printer=printer)
+    if skip_state is not None:
+        return skip_state
+
     printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
     filing_url, sec_report_date = get_latest_earnings_url(cik)
     if not filing_url:
@@ -455,22 +462,10 @@ def _build_initial_state(info: dict, printer=print) -> dict:
             "status": "failed",
             "error": f"No 8-K earnings filing found on SEC EDGAR for CIK {cik}",
         }
-    # Guard: skip if this exact period-end date is already stored in normalize_data.
-    if sec_report_date and _is_period_already_stored(ticker, sec_report_date):
-        printer(
-            f"  [UP TO DATE] {company_name} ({ticker or cik}) — "
-            f"period {sec_report_date} already in normalize_data"
-        )
-        return {
-            **_base,
-            "discovered_file_url": filing_url,
-            "sec_report_date": sec_report_date,
-            "status": "already_stored",
-        }
     return {
         **_base,
         "discovered_file_url": filing_url,
-        "sec_report_date": sec_report_date,  # authoritative period-end date from SEC
+        "sec_report_date": sec_report_date,
         "status": "discovered",
     }
 
@@ -604,38 +599,105 @@ def _is_already_saved(ticker: str) -> bool:
         return False
 
 
-def _is_period_already_stored(ticker: str, sec_report_date_str: str | None) -> bool:
-    """Return True when *sec_report_date_str* is already covered by normalize_data.
+def _resolve_8k_skip_guard(
+    ticker: str,
+    cik: str,
+    printer=print,
+) -> dict | None:
+    """Check whether the latest 8-K's fiscal period is already stored in the DB.
 
-    Skips the filing when its period-end date is NOT newer than the most
-    recently stored ``end_date`` for *ticker*'s CIK — same semantics as the
-    10-K/Q worker's incremental guard (``report_date <= latest_stored``).
+    Fetches the SEC submissions API once and:
+      1. Gets ``fiscal_year_end_month`` from normalize_data.
+      2. Finds the latest 8-K's ``filingDate``.
+      3. Uses ``_infer_8k_fiscal_period`` to determine ``(fiscal_year, quarter)``.
+      4. Checks ``concept_values_quarterly`` / ``concept_values_annual``.
 
-    Using ``<=`` (not ``==``) means an older filing that arrives after a newer
-    one has already been stored is also correctly skipped.
+    Returns a state dict with ``status="already_stored"`` when the period
+    already exists, or ``None`` when the pipeline should proceed.
 
-    Returns False on any DB error or missing data (fail-safe: never skips on
-    ambiguity).
+    Also returns ``None`` on any error (fail-safe: never skips on ambiguity).
     """
-    if not sec_report_date_str or not ticker:
-        return False
+    if not ticker or not cik:
+        return None
     try:
-        from datetime import date
         from earnings_agents.tools.normalize_data_client import (
+            fiscal_period_exists,
             get_company_by_ticker,
-            get_latest_period,
         )
+        from earnings_agents.tools.edgar_client import (
+            _EDGAR_SUBMISSIONS,
+            _edgar_get,
+            _find_exhibit_99_in_index,
+            _infer_8k_fiscal_period,
+            normalize_cik,
+        )
+
+        # 1. Get fiscal_year_end_month.
         company = get_company_by_ticker(ticker)
         if company is None:
-            return False
-        latest = get_latest_period(company["cik"])
-        if latest is None:
-            return False
-        report_date = date.fromisoformat(sec_report_date_str)
-        stored_end = latest["end_date"].date()
-        return report_date <= stored_end   # skip if not newer than stored
+            return None
+        fy_end_month = company.get("fiscal_year_end_month")
+        if not fy_end_month:
+            return None
+
+        # 2. Fetch SEC submissions (one HTTP call).
+        cik_padded = normalize_cik(cik)
+        sub_url = _EDGAR_SUBMISSIONS.format(cik=cik_padded)
+        from earnings_agents.config import HTTP_TIMEOUT
+        try:
+            resp = _edgar_get(sub_url, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            return None
+
+        recent = data.get("filings", {}).get("recent", {})
+        forms: list[str] = recent.get("form", [])
+        filing_dates: list[str] = recent.get("filingDate", [])
+        items_list: list[str] = recent.get("items", [])
+
+        # Find latest 8-K (Item 2.02) filing_date.
+        filing_date_str: str | None = None
+        for i, form in enumerate(forms):
+            if form != "8-K":
+                continue
+            item_str = items_list[i] if i < len(items_list) else ""
+            if "2.02" in item_str:
+                fd = filing_dates[i] if i < len(filing_dates) else ""
+                if fd:
+                    filing_date_str = fd
+                break
+
+        # 3. Determine (fiscal_year, quarter) the 8-K reports on.
+        if filing_date_str:
+            fp = _infer_8k_fiscal_period(recent, filing_date_str, fy_end_month)
+            if fp is not None:
+                fy, q, pt = fp
+                q_arg = q if pt == "quarterly" else None
+                if fiscal_period_exists(cik, fy, q_arg):
+                    printer(
+                        f"  [UP TO DATE] period FY{fy}"
+                        + (f" Q{q}" if pt == "quarterly" else " (annual)")
+                        + f" already stored — skipping"
+                    )
+                    return {
+                        "status": "already_stored",
+                        "ticker": ticker,
+                        "company_name": company.get("name", ticker),
+                        "discovered_file_url": None,
+                        "file_type": None,
+                        "raw_text": None,
+                        "metrics": None,
+                        "error": None,
+                        "extraction_attempts": 0,
+                        "extraction_notes": None,
+                        "needs_reextract": False,
+                        "previous_high_finding_keys": None,
+                    }
+
+        return None
     except Exception:  # noqa: BLE001 — fail safe: never skip on ambiguity
-        return False
+        return None
 
 
 def _run_company_parallel(args: tuple) -> dict:

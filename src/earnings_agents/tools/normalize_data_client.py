@@ -477,6 +477,22 @@ def compute_fiscal_period(
     m = period_end_date.month
     y = period_end_date.year
 
+    # When period_str carries a parseable date (e.g. "Three Months Ended
+    # May 25, 2026"), use it for the calendar-month fallback.  The
+    # period_end_date argument may come from SEC EDGAR's reportDate which
+    # on 8-Ks is company-set and sometimes the announcement/filing date
+    # rather than the true fiscal period end — the LLM reads the actual
+    # column header from the document, which is more trustworthy.
+    str_date = parse_period_end_date(period_str)
+    if str_date is not None and str_date != period_end_date:
+        logger.debug(
+            "compute_fiscal_period: period_str date %s overrides "
+            "period_end_date %s for quarter calculation",
+            str_date, period_end_date,
+        )
+        m = str_date.month
+        y = str_date.year
+
     # Fiscal year: if period month falls within the FY ending in fy_end_month
     # of year y (i.e. m <= fy_end_month) → fiscal_year = y; otherwise y + 1.
     fiscal_year = y if m <= fiscal_year_end_month else y + 1
@@ -565,6 +581,29 @@ def get_latest_period(cik: str) -> dict[str, Any] | None:
             }
 
     return best
+
+
+def fiscal_period_exists(
+    cik: str,
+    fiscal_year: int,
+    quarter: int | None = None,
+) -> bool:
+    """Return True when concept values already exist for *cik* + *fiscal_year* (+ *quarter*).
+
+    When *quarter* is None the check is against ``concept_values_annual``
+    (annual / full-year filings); otherwise ``concept_values_quarterly``.
+    """
+    db = _get_client()[_NORMALIZE_DB]
+    collection_name = (
+        "concept_values_annual" if quarter is None else "concept_values_quarterly"
+    )
+    filt: dict[str, Any] = {
+        "company_cik": cik,
+        "reporting_period.fiscal_year": fiscal_year,
+    }
+    if quarter is not None:
+        filt["reporting_period.quarter"] = quarter
+    return db[collection_name].count_documents(filt, limit=1) > 0
 
 
 def get_recently_valued_concept_ids(
@@ -717,19 +756,33 @@ def upsert_concept_values(
         logger.debug("upsert_concept_values: empty concept_metrics — nothing to do")
         return 0
 
-    # Resolve the period end date: SEC reportDate override takes priority.
-    end_date = report_date or parse_period_end_date(period_str)
-    if end_date is None:
+    # Resolve the period end date.
+    #
+    # The LLM's __period__ label (e.g. "Three Months Ended May 31, 2026") is
+    # read directly from the document and is consistent across re-runs.  The
+    # SEC reportDate on 8-Ks is company-set and may differ between runs
+    # (e.g. June 1 vs May 31), causing duplicate documents when the upsert
+    # filter uses exact end_date matching.
+    #
+    # Prefer the LLM's date when both are available — it is the stable source
+    # of truth for dedup.  Fall back to SEC reportDate only when the LLM
+    # provides no parseable date.
+    parsed = parse_period_end_date(period_str)
+    if parsed is not None:
+        end_date = parsed
+    elif report_date is not None:
+        end_date = report_date
+        logger.debug(
+            "upsert_concept_values: using SEC reportDate %s "
+            "(period_str %r had no parseable date)",
+            report_date, period_str,
+        )
+    else:
         logger.warning(
             "upsert_concept_values: cannot parse period end date from %r — skipping",
             period_str,
         )
         return 0
-    if report_date and report_date != parse_period_end_date(period_str):
-        logger.debug(
-            "upsert_concept_values: using SEC reportDate %s (period_str parsed to %s)",
-            report_date, parse_period_end_date(period_str),
-        )
 
     # Annual vs quarterly routing.  An explicit *period_type_override* from the
     # upstream node (``detected_period_type``) is authoritative — it keeps the
