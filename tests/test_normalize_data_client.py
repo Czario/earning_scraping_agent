@@ -105,23 +105,32 @@ def test_compute_fiscal_period(end_date, fy_end_month, expected_fy, expected_q):
 # ── compute_fiscal_period WITH period_str (52-week + explicit durations) ─────
 
 @pytest.mark.parametrize("period_str, end_date, fy_end_month, expected_fy, expected_q", [
-    # BJ (Jan FY end, 52-week calendar) — week-count overrides calendar-month calc
-    ("Thirteen Weeks Ended May 2, 2026",        date(2026,  5,  2), 1, 2027, 1),
+    # BJ (Jan FY end, 52-week calendar) — "Thirteen Weeks" is NOT inferred as Q1
+    # (ambiguous — non-cumulative reporters use it for every quarter).
+    # Calendar math with fy_end_month=1, date May 2 → month offset 3 → Q2.
+    ("Thirteen Weeks Ended May 2, 2026",        date(2026,  5,  2), 1, 2027, 2),
     ("Twenty-Six Weeks Ended August 1, 2026",   date(2026,  8,  1), 1, 2027, 2),
     ("Thirty-Nine Weeks Ended November 1, 2025",date(2025, 11,  1), 1, 2026, 3),
     # Digit forms
-    ("13 Weeks Ended May 2, 2026",              date(2026,  5,  2), 1, 2027, 1),
+    ("13 Weeks Ended May 2, 2026",              date(2026,  5,  2), 1, 2027, 2),
     ("26 Weeks Ended August 1, 2026",           date(2026,  8,  1), 1, 2027, 2),
     ("39 Weeks Ended November 1, 2025",         date(2025, 11,  1), 1, 2026, 3),
     # Month-based (Six/Nine unambiguous; Three falls back to date math)
     ("Six Months Ended June 30, 2026",          date(2026,  6, 30), 12, 2026, 2),
     ("Nine Months Ended September 30, 2026",    date(2026,  9, 30), 12, 2026, 3),
-    # Ordinal labels
+    # Ordinal labels — always trusted (explicit, not inferred)
     ("First Quarter Ended March 31, 2026",      date(2026,  3, 31), 12, 2026, 1),
     ("Second Quarter Ended June 30, 2026",      date(2026,  6, 30), 12, 2026, 2),
     ("Q3 Results Ended September 30, 2026",     date(2026,  9, 30), 12, 2026, 3),
     # MSFT (June FY end) with explicit period
     ("Nine Months Ended March 31, 2026",        date(2026,  3, 31),  6, 2026, 3),
+    # SMPL (Aug FY end) — "Thirteen Weeks" is ambiguous, falls back to calendar math
+    # May 30 → month offset 8 (Sep start) → Q3 (NOT Q1)
+    ("Thirteen Weeks Ended May 30, 2026",       date(2026,  5, 30),  8, 2026, 3),
+    ("Three Months Ended May 30, 2026",         date(2026,  5, 30),  8, 2026, 3),
+    # SMPL Q1 — calendar math: Nov → month offset 2 → Q1
+    ("Thirteen Weeks Ended November 30, 2025",  date(2025, 11, 30),  8, 2026, 1),
+    ("Three Months Ended November 30, 2025",    date(2025, 11, 30),  8, 2026, 1),
 ])
 def test_compute_fiscal_period_with_period_str(
     period_str, end_date, fy_end_month, expected_fy, expected_q

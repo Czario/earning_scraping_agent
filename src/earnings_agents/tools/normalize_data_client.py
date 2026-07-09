@@ -380,11 +380,16 @@ def _quarter_from_period_str(period_str: str) -> int | None:
 
     Uses cumulative duration to determine the quarter:
 
-    * Week-based (52-week fiscal-year companies always report cumulative):
-      13 w → Q1, 26 w → Q2, 39 w → Q3.
+    * Week-based unambiguous values:
+      26 w → Q2, 39 w → Q3.  (13 weeks is ambiguous — falls back to date math.)
     * Month-based unambiguous values:
       6 m → Q2, 9 m → Q3.  (3 months is ambiguous — falls back to date math.)
     * Ordinal words: "First Quarter" → Q1, etc.
+
+    ``"Thirteen Weeks"`` / ``"3 Months"`` is **never** inferred as Q1 because
+    many companies report non-cumulatively — they print the same duration
+    label for every quarter.  The caller must fall back to calendar-month
+    math using the company's ``fiscal_year_end_month`` and the period-end date.
 
     Annual periods (52/53 weeks, 12 months) are handled by
     ``detect_period_type`` upstream and never reach here.
@@ -405,15 +410,15 @@ def _quarter_from_period_str(period_str: str) -> int | None:
     count, unit = duration
 
     if unit == "weeks":
-        # 52-week fiscal-year companies report cumulative weeks from FY start.
-        if 12 <= count <= 14:
-            return 1
+        # 13 w is NOT inferred as Q1 — just like "3 months", it is
+        # ambiguous (non-cumulative reporters print "Thirteen Weeks"
+        # for every quarter).  Only cumulative durations are unambiguous.
         if 25 <= count <= 27:
             return 2
         if 38 <= count <= 40:
             return 3
     elif unit == "months":
-        # 6- and 9-month figures are unambiguously cumulative from FY start.
+        # 3 months is ambiguous — not inferred.  6/9 months are cumulative.
         if count == 6:
             return 2
         if count == 9:
@@ -455,24 +460,34 @@ def compute_fiscal_period(
 
     ``fiscal_year_end_month``: 1-12 (e.g. 6 for June, 12 for December).
 
-    When *period_str* is provided the cumulative duration it contains
-    (e.g. "Twenty-Six Weeks" → Q2) is used to identify the quarter.
-    This is essential for 52-week fiscal-year companies (e.g. BJ Wholesale)
-    whose quarter end dates fall one calendar month later than strict
-    3-month boundaries would suggest.
+    *Fiscal year* is determined by comparing the period-end month against
+    ``fiscal_year_end_month``.  *Quarter* uses the company's
+    ``fiscal_year_end_month`` to divide the fiscal year into 3-month
+    blocks — no prediction from duration text (see below).
 
-    When *period_str* gives no unambiguous quarter (e.g. "Three Months"),
-    the function falls back to a calendar-month calculation that is exact
-    for companies whose quarter ends align with calendar month boundaries.
+    When *period_str* carries an unambiguous cumulative duration
+    (e.g. "Twenty-Six Weeks" → Q2, "Six Months" → Q2, "Nine Months" → Q3,
+    or an ordinal like "Second Quarter"), that value is used.
+    "Thirteen Weeks" and "Three Months" are **never** treated as Q1
+    because many companies report non-cumulatively — the same label
+    appears for every quarter.  The function falls back to calendar-month
+    math using *period_end_date* (or the date in *period_str*, which is
+    preferred when available).
+
+    The period_str **date** (e.g. "May 25, 2026" from "Three Months Ended
+    May 25, 2026") overrides *period_end_date* when both are present and
+    differ — the LLM reads the actual column header from the document,
+    which is more trustworthy than SEC EDGAR's company-set reportDate on 8-Ks.
 
     Examples (MSFT, fy_end_month=6):
       - 2026-03-31 → FY2026 Q3
       - 2026-06-30 → FY2026 Q4
       - 2025-09-30 → FY2026 Q1
 
-    Examples (BJ, fy_end_month=1, with period_str):
-      - "Thirteen Weeks Ended May 2, 2026"  → FY2027 Q1
-      - "Twenty-Six Weeks Ended Aug 1, 2026" → FY2027 Q2
+    Examples (SMPL, fy_end_month=8):
+      - "Three Months Ended May 30, 2026"   → FY2026 Q3
+      - "Thirteen Weeks Ended May 30, 2026"  → FY2026 Q3
+      - "Thirteen Weeks Ended Nov 30, 2025"  → FY2026 Q1
     """
     m = period_end_date.month
     y = period_end_date.year
@@ -497,10 +512,12 @@ def compute_fiscal_period(
     # of year y (i.e. m <= fy_end_month) → fiscal_year = y; otherwise y + 1.
     fiscal_year = y if m <= fiscal_year_end_month else y + 1
 
-    # Quarter: prefer period-string-derived value; fall back to calendar math.
+    # Quarter: prefer unambiguous period-string-derived value; fall back to
+    # calendar-month math (no guessing — "13 weeks"/"3 months" are ambiguous).
     quarter = _quarter_from_period_str(period_str)
     if quarter is None:
-        # Calendar-month fallback — exact for standard (non-52-week) companies.
+        # Calendar-month fallback — exact for companies whose quarter ends
+        # align with calendar month boundaries (the vast majority).
         fy_start_month = fiscal_year_end_month % 12 + 1
         fy_month_offset = (m - fy_start_month) % 12
         quarter = fy_month_offset // 3 + 1
