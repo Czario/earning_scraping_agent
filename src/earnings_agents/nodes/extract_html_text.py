@@ -548,20 +548,14 @@ def _fetch_and_classify_supplement(
         is_sec = "sec.gov" in url
         response = _http_get(url, sec=is_sec)
         supp_html = response.text
-        report_call(
-            f"  [{ex_label}]  fetched  {len(supp_html):,} raw bytes"
-            f"  ({len(supp_html) // 1024} KB)"
-        )
 
         supp_html = _strip_sgml_wrapper(supp_html)
-        report_call(f"  [{ex_label}]  parsing HTML and removing noise…")
 
         supp_soup = BeautifulSoup(supp_html, "lxml")
         for tag in supp_soup(_NOISE_TAGS):
             tag.decompose()
 
         supp_scale, _, _ = _prescan_document(supp_soup.get_text(" ", strip=True))
-        report_call(f"  [{ex_label}]  classifying tables…")
         supp_sections, _, supp_prose, supp_pending = _classify_document_tables(
             supp_soup, supp_scale, skip_llm_filter=True,
         )
@@ -590,11 +584,6 @@ def _fetch_and_classify_supplement(
         cf_c = len(supp_sections["cash_flow"])
         oth_c = len(supp_sections["other"])
         ngaap_c = len(supp_sections["non_gaap"])
-        report_call(
-            f"  [{ex_label}]  classified {total_tables} tables"
-            f"  ({is_c} IS, {bs_c} BS, {cf_c} CF, {oth_c} other, {ngaap_c} non-gaap)"
-        )
-
         logger.info(
             "Supplemental exhibit %d for %s: %d tables (%d IS, %d BS, %d CF, "
             "%d other, %d non-gaap)",
@@ -682,11 +671,7 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
         main_other = len(sections["other"])
         main_ngaap = len(sections["non_gaap"])
         main_total = main_is + main_bs + main_cf + main_other + main_ngaap
-        report_call(
-            f"  [main doc]      classified {main_total} tables"
-            f"  ({main_is} IS, {main_bs} BS, {main_cf} CF,"
-            f" {main_other} other, {main_ngaap} non-gaap)"
-        )
+        report_call(f"  [main doc]      {main_total} tables ({main_is} IS, {main_bs} BS, {main_cf} CF, {main_other} other)")
 
         # ── Process supplemental exhibits (EX-99.2, EX-99.3, ...) ──────────────
         # Each supplemental document is parsed and classified independently using
@@ -695,19 +680,18 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
         # extractor sees which exhibit each table originated from.
         supplemental_urls = state.get("supplemental_file_urls") or []
         supp_blocks: list[str] = []  # raw_text blocks, assembled below
+        # Only IS tables go to extraction now (BS/CF/other/non-GAAP excluded).
         supplemental_log: list[str] = [
-            f"  [main doc]      {main_total} tables"
-            f"  ({main_is} IS, {main_bs} BS, {main_cf} CF,"
-            f" {main_other} other, {main_ngaap} non-gaap)"
+            f"  [main doc]      {main_is} IS → extraction"
+            + (f"  (classified {main_total} total: {main_bs} BS, {main_other} other, {main_ngaap} non-gaap — not sent)" if main_total > main_is else "")
         ]
         for supp_idx, supp_url in enumerate(supplemental_urls):
             report_call(f"  [supplement {supp_idx+2}]  processing  {supp_url.rsplit('/', 1)[-1]}")
             result = _fetch_and_classify_supplement(supp_url, ticker, supp_idx)
             if result is None:
                 supplemental_log.append(
-                    f"  [supplement {supp_idx+2}]   skipped — no financial tables"
+                    f"  [supplement {supp_idx+2}]   skipped"
                 )
-                report_call(f"  [supplement {supp_idx+2}]  skipped — no financial tables (likely presentation)")
                 continue
             supp_sections, supp_prose, supp_pending = result
             # Supplement 'other' tables are never included in extraction
@@ -731,12 +715,7 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
             if supp_prose.strip() and is_count:
                 supp_blocks.append(f"=== SUPPLEMENTAL EXHIBIT ({supp_idx + 2}) NARRATIVE ===\n{prefix}{supp_prose}")
             supplemental_log.append(
-                f"  [supplement {supp_idx+2}]   {is_count} IS table(s) merged"
-                f"  (skipped {bs_count} BS, {cf_count} CF,"
-                f" {other_count} other, {ngaap_count} non-gaap)"
-            )
-            report_call(
-                f"  [supplement {supp_idx+2}]  merged {is_count} IS table(s) into extraction sections"
+                f"  [supplement {supp_idx+2}]   {is_count} IS → extraction"
             )
             logger.info(
                 "Supplemental exhibit %d merged for %s (%d IS tables)",
@@ -768,37 +747,41 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                 has_gaap_tables = True
 
         if has_gaap_tables:
-            # Structured output: GAAP tables first → narrative → non-GAAP
+            # Structured output: only income_statement tables are included.
+            # Balance sheet, cash flow, "other", and non-GAAP sections are
+            # excluded — targeted extraction focuses on IS concepts only.
             parts: list[str] = []
-            for stmt_type, label in [
-                ("income_statement", "GAAP INCOME STATEMENT"),
-                ("balance_sheet",    "GAAP BALANCE SHEET"),
-                ("cash_flow",        "GAAP CASH FLOWS"),
-                ("other",            "FINANCIAL DATA"),
-            ]:
-                for entry in sections[stmt_type]:
-                    parts.append(f"=== {label} ===\n{entry}")
-            if prose.strip():
+            for entry in sections["income_statement"]:
+                parts.append(f"=== GAAP INCOME STATEMENT ===\n{entry}")
+            if prose.strip() and sections["income_statement"]:
                 parts.append(f"=== NARRATIVE ===\n{prose}")
-            for entry in sections["non_gaap"]:
-                parts.append(
-                    "=== NON-GAAP (FOR REFERENCE ONLY — DO NOT USE FOR GAAP METRICS) ===\n"
-                    + entry
-                )
             # Append supplemental narrative blocks at the end of raw_text
             raw_text = "\n\n".join(parts)
             if supp_blocks:
                 raw_text += "\n\n" + "\n\n".join(supp_blocks)
 
             logger.info(
-                "HTML extracted %d chars for %s — %d income, %d balance, "
-                "%d cashflow, %d other, %d non-gaap table(s)%s",
+                "HTML extracted %d chars for %s — %d IS table(s) to extraction%s",
                 len(raw_text), ticker,
-                len(sections["income_statement"]), len(sections["balance_sheet"]),
-                len(sections["cash_flow"]), len(sections["other"]),
-                len(sections["non_gaap"]),
-                f"  (+{len(supp_blocks)} supplemental)" if supp_blocks else "",
+                len(sections["income_statement"]),
+                f"  (+{len(supp_blocks)} supplemental narrative)" if supp_blocks else "",
             )
+
+            # ── Table summary ─────────────────────────────────────────────────
+            # Show IS tables going to extraction by source.
+            _is_entries = sections.get("income_statement", [])
+            if _is_entries:
+                _main = sum(1 for e in _is_entries if not e.startswith("[SUPPLEMENTAL"))
+                _supp = len(_is_entries) - _main
+                _parts = []
+                if _main:
+                    _parts.append(f"{_main} main")
+                if _supp:
+                    _parts.append(f"{_supp} supplement")
+                report_call(
+                    f"  [IS → LLM]  {len(_is_entries)} table(s)"
+                    + (f"  ({', '.join(_parts)})" if _parts else "")
+                )
 
             return {
                 **state,

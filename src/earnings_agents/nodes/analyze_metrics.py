@@ -142,24 +142,19 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
         logger.warning("analyze_metrics: no metrics on state for %s", ticker)
         return {**state, "needs_reextract": False}
 
-    report_call(f"  [analyze]  running presence checkers on {len(metrics)} metric(s)")
     presence = presence_summary(metrics.keys())
     findings: list[Finding] = []
     findings.extend(check_presence(metrics, presence))
 
     # Registry loop — pure observers only (ADR-0003). check_presence is called
     # separately above because it requires a pre-computed presence summary.
-    n_detectors = 0
     for checker in iter_detectors():
         findings.extend(checker(metrics))
-        n_detectors += 1
-    report_call(f"  [analyze]  ran {n_detectors} skill detector(s) → {len(findings)} total finding(s)")
 
     # Source-grounding ("show me") verification. Called explicitly (not via the
     # registry) because it needs the per-metric source snippets and the source
     # text in addition to the metrics dict. Degrades to a no-op when no
     # snippets were captured.
-    n_grounded = len(findings)
     findings.extend(
         check_source_grounding(
             metrics,
@@ -167,9 +162,6 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
             state.get("raw_text") or "",
         )
     )
-    n_new_grounding = len(findings) - n_grounded
-    if n_new_grounding:
-        report_call(f"  [analyze]  source-grounding check found {n_new_grounding} ungrounded value(s)")
 
     # Corrector post-pass — kept explicitly separate from the observer loop so
     # it is easy to audit: only derive_corrected_total_opex mutates metrics.
