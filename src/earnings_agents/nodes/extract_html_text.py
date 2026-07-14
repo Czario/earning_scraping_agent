@@ -680,10 +680,13 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
         # extractor sees which exhibit each table originated from.
         supplemental_urls = state.get("supplemental_file_urls") or []
         supp_blocks: list[str] = []  # raw_text blocks, assembled below
-        # Only IS tables go to extraction now (BS/CF/other/non-GAAP excluded).
+        # IS + LLM-filtered "other" tables go to extraction. BS/CF/non-GAAP excluded.
+        _sent_is_other = main_is + main_other
         supplemental_log: list[str] = [
-            f"  [main doc]      {main_is} IS → extraction"
-            + (f"  (classified {main_total} total: {main_bs} BS, {main_other} other, {main_ngaap} non-gaap — not sent)" if main_total > main_is else "")
+            f"  [main doc]      {_sent_is_other} → extraction"
+            + (f"  ({main_is} IS, {main_other} other)"
+               + (f"  — {main_bs} BS, {main_ngaap} non-gaap not sent" if (main_bs or main_ngaap) else "")
+               if _sent_is_other else f"  {main_total} total — none to extraction")
         ]
         for supp_idx, supp_url in enumerate(supplemental_urls):
             report_call(f"  [supplement {supp_idx+2}]  processing  {supp_url.rsplit('/', 1)[-1]}")
@@ -747,13 +750,21 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                 has_gaap_tables = True
 
         if has_gaap_tables:
-            # Structured output: only income_statement tables are included.
-            # Balance sheet, cash flow, "other", and non-GAAP sections are
-            # excluded — targeted extraction focuses on IS concepts only.
+            # Structured output: include income_statement + "other" (LLM-filtered
+            # financial data tables that passed the batch filter) + narrative prose.
+            # Balance sheet, cash flow, and non-GAAP sections are excluded — they
+            # don't contribute IS-relevant data.
+            #
+            # "other" IS always included because many companies don't have a
+            # separate IS table — their income statement data is embedded in
+            # "Financial Summary", "Key Metrics", or "Segment Data" tables that
+            # get classified as "other" by the regex classifier.
             parts: list[str] = []
             for entry in sections["income_statement"]:
                 parts.append(f"=== GAAP INCOME STATEMENT ===\n{entry}")
-            if prose.strip() and sections["income_statement"]:
+            for entry in sections["other"]:
+                parts.append(f"=== FINANCIAL DATA ===\n{entry}")
+            if prose.strip():
                 parts.append(f"=== NARRATIVE ===\n{prose}")
             # Append supplemental narrative blocks at the end of raw_text
             raw_text = "\n\n".join(parts)
@@ -768,18 +779,20 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
             )
 
             # ── Table summary ─────────────────────────────────────────────────
-            # Show IS tables going to extraction by source.
-            _is_entries = sections.get("income_statement", [])
-            if _is_entries:
-                _main = sum(1 for e in _is_entries if not e.startswith("[SUPPLEMENTAL"))
-                _supp = len(_is_entries) - _main
+            # Show IS + "other" tables going to extraction by source.
+            for _type, _label in (("income_statement", "IS"), ("other", "DATA")):
+                _entries = sections.get(_type, [])
+                if not _entries:
+                    continue
+                _main = sum(1 for e in _entries if not e.startswith("[SUPPLEMENTAL"))
+                _supp = len(_entries) - _main
                 _parts = []
                 if _main:
                     _parts.append(f"{_main} main")
                 if _supp:
                     _parts.append(f"{_supp} supplement")
                 report_call(
-                    f"  [IS → LLM]  {len(_is_entries)} table(s)"
+                    f"  [{_label} → LLM]  {len(_entries)} table(s)"
                     + (f"  ({', '.join(_parts)})" if _parts else "")
                 )
 
