@@ -113,7 +113,11 @@ def _format_step_line(node_name: str, state: dict) -> str | None:
         if state.get("status") == "failed":
             return "  [fetch text]    failed"
         n = len(state.get("raw_text") or "")
-        return f"  [fetch text]     {n:,} chars"
+        lines = [f"  [fetch text]     {n:,} chars"]
+        supp_log = state.get("_supplemental_log") or []
+        if supp_log:
+            lines.extend(supp_log)
+        return "\n".join(lines)
 
     if node_name == "extract_financial_metrics_node":
         attempt = state.get("extraction_attempts", 1)
@@ -454,17 +458,21 @@ def _build_initial_state(info: dict, printer=print) -> dict:
         return skip_state
 
     printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
-    filing_url, sec_report_date = get_latest_earnings_url(cik)
+    filing_url, supplemental_urls, sec_report_date = get_latest_earnings_url(cik)
     if not filing_url:
         return {
             **_base,
             "discovered_file_url": None,
+            "supplemental_file_urls": [],
             "status": "failed",
             "error": f"No 8-K earnings filing found on SEC EDGAR for CIK {cik}",
         }
+    if supplemental_urls:
+        printer(f"  [EDGAR]  +{len(supplemental_urls)} supplemental exhibit(s): {[u.rsplit('/', 1)[-1] for u in supplemental_urls]}")
     return {
         **_base,
         "discovered_file_url": filing_url,
+        "supplemental_file_urls": supplemental_urls,
         "sec_report_date": sec_report_date,
         "status": "discovered",
     }
@@ -627,7 +635,6 @@ def _resolve_8k_skip_guard(
         from earnings_agents.tools.edgar_client import (
             _EDGAR_SUBMISSIONS,
             _edgar_get,
-            _find_exhibit_99_in_index,
             _infer_8k_fiscal_period,
             normalize_cik,
         )

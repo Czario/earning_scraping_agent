@@ -106,7 +106,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         logger.warning("8-K message for %s missing cik — skipping", label)
         return True
 
-    filing_url, period = get_latest_earnings_url(cik)
+    filing_url, supplemental_urls, period = get_latest_earnings_url(cik)
 
     if not filing_url:
         pub.publish("skip", "no Exhibit 99.1 on EDGAR — not an earnings release")
@@ -145,6 +145,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         "company_name": label,
         "company_cik": cik or None,
         "discovered_file_url": filing_url,
+        "supplemental_file_urls": supplemental_urls,
         "sec_report_date": period or None,
         "file_type": None,
         "raw_text": None,

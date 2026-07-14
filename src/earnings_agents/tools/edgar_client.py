@@ -31,7 +31,11 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
-_EX99_TYPES = frozenset({"EX-99.1", "EX-99", "EX99.1", "EX-99.01"})
+_EX99_TYPES = frozenset({
+    "EX-99.1", "EX-99", "EX99.1", "EX-99.01",
+    "EX-99.2", "EX99.2", "EX-99.02",
+    "EX-99.3", "EX99.3", "EX-99.03",
+})
 
 
 class _TokenBucket:
@@ -102,17 +106,25 @@ def _edgar_get(url: str, **kwargs) -> requests.Response:
     raise requests.RequestException(f"_edgar_get exhausted retries for {url}") from last_exc
 
 
-def _find_exhibit_99_in_index(cik_int: str, acc: str, acc_nodash: str) -> Optional[str]:
-    """Parse the EDGAR HTML filing index to find the Exhibit 99.1 document URL."""
+def _find_all_ex_99_urls(cik_int: str, acc: str, acc_nodash: str) -> list[str]:
+    """Parse the EDGAR HTML filing index to find ALL EX-99 exhibit document URLs.
+
+    Returns a list of URLs in filing-index order. The first entry is typically
+    EX-99.1 (the main earnings press release), and subsequent entries are
+    supplemental financial exhibits (EX-99.2, EX-99.3, etc.).
+
+    Returns an empty list when no exhibits are found.
+    """
     index_url = _EDGAR_INDEX_HTML.format(cik_int=cik_int, acc_nodash=acc_nodash, acc=acc)
     try:
         resp = _edgar_get(index_url, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("EDGAR HTML index fetch failed for %s: %s", index_url, exc)
-        return None
+        return []
 
     soup = BeautifulSoup(resp.text, "lxml")
+    urls: list[str] = []
 
     # Filing index table: columns are Seq | Description | Document | Type | Size
     for row in soup.select("table.tableFile tr, table tr"):
@@ -127,11 +139,14 @@ def _find_exhibit_99_in_index(cik_int: str, acc: str, acc_nodash: str) -> Option
                 href: str = link_tag["href"]
                 if href.startswith("/"):
                     href = f"https://www.sec.gov{href}"
-                logger.info("Found Exhibit 99.1 for %s/%s: %s", cik_int, acc, href)
-                return href
+                urls.append(href)
+                logger.info("Found exhibit %s for %s/%s: %s", doc_type, cik_int, acc, href)
 
-    logger.info("No Exhibit 99.1 found in index for %s/%s", cik_int, acc)
-    return None
+    logger.info(
+        "Found %d EX-99 exhibit(s) in index for %s/%s",
+        len(urls), cik_int, acc,
+    )
+    return urls
 
 
 def normalize_cik(cik: str) -> str:
@@ -400,17 +415,20 @@ def _infer_8k_fiscal_period(
         return (next_fy, next_q, period_type)
 
 
-def get_latest_earnings_url(cik: str) -> tuple[Optional[str], Optional[str]]:
-    """Return ``(filing_url, report_date)`` for the most recent earnings press
-    release (Exhibit 99.1) from an 8-K Item 2.02 filing for the given CIK.
+def get_latest_earnings_url(cik: str) -> tuple[Optional[str], list[str], Optional[str]]:
+    """Return ``(filing_url, supplemental_urls, report_date)`` for the most recent
+    earnings press release.
 
+    ``filing_url`` is the URL to the primary earnings release (Exhibit 99.1).
+    ``supplemental_urls`` is a list of additional exhibit URLs (EX-99.2, EX-99.3,
+    etc.) that contain supplemental financial data.
     ``report_date`` is the EDGAR ``reportDate`` field (``"YYYY-MM-DD"`` string)
     — the period-end date for the filing as declared to the SEC.  It is the
     authoritative source for the reporting period end date and should be
     preferred over the LLM-extracted ``__period__`` label.
 
     Falls back to the most recent 8-K primary document if no Exhibit 99.1 is found.
-    Returns ``(None, None)`` if no 8-K filing is available.
+    Returns ``(None, [], None)`` if no 8-K filing is available.
     """
     cik_padded = normalize_cik(cik)
     cik_int = str(int(cik_padded))  # no leading zeros for archive paths
@@ -423,7 +441,7 @@ def get_latest_earnings_url(cik: str) -> tuple[Optional[str], Optional[str]]:
         data = resp.json()
     except requests.RequestException as exc:
         logger.error("EDGAR submissions fetch failed for CIK %s: %s", cik_padded, exc)
-        return None, None
+        return None, [], None
 
     recent = data.get("filings", {}).get("recent", {})
     forms: list[str] = recent.get("form", [])
@@ -456,7 +474,7 @@ def get_latest_earnings_url(cik: str) -> tuple[Optional[str], Optional[str]]:
 
     if target_idx is None:
         logger.warning("No 8-K filings found for CIK %s", cik_padded)
-        return None, None
+        return None, [], None
 
     acc = accessions[target_idx]       # e.g. "0000320193-26-000011"
     acc_nodash = acc.replace("-", "")  # e.g. "000032019326000011"
@@ -474,20 +492,28 @@ def get_latest_earnings_url(cik: str) -> tuple[Optional[str], Optional[str]]:
     # correction is impossible.
     report_date = _infer_period_end(recent, filing_date_str, report_date)
 
-    # ── 3. Parse HTML filing index to find Exhibit 99.1 ──────────────────────
-    ex99_url = _find_exhibit_99_in_index(cik_int, acc, acc_nodash)
-    if ex99_url:
-        return ex99_url, report_date
+    # ── 3. Parse HTML filing index to find ALL EX-99 exhibits ────────────────
+    ex99_urls = _find_all_ex_99_urls(cik_int, acc, acc_nodash)
+
+    if ex99_urls:
+        primary_url = ex99_urls[0]
+        supplemental_urls = ex99_urls[1:]
+        if supplemental_urls:
+            logger.info(
+                "Found %d supplemental exhibit(s) for CIK %s: %s",
+                len(supplemental_urls), cik_padded, supplemental_urls,
+            )
+        return primary_url, supplemental_urls, report_date
 
     # ── 4. Last resort: primary document from submissions metadata ────────────
     primary_doc = primary_docs[target_idx] if target_idx < len(primary_docs) else ""
     if primary_doc:
         url = f"{_EDGAR_ARCHIVES_BASE.format(cik_int=cik_int, acc_nodash=acc_nodash)}/{primary_doc}"
         logger.info("EDGAR primary doc fallback for CIK %s: %s", cik_padded, url)
-        return url, report_date
+        return url, [], report_date
 
     logger.warning("Could not resolve document URL for CIK %s accession %s", cik_padded, acc)
-    return None, None
+    return None, [], None
 
 
 def get_next_8k_status(
@@ -596,7 +622,8 @@ def get_next_8k_status(
         if rd >= min_next_report_date:
             acc = filing["accession"]
             acc_nodash = acc.replace("-", "")
-            url = _find_exhibit_99_in_index(cik_int, acc, acc_nodash)
+            ex99_urls = _find_all_ex_99_urls(cik_int, acc, acc_nodash)
+            url = ex99_urls[0] if ex99_urls else None
             if not url:
                 pdoc = filing["primary_doc"]
                 if pdoc:

@@ -9,6 +9,7 @@ class EarningsAgentState(TypedDict):
     ticker: str
     company_name: str
     discovered_file_url: Optional[str]
+    supplemental_file_urls: NotRequired[Optional[list[str]]]
     file_type: Optional[str]   # "pdf" | "html"
     raw_text: Optional[str]
     metrics: Optional[dict]    # serialised EarningsMetrics

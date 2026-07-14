@@ -117,8 +117,31 @@ def invoke_chunk_with_retry(
             # Skip for Groq (cloud API with its own rate limiting).
             _ctx = _OLLAMA_SEMAPHORE if provider != "groq" else _nullcontext()
             report_call(f"  [llm]  chunk {chunk_num}/{total_chunks}  attempt {attempt + 1}  → calling llm  ({provider or _LLM_PROVIDER or 'llm'})")
-            with _ctx:
-                response: str = llm.invoke(prefix + prompt)
+
+            # ── Progress heartbeat during long LLM invokes ────────────────────
+            # llm.invoke() blocks for minutes on large prompts with no intermediate
+            # progress.  A daemon thread logs a periodic keepalive so the operator
+            # can see the LLM is still working (not hung) during long waits.
+            import threading as _th, time as _time
+            _invoke_done = _th.Event()
+            _invoke_start = _time.monotonic()
+            def _heartbeat() -> None:
+                interval = 20  # seconds
+                while not _invoke_done.wait(interval):
+                    elapsed = _time.monotonic() - _invoke_start
+                    report_call(
+                        f"  [llm]  chunk {chunk_num}/{total_chunks}  attempt {attempt + 1}"
+                        f"  … waiting…  ({elapsed:.0f}s elapsed)"
+                    )
+            _hb_thread = _th.Thread(target=_heartbeat, daemon=True)
+            _hb_thread.start()
+
+            try:
+                with _ctx:
+                    response: str = llm.invoke(prefix + prompt)
+            finally:
+                _invoke_done.set()
+                _hb_thread.join(timeout=3)
             logger.debug(
                 "Chunk %d/%d attempt %d raw response for %s: %r",
                 chunk_num, total_chunks, attempt + 1, ticker, response[:300],

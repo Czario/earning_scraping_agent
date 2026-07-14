@@ -73,6 +73,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
     Refuses to save when accounting identity checks failed and
     ``STRICT_ACCURACY`` is enabled (default).
     """
+    from earnings_agents.hooks import report_call
     ticker = state["ticker"]
     identity_warnings = state.get("identity_warnings") or []
 
@@ -82,6 +83,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
             f"identity check(s) failed — "
             + "; ".join(identity_warnings)
         )
+        report_call(f"  [save]  identity checks FAILED — refusing to save ({len(identity_warnings)} warning(s))")
         logger.error(msg)
         return {**state, "status": "failed", "error": msg}
 
@@ -117,6 +119,12 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
 
     if concept_metrics and cik and fy_end_month and (period_str or sec_rd):
         from earnings_agents.tools.normalize_data_client import upsert_concept_values
+        n_mapped = len(concept_metrics) - len(derived_ids)
+        n_derived = len(derived_ids)
+        report_call(
+            f"  [save]  upserting {n_mapped} mapped + {n_derived} derived "
+            f"concept(s) for CIK {cik} — {period_str or sec_report_date_str or '?'}"
+        )
         try:
             n = upsert_concept_values(
                 cik=cik,
@@ -129,12 +137,20 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 period_type_override=detected_period_type,
                 derived_concept_ids=derived_ids,
             )
+            report_call(f"  [save]  ✓ {n} concept value(s) upserted")
             logger.info(
                 "normalize_data: upserted %d concept value(s) for %s", n, ticker
             )
         except Exception as exc:  # noqa: BLE001
+            report_call(f"  [save]  ✗ upsert failed: {exc}")
             return {**state, "status": "failed", "error": f"normalize_data upsert failed: {exc}"}
     else:
+        reason_parts = []
+        if not concept_metrics: reason_parts.append("no concept_metrics")
+        if not cik: reason_parts.append("no CIK")
+        if not fy_end_month: reason_parts.append("no fy_end_month")
+        if not period_str and not sec_rd: reason_parts.append("no period date")
+        report_call(f"  [save]  skipped — {', '.join(reason_parts)}")
         logger.warning(
             "Skipping normalize_data upsert for %s — "
             "missing concept_metrics=%s cik=%s fy_end_month=%s period=%r",

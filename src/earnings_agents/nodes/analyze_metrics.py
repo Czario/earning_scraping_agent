@@ -126,6 +126,7 @@ def _build_extraction_notes(
 
 def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     """Run all deterministic analysis checkers and decide on re-extract."""
+    from earnings_agents.hooks import report_call
     if state.get("status") == "failed":
         return state
 
@@ -141,19 +142,24 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
         logger.warning("analyze_metrics: no metrics on state for %s", ticker)
         return {**state, "needs_reextract": False}
 
+    report_call(f"  [analyze]  running presence checkers on {len(metrics)} metric(s)")
     presence = presence_summary(metrics.keys())
     findings: list[Finding] = []
     findings.extend(check_presence(metrics, presence))
 
     # Registry loop — pure observers only (ADR-0003). check_presence is called
     # separately above because it requires a pre-computed presence summary.
+    n_detectors = 0
     for checker in iter_detectors():
         findings.extend(checker(metrics))
+        n_detectors += 1
+    report_call(f"  [analyze]  ran {n_detectors} skill detector(s) → {len(findings)} total finding(s)")
 
     # Source-grounding ("show me") verification. Called explicitly (not via the
     # registry) because it needs the per-metric source snippets and the source
     # text in addition to the metrics dict. Degrades to a no-op when no
     # snippets were captured.
+    n_grounded = len(findings)
     findings.extend(
         check_source_grounding(
             metrics,
@@ -161,6 +167,9 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
             state.get("raw_text") or "",
         )
     )
+    n_new_grounding = len(findings) - n_grounded
+    if n_new_grounding:
+        report_call(f"  [analyze]  source-grounding check found {n_new_grounding} ungrounded value(s)")
 
     # Corrector post-pass — kept explicitly separate from the observer loop so
     # it is easy to audit: only derive_corrected_total_opex mutates metrics.
@@ -259,11 +268,19 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
     if not high or attempts >= MAX_EXTRACTION_ATTEMPTS:
         if high:
+            n_msg = min(len(high), 3)
+            samples = "; ".join(f.message[:60] for f in high[:n_msg])
+            report_call(
+                f"  [analyze]  {len(high)} high finding(s) unresolvable after "
+                f"{attempts}/{MAX_EXTRACTION_ATTEMPTS} attempts — proceeding to save"
+            )
             logger.warning(
                 "analyze_metrics %s: %d critical metric(s) still missing after "
                 "%d attempt(s) — proceeding to cleanup/save",
                 ticker, len(high), attempts,
             )
+        else:
+            report_call(f"  [analyze]  ✓ all checks passed")
         return out  # type: ignore[return-value]
 
     # No-progress detection: if the set of high-severity messages is identical
@@ -271,6 +288,10 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     current_high_keys = sorted(f.message for f in high)
     prev_high_keys: list[str] = state.get("previous_high_finding_keys") or []
     if attempts > 0 and current_high_keys == prev_high_keys:
+        report_call(
+            f"  [analyze]  same {len(high)} high finding(s) as previous pass — "
+            f"no progress, skipping re-extract"
+        )
         logger.warning(
             "analyze_metrics %s: same %d high finding(s) as previous pass — "
             "no progress detected, skipping re-extract",
@@ -289,6 +310,8 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     )
     out["needs_reextract"] = True
     out["previous_high_finding_keys"] = current_high_keys
+    msg = f"  [analyze]  {len(high)} high finding(s) — re-extracting (attempt {attempts + 1}/{MAX_EXTRACTION_ATTEMPTS})"
+    report_call(msg)
     logger.info(
         "analyze_metrics %s: %d critical metric(s) missing — looping back "
         "(attempt %d/%d)",

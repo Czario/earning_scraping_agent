@@ -109,6 +109,8 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     ticker = state["ticker"]
 
     def _skip(message: str, **extra: object) -> EarningsAgentState:
+        from earnings_agents.hooks import report_call
+        report_call(f"  [load concepts]  ✗ skipped — {message[:80]}")
         logger.info("load_company_concepts: %s", message)
         skipped = {
             **state,
@@ -124,6 +126,8 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
         skipped.update(extra)
         return skipped  # type: ignore[return-value]
 
+    from earnings_agents.hooks import report_call
+    report_call(f"  [load concepts]  looking up company in normalize_data…")
     try:
         company = get_company_by_ticker(ticker)
     except Exception as exc:  # noqa: BLE001
@@ -143,6 +147,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     fy_end_month: int = company["fiscal_year_end_month"]
     fy_end_code: str | None = company.get("fiscal_year_end_code")
     sec_report_date_str: str | None = state.get("sec_report_date")  # type: ignore[assignment]
+    report_call(f"  [load concepts]  found CIK {cik}  (FY end month {fy_end_month})")
 
     # Period-type decision (Option B — cadence drives, date is the safety net):
     #   * cadence_based — the deterministic filing-cycle state machine derived
@@ -209,6 +214,10 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             detected_period_type=period_type,
         )
 
+    report_call(
+        f"  [load concepts]  loaded {len(concepts)} income-statement concept(s) "
+        f"({period_type})"
+    )
     logger.info(
         "load_company_concepts: loaded %d income-statement concept(s) for %s (CIK %s, %s)",
         len(concepts),

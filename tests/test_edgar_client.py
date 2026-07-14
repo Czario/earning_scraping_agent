@@ -84,12 +84,63 @@ def test_finds_exhibit_99_from_8k_item_202(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, report_date = get_latest_earnings_url("0000320193")
+    url, supplemental_urls, report_date = get_latest_earnings_url("0000320193")
 
     assert url is not None
     assert "ex991pressrelease.htm" in url
     assert url.startswith("https://www.sec.gov")
+    assert supplemental_urls == []
     assert report_date == "2026-03-29"
+
+
+@patch("earnings_agents.tools.edgar_client.requests.get")
+def test_finds_all_ex_99_exhibits(mock_get):
+    """Returns all EX-99 exhibit URLs when multiple exhibits exist (e.g. EX-99.1 and EX-99.2)."""
+    index_html = """
+    <html><body>
+    <table class="tableFile">
+      <tr><th>Seq</th><th>Description</th><th>Document</th><th>Type</th><th>Size</th></tr>
+      <tr><td>1</td><td>8-K</td>
+        <td><a href="/Archives/edgar/data/1649749/000164974926000052/fbk-20260713.htm">fbk-20260713.htm</a></td>
+        <td>8-K</td><td>36KB</td></tr>
+      <tr><td>2</td><td>PRESS RELEASE</td>
+        <td><a href="/Archives/edgar/data/1649749/000164974926000052/ex991press.htm">ex991press.htm</a></td>
+        <td>EX-99.1</td><td>286KB</td></tr>
+      <tr><td>3</td><td>SUPPLEMENTAL</td>
+        <td><a href="/Archives/edgar/data/1649749/000164974926000052/ex992supp.htm">ex992supp.htm</a></td>
+        <td>EX-99.2</td><td>2.5MB</td></tr>
+      <tr><td>4</td><td>EARNINGS PRESENTATION</td>
+        <td><a href="/Archives/edgar/data/1649749/000164974926000052/ex993present.htm">ex993present.htm</a></td>
+        <td>EX-99.3</td><td>39KB</td></tr>
+    </table>
+    </body></html>
+    """
+    submissions_resp = MagicMock()
+    submissions_resp.raise_for_status = MagicMock()
+    submissions_resp.json.return_value = _mock_submissions(
+        forms=["8-K", "10-Q"],
+        items=["2.02,7.01,9.01", ""],
+        accessions=["0001649749-26-000052", "0001649749-25-000050"],
+        primary_docs=["fbk-20260713.htm", "fbk-10q.htm"],
+        report_dates=["2026-06-30", "2026-03-31"],
+        filing_dates=["2026-07-13", "2026-05-10"],
+    )
+
+    index_resp = MagicMock()
+    index_resp.raise_for_status = MagicMock()
+    index_resp.text = index_html
+
+    mock_get.side_effect = [submissions_resp, index_resp]
+
+    url, supplemental_urls, report_date = get_latest_earnings_url("0001649749")
+
+    assert url is not None
+    assert "ex991press.htm" in url
+    assert len(supplemental_urls) == 2
+    assert "ex992supp.htm" in supplemental_urls[0]
+    assert "ex993present.htm" in supplemental_urls[1]
+    assert all(u.startswith("https://www.sec.gov") for u in supplemental_urls)
+    assert report_date is not None
 
 
 @patch("earnings_agents.tools.edgar_client.requests.get")
@@ -110,10 +161,11 @@ def test_falls_back_to_first_8k_when_no_item_202(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, report_date = get_latest_earnings_url("0000789019")
+    url, supplemental_urls, report_date = get_latest_earnings_url("0000789019")
     # Falls back to primary doc since no EX-99.1 in index
     assert url is not None
     assert "msft-8k.htm" in url
+    assert supplemental_urls == []
 
 
 @patch("earnings_agents.tools.edgar_client.requests.get")
@@ -129,8 +181,9 @@ def test_returns_none_when_no_8k_filings(mock_get):
     )
     mock_get.return_value = resp
 
-    url, report_date = get_latest_earnings_url("0001234567")
+    url, supplemental_urls, report_date = get_latest_earnings_url("0001234567")
     assert url is None
+    assert supplemental_urls == []
     assert report_date is None
 
 
@@ -140,8 +193,9 @@ def test_returns_none_on_submissions_api_error(mock_get):
     import requests as req
     mock_get.side_effect = req.RequestException("timeout")
 
-    url, report_date = get_latest_earnings_url("0000320193")
+    url, supplemental_urls, report_date = get_latest_earnings_url("0000320193")
     assert url is None
+    assert supplemental_urls == []
     assert report_date is None
 
 
@@ -169,10 +223,11 @@ def test_falls_back_to_primary_doc_when_index_fails(mock_get):
 
     with patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None):
         mock_get.side_effect = [submissions_resp, *index_errors]
-        url, report_date = get_latest_earnings_url("0000320193")
+        url, supplemental_urls, report_date = get_latest_earnings_url("0000320193")
 
     assert url is not None
     assert "aapl-20260430.htm" in url
+    assert supplemental_urls == []
     # raw 8-K reportDate passes validation (between prior 10-Q reportDate
     # and 8-K filing date), so it is accepted.
     assert report_date == "2026-03-29"
@@ -206,9 +261,10 @@ def test_uses_prior_year_10q_for_period_end(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, report_date = get_latest_earnings_url("0001045810")
+    url, supplemental_urls, report_date = get_latest_earnings_url("0001045810")
 
     assert url is not None
+    assert supplemental_urls == []
     # Prior-year 10-Q reportDate 2025-04-27 + 1 year → 2026-04-27 (actual quarter end)
     assert report_date == "2026-04-27"
 
@@ -240,9 +296,10 @@ def test_uses_prior_year_10k_for_fast_annual_reporter(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, report_date = get_latest_earnings_url("0001341439")
+    url, supplemental_urls, report_date = get_latest_earnings_url("0001341439")
 
     assert url is not None
+    assert supplemental_urls == []
     # Prior-year 10-K reportDate 2025-05-31 + 1 year → 2026-05-31 (actual FYE),
     # even though it is only 10 days before the 2026-06-10 filing date.
     assert report_date == "2026-05-31"
@@ -270,7 +327,8 @@ def test_keeps_raw_report_date_when_no_prior_periodic_filings(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, report_date = get_latest_earnings_url("0000320193")
+    url, supplemental_urls, report_date = get_latest_earnings_url("0000320193")
+    assert supplemental_urls == []
 
     assert url is not None
     # No prior 10-Q/10-K — raw reportDate kept for skip guard (best-effort).

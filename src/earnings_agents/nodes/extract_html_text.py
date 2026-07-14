@@ -258,26 +258,44 @@ def _classify_table(table_text: str, context_text: str) -> str:
     # ── 2. Full-probe non-GAAP ────────────────────────────────────────────────
     full_probe = context_text + " " + table_text
     if _NON_GAAP_TABLE_RX.search(full_probe):
-        # Guard: a GAAP segment revenue table often carries a footnote cell such
-        # as "* Currency-neutral revenues are a non-GAAP measure."  That line
-        # refers only to a percentage column — the dollar values are all GAAP.
-        # When the full probe contains BOTH a non-GAAP keyword AND a segment
-        # pattern, AND the context heading itself does NOT advertise non-GAAP
-        # content, the table is a GAAP segment table with a footnote disclaimer.
-        # Fall through to the GAAP/segment checks below rather than suppressing
-        # the whole table.
+        # Guard: many bank filing tables contain non-GAAP footnotes or a handful
+        # of "Adjusted" metric rows inside an otherwise GAAP statement table
+        # (e.g. "Adjusted net income" in a Consolidated Statements of Income
+        # table).  The heading / opening context determines the primary type.
         #
-        # This handles the common case where the "(1) Revenues by reportable
-        # segment" note is a row inside the preceding IS table (and disappears
-        # when that table is decomposed), leaving the segment table with an
-        # empty context — so step 1 above cannot fire — while the body still
-        # contains the currency-neutral footnote row.
-        if not (_SEGMENT_TABLE_RX.search(full_probe) and not _NON_GAAP_TABLE_RX.search(context_text)):
+        # A table is treated as GAAP (not non-GAAP) when:
+        #   (a) The context (preceding heading) identifies it as IS/BS/CF AND
+        #       the context itself does NOT contain non-GAAP keywords, OR
+        #   (b) The TABLE'S OWN opening text (first 600 chars) identifies it
+        #       as IS/BS/CF AND that opening section is non-GAAP-free — this
+        #       catches tables whose headings are inside the table body (common
+        #       in press releases where "Statement of Income Highlights" is a
+        #       data row rather than a preceding DOM element), OR
+        #   (c) Segment-table guard (original logic): full body matches a
+        #       segment pattern AND context is non-GAAP-free.
+        context_ngaap = _NON_GAAP_TABLE_RX.search(context_text)
+        opening = table_text[:600]
+        is_gaap_by_context = (
+            not context_ngaap
+            and (_INCOME_STMT_TABLE_RX.search(context_text)
+                 or _BALANCE_SHEET_TABLE_RX.search(context_text)
+                 or _CASH_FLOW_TABLE_RX.search(context_text))
+        )
+        is_gaap_by_opening = (
+            not context_text.strip()
+            and not _NON_GAAP_TABLE_RX.search(opening)
+            and (_INCOME_STMT_TABLE_RX.search(opening)
+                 or _BALANCE_SHEET_TABLE_RX.search(opening)
+                 or _CASH_FLOW_TABLE_RX.search(opening))
+        )
+        is_segment = _SEGMENT_TABLE_RX.search(full_probe) and not context_ngaap
+        if not (is_gaap_by_context or is_gaap_by_opening or is_segment):
             return "non_gaap"
         logger.debug(
-            "Table has non-GAAP footnote but also segment keywords — "
-            "treating as GAAP segment table (context=%r...)",
-            context_text[:120],
+            "Non-GAAP keywords found but table identified as GAAP via "
+            "context/opening — falling through to GAAP checks "
+            "(context=%r..., opening=%r...)",
+            context_text[:80], opening[:80],
         )
 
     # ── 3. Short-probe GAAP statement checks ─────────────────────────────────
@@ -398,6 +416,201 @@ def _strip_sgml_wrapper(html: str) -> str:
     return match.group(1).strip() if match else html
 
 
+def _classify_document_tables(
+    soup: BeautifulSoup,
+    doc_scale: str | None,
+    skip_llm_filter: bool = False,
+) -> tuple[dict[str, list[str]], bool, str]:
+    """Classify all HTML tables in *soup* into financial statement sections.
+
+    Applies the same classification pipeline as the main EX-99.1 processing:
+    table-type detection (income_statement, balance_sheet, cash_flow, segment,
+    non_gaap, other), scale caption injection for GAAP tables.
+
+    When ``skip_llm_filter=True``, the LLM batch filter for 'other' tables is
+    deferred — pending entries are returned so the caller can batch them across
+    multiple documents into a single LLM call.
+
+    **Modifies *soup* in place** — all ``<table>`` elements are decomposed
+    during classification so prose extraction is table-free.
+
+    Returns:
+        sections:   ``{income_statement: [], balance_sheet: [], cash_flow: [],
+                    other: [], non_gaap: []}`` — each value is a list of
+                    markdown-formatted table entries with leading context.
+                    When ``skip_llm_filter=True``, "other" entries that passed
+                    deterministic checks are already included; the unfiltered
+                    pending batch is returned separately.
+        has_gaap:   ``True`` if at least one table was classified as a GAAP
+                    statement type.
+        prose:      All non-table text (noise tags removed, boilerplate stripped).
+        pending:    ``None`` when ``skip_llm_filter=False``.  Otherwise, a list
+                    of ``(markdown_entry, table_text, context)`` tuples for
+                    tables classified as ``'other'`` that still need LLM batch
+                    filtering.
+    """
+    sections: dict[str, list[str]] = {
+        "income_statement": [],
+        "balance_sheet": [],
+        "cash_flow": [],
+        "other": [],
+        "non_gaap": [],
+    }
+    has_gaap = False
+
+    # Pending 'other' tables — classified in one batched LLM call after the loop.
+    _other_pending: list[tuple[str, str, str]] = []
+
+    for table in list(soup.find_all("table")):
+        context = _get_table_context(table)
+        table_text = table.get_text(" ", strip=True)
+        ttype = _classify_table(table_text, context)
+        logger.debug(
+            "Table classified as %r — context=%r... body_start=%r...",
+            ttype,
+            context[:100],
+            table_text[:100],
+        )
+        md = _table_to_markdown(table)
+        entry = (f"{context}\n" if context.strip() else "") + md
+        # Re-attach a scale caption to GAAP statements whose own text says
+        # nothing about scale.
+        if ttype in ("income_statement", "balance_sheet", "cash_flow") and not _ENTRY_HAS_SCALE_RX.search(entry):
+            table_scale = _find_preceding_scale(table) or doc_scale
+            if table_scale:
+                entry = f"(in {table_scale})\n{entry}"
+        if ttype == "other":
+            _other_pending.append((entry, table_text, context))
+        elif ttype == "drop":
+            logger.debug(
+                "Table deterministically dropped (regex) — context=%r...",
+                context[:80],
+            )
+        elif ttype == "segment":
+            if not _ENTRY_HAS_SCALE_RX.search(entry):
+                table_scale = _find_preceding_scale(table) or doc_scale
+                if table_scale:
+                    entry = f"(in {table_scale})\n{entry}"
+            sections["other"].append(entry)
+            has_gaap = True
+        else:
+            sections[ttype].append(entry)
+            if ttype in ("income_statement", "balance_sheet", "cash_flow"):
+                has_gaap = True
+        table.decompose()
+
+    # Batch-classify all 'other' tables.
+    pending: list | None = None
+    if _other_pending and not skip_llm_filter:
+        from earnings_agents.config import LLM_PROVIDER as _LLM_PROVIDER
+        from earnings_agents.hooks import report_call as _report_call
+        _report_call(f"  [llm]  classify {len(_other_pending)} 'other' table(s)  → calling llm  ({_LLM_PROVIDER or 'llm'})")
+        llm = build_llm(format_json=True)
+        candidates = [(t, c) for _, t, c in _other_pending]
+        keep_flags = _llm_classify_other_batch(candidates, llm)
+        kept = 0
+        for (entry, _, _ctx), keep in zip(_other_pending, keep_flags):
+            if keep:
+                sections["other"].append(entry)
+                kept += 1
+        if kept < len(_other_pending):
+            from earnings_agents.hooks import report_call as _report_call2
+            _report_call2(
+                f"  [filter]  kept {kept}/{len(_other_pending)} 'other' table(s)"
+                f"  (dropped {len(_other_pending) - kept})"
+            )
+    elif _other_pending:
+        # Defer LLM filter: return pending for batched processing upstream.
+        pending = _other_pending
+
+    # Prose text with all tables removed
+    prose = soup.get_text(separator="\n", strip=True)
+    prose = _strip_boilerplate(prose)
+
+    return sections, has_gaap, prose, pending
+
+
+def _fetch_and_classify_supplement(
+    url: str, ticker: str, index: int,
+) -> tuple[dict[str, list[str]], str, list] | None:
+    """Fetch a supplemental exhibit and classify its tables using the same
+    pipeline as the main document.
+
+    Returns ``(sections, prose, pending)`` where *sections* is a classified
+    table dict and *pending* is a list of ``(entry, table_text, context)``
+    for 'other' tables that still need LLM batch filtering, or ``None`` if
+    already filtered.  Returns ``None`` on fetch/parse failure.
+    """
+    from earnings_agents.hooks import report_call
+    try:
+        ex_label = f"supplement {index + 2}"
+        report_call(f"  [http]  GET supplemental {url[:80]}")
+        is_sec = "sec.gov" in url
+        response = _http_get(url, sec=is_sec)
+        supp_html = response.text
+        report_call(
+            f"  [{ex_label}]  fetched  {len(supp_html):,} raw bytes"
+            f"  ({len(supp_html) // 1024} KB)"
+        )
+
+        supp_html = _strip_sgml_wrapper(supp_html)
+        report_call(f"  [{ex_label}]  parsing HTML and removing noise…")
+
+        supp_soup = BeautifulSoup(supp_html, "lxml")
+        for tag in supp_soup(_NOISE_TAGS):
+            tag.decompose()
+
+        supp_scale, _, _ = _prescan_document(supp_soup.get_text(" ", strip=True))
+        report_call(f"  [{ex_label}]  classifying tables…")
+        supp_sections, _, supp_prose, supp_pending = _classify_document_tables(
+            supp_soup, supp_scale, skip_llm_filter=True,
+        )
+
+        # Count total tables across all sections
+        total_tables = sum(len(v) for v in supp_sections.values())
+
+        # Skip exhibits that are investor presentations (slide decks, charts)
+        # rather than financial data supplements.  Presentations have few or no
+        # extractable HTML tables (they are image/chart-based), so they add
+        # prompt size without useful extraction targets.
+        if total_tables == 0:
+            report_call(
+                f"  [{ex_label}]  no financial tables found — "
+                f"skipping (likely investor presentation)"
+            )
+            logger.info(
+                "Supplemental exhibit %d for %s: no financial tables found — "
+                "skipping (likely investor presentation)",
+                index + 2, ticker,
+            )
+            return None
+
+        is_c = len(supp_sections["income_statement"])
+        bs_c = len(supp_sections["balance_sheet"])
+        cf_c = len(supp_sections["cash_flow"])
+        oth_c = len(supp_sections["other"])
+        ngaap_c = len(supp_sections["non_gaap"])
+        report_call(
+            f"  [{ex_label}]  classified {total_tables} tables"
+            f"  ({is_c} IS, {bs_c} BS, {cf_c} CF, {oth_c} other, {ngaap_c} non-gaap)"
+        )
+
+        logger.info(
+            "Supplemental exhibit %d for %s: %d tables (%d IS, %d BS, %d CF, "
+            "%d other, %d non-gaap)",
+            index + 2, ticker, total_tables,
+            is_c, bs_c, cf_c, oth_c, ngaap_c,
+        )
+
+        return supp_sections, supp_prose, supp_pending
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to fetch supplemental exhibit %s for %s: %s",
+            url, ticker, exc,
+        )
+        return None
+
+
 def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
     """Fetch an HTML earnings page and extract clean article text.
 
@@ -451,93 +664,108 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
         # Classify each HTML table by financial statement type, then assemble
         # raw_text so GAAP tables appear first and non-GAAP reconciliation
         # tables are isolated at the end with a clear label.
-        #
-        # Processing order matters: each table is decomposed from the soup
-        # before the next table's context is collected, so `_get_table_context`
-        # only sees text *between* consecutive tables (not the prior table's
-        # rows), keeping the scale/period header attached to the right table.
-        sections: dict[str, list[str]] = {
-            "income_statement": [],
-            "balance_sheet": [],
-            "cash_flow": [],
-            "other": [],
-            "non_gaap": [],
-        }
-        has_gaap_tables = False
+        # Collect 'other' table pending entries from the MAIN document for
+        # batched LLM filtering.  Supplement 'other' tables are always excluded
+        # (IS-only merge policy).
+        all_pending: list[tuple[str, str, str]] = []
 
-        # Pending 'other' tables — classified in one batched LLM call after the loop.
-        # Each entry: (table_markdown_entry, table_text_for_llm)
-        _other_pending: list[tuple[str, str]] = []
+        sections, has_gaap_tables, prose, pending = _classify_document_tables(
+            soup, doc_scale, skip_llm_filter=True,
+        )
+        if pending:
+            all_pending.extend(pending)
 
-        for table in list(soup.find_all("table")):
-            context = _get_table_context(table)
-            table_text = table.get_text(" ", strip=True)
-            ttype = _classify_table(table_text, context)
-            logger.debug(
-                "Table classified as %r — context=%r... body_start=%r...",
-                ttype,
-                context[:100],
-                table_text[:100],
-            )
-            md = _table_to_markdown(table)
-            entry = (f"{context}\n" if context.strip() else "") + md
-            # Re-attach a scale caption to GAAP statements whose own text says
-            # nothing about scale, so the downstream prescan and the LLM both
-            # see "(in <scale>)". Prefer the nearest scale caption preceding
-            # THIS table (structure-agnostic, correct for mixed-scale filings),
-            # falling back to the document-wide scale. Never overrides a table
-            # that states its own scale (the regex guard); skipped for
-            # non-GAAP / 'other' tables to stay conservative.
-            if ttype in ("income_statement", "balance_sheet", "cash_flow") and not _ENTRY_HAS_SCALE_RX.search(entry):
-                table_scale = _find_preceding_scale(table) or doc_scale
-                if table_scale:
-                    entry = f"(in {table_scale})\n{entry}"
-            if ttype == "other":
-                _other_pending.append((entry, table_text, context))
-            elif ttype == "drop":
-                logger.debug(
-                    "Table deterministically dropped (regex) — context=%r...",
-                    context[:80],
+        # Capture main document table counts for CLI display (before supplement merge)
+        main_is = len(sections["income_statement"])
+        main_bs = len(sections["balance_sheet"])
+        main_cf = len(sections["cash_flow"])
+        main_other = len(sections["other"])
+        main_ngaap = len(sections["non_gaap"])
+        main_total = main_is + main_bs + main_cf + main_other + main_ngaap
+        report_call(
+            f"  [main doc]      classified {main_total} tables"
+            f"  ({main_is} IS, {main_bs} BS, {main_cf} CF,"
+            f" {main_other} other, {main_ngaap} non-gaap)"
+        )
+
+        # ── Process supplemental exhibits (EX-99.2, EX-99.3, ...) ──────────────
+        # Each supplemental document is parsed and classified independently using
+        # the same pipeline as the main EX-99.1 document.  Table results are
+        # merged into the main sections with a provenance prefix so the LLM
+        # extractor sees which exhibit each table originated from.
+        supplemental_urls = state.get("supplemental_file_urls") or []
+        supp_blocks: list[str] = []  # raw_text blocks, assembled below
+        supplemental_log: list[str] = [
+            f"  [main doc]      {main_total} tables"
+            f"  ({main_is} IS, {main_bs} BS, {main_cf} CF,"
+            f" {main_other} other, {main_ngaap} non-gaap)"
+        ]
+        for supp_idx, supp_url in enumerate(supplemental_urls):
+            report_call(f"  [supplement {supp_idx+2}]  processing  {supp_url.rsplit('/', 1)[-1]}")
+            result = _fetch_and_classify_supplement(supp_url, ticker, supp_idx)
+            if result is None:
+                supplemental_log.append(
+                    f"  [supplement {supp_idx+2}]   skipped — no financial tables"
                 )
-            elif ttype == "segment":
-                # Segment/geographic/product revenue tables — always keep;
-                # bypass the LLM batch filter and place directly into "other"
-                # so they reach extraction as FINANCIAL DATA chunks.
-                # Also inject scale if the table doesn't declare its own.
-                if not _ENTRY_HAS_SCALE_RX.search(entry):
-                    table_scale = _find_preceding_scale(table) or doc_scale
-                    if table_scale:
-                        entry = f"(in {table_scale})\n{entry}"
-                sections["other"].append(entry)
+                report_call(f"  [supplement {supp_idx+2}]  skipped — no financial tables (likely presentation)")
+                continue
+            supp_sections, supp_prose, supp_pending = result
+            # Supplement 'other' tables are never included in extraction
+            # (IS-only merge).  Don't add them to the batched filter either
+            # since their results are discarded — saves an LLM call.
+            # (Pending from main doc *is* added above and still needs filtering.)
+            # Only merge income_statement tables from supplements.
+            # Balance sheet, cash flow, "other" (non-IS financial data like loan
+            # portfolios, capital ratios, deposit data), and non-GAAP tables are
+            # excluded — targeted extraction focuses on income-statement concepts,
+            # so only explicitly IS-classified tables contribute relevant data.
+            is_count = len(supp_sections["income_statement"])
+            bs_count = len(supp_sections["balance_sheet"])
+            cf_count = len(supp_sections["cash_flow"])
+            other_count = len(supp_sections["other"])
+            ngaap_count = len(supp_sections["non_gaap"])
+            prefix = f"[SUPPLEMENTAL EXHIBIT ({supp_idx + 2})] "
+            for entry in supp_sections["income_statement"]:
+                sections["income_statement"].append(prefix + entry)
                 has_gaap_tables = True
-            else:
-                sections[ttype].append(entry)
-                if ttype in ("income_statement", "balance_sheet", "cash_flow"):
-                    has_gaap_tables = True
-            table.decompose()  # Remove before processing next table
+            if supp_prose.strip() and is_count:
+                supp_blocks.append(f"=== SUPPLEMENTAL EXHIBIT ({supp_idx + 2}) NARRATIVE ===\n{prefix}{supp_prose}")
+            supplemental_log.append(
+                f"  [supplement {supp_idx+2}]   {is_count} IS table(s) merged"
+                f"  (skipped {bs_count} BS, {cf_count} CF,"
+                f" {other_count} other, {ngaap_count} non-gaap)"
+            )
+            report_call(
+                f"  [supplement {supp_idx+2}]  merged {is_count} IS table(s) into extraction sections"
+            )
+            logger.info(
+                "Supplemental exhibit %d merged for %s (%d IS tables)",
+                supp_idx + 2, ticker, is_count,
+            )
 
-        # Batch-classify all 'other' tables in a single LLM call.
-        if _other_pending:
+        # ── LLM filter for main doc 'other' tables ──────────────────────────────
+        # Supplement 'other' tables are excluded (IS-only merge) so only main doc
+        # pending entries need the LLM batch filter.
+        if all_pending:
             from earnings_agents.config import LLM_PROVIDER as _LLM_PROVIDER
-            report_call(f"  [llm]  classify {len(_other_pending)} 'other' table(s)  → calling llm  ({_LLM_PROVIDER or 'llm'})")
+            report_call(
+                f"  [llm]  classify {len(all_pending)} 'other' table(s)"
+                f"  (across all exhibits)  → calling llm  ({_LLM_PROVIDER or 'llm'})"
+            )
             llm = build_llm(format_json=True)
-            candidates = [(t, c) for _, t, c in _other_pending]
+            candidates = [(t, c) for _, t, c in all_pending]
             keep_flags = _llm_classify_other_batch(candidates, llm)
-            skipped = 0
-            for (entry, _, _ctx), keep in zip(_other_pending, keep_flags):
+            kept = 0
+            for (entry, _, _ctx), keep in zip(all_pending, keep_flags):
                 if keep:
                     sections["other"].append(entry)
-                else:
-                    skipped += 1
-            if skipped:
-                logger.debug(
-                    "LLM batch filter: skipped %d/%d 'other' table(s) for %s",
-                    skipped, len(_other_pending), ticker,
-                )
-
-        # Prose text with all tables removed
-        prose = soup.get_text(separator="\n", strip=True)
-        prose = _strip_boilerplate(prose)
+                    kept += 1
+            report_call(
+                f"  [filter]  kept {kept}/{len(all_pending)} 'other' table(s)"
+                f"  (dropped {len(all_pending) - kept})"
+            )
+            if kept:
+                has_gaap_tables = True
 
         if has_gaap_tables:
             # Structured output: GAAP tables first → narrative → non-GAAP
@@ -557,19 +785,26 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                     "=== NON-GAAP (FOR REFERENCE ONLY — DO NOT USE FOR GAAP METRICS) ===\n"
                     + entry
                 )
+            # Append supplemental narrative blocks at the end of raw_text
             raw_text = "\n\n".join(parts)
+            if supp_blocks:
+                raw_text += "\n\n" + "\n\n".join(supp_blocks)
+
             logger.info(
                 "HTML extracted %d chars for %s — %d income, %d balance, "
-                "%d cashflow, %d other, %d non-gaap table(s)",
+                "%d cashflow, %d other, %d non-gaap table(s)%s",
                 len(raw_text), ticker,
                 len(sections["income_statement"]), len(sections["balance_sheet"]),
                 len(sections["cash_flow"]), len(sections["other"]),
                 len(sections["non_gaap"]),
+                f"  (+{len(supp_blocks)} supplemental)" if supp_blocks else "",
             )
+
             return {
                 **state,
                 "raw_text": raw_text,
                 "raw_sections": sections,
+                "_supplemental_log": supplemental_log,
                 "status": "text_extracted",
             }
         else:
@@ -586,7 +821,12 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                 "HTML extracted %d chars for %s (fallback — no GAAP tables classified)",
                 len(raw_text), ticker,
             )
-            return {**state, "raw_text": raw_text, "status": "text_extracted"}
+
+            # Append supplemental narrative blocks (tables already merged above)
+            if supp_blocks:
+                raw_text += "\n\n" + "\n\n".join(supp_blocks)
+
+            return {**state, "raw_text": raw_text, "_supplemental_log": supplemental_log, "status": "text_extracted"}
     except Exception as exc:  # noqa: BLE001
         return {**state, "status": "failed", "error": f"HTML extraction failed: {exc}"}
 
