@@ -1367,11 +1367,12 @@ class TestTaxonomyKeyMapping:
         result = extract_financial_metrics_node(state)
 
         cm = result.get("concept_metrics", {})
-        # Both mapped at tier0b — no tier2 LLM call needed
+        # Both mapped at tier0b — tier2 LLM mapping always runs
+        # (uses all numeric keys to map remaining concepts)
         assert cm.get("aaa111") == pytest.approx(5_234_000_000)
         assert cm.get("bbb222") == pytest.approx(3_900_000_000)
-        # Only one LLM call (extraction) — no tier2 call
-        assert mock_llm.invoke.call_count == 1
+        # Two LLM calls: extraction + tier2 mapping
+        assert mock_llm.invoke.call_count == 2
 
     @patch("earnings_agents.nodes.extract_financial_metrics.build_llm")
     def test_llm_semantic_mapping_used_for_residual(self, mock_build_llm):

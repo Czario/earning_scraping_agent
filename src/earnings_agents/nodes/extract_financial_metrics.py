@@ -14,6 +14,7 @@ from earnings_agents.config import (
     GROQ_REQUEST_TIMEOUT,
     LLM_PROVIDER,
     SOURCE_GROUNDING,
+    default_chunk_size,
 )
 from earnings_agents.hooks import get_detail_callback, report_call, report_detail
 from earnings_agents.llm_factory import build_llm
@@ -66,6 +67,106 @@ from earnings_agents.extraction.concept_mapper import (
     _build_concept_prompt_list,
     _llm_map_concepts,
 )
+
+
+# ── Multi-column table detection ─────────────────────────────────────────────
+# Bank earnings supplements routinely present income statements with 5-9
+# side-by-side columns (current quarter, prior quarters, YTD totals, percentage
+# changes).  The HTML-to-text conversion often mangles the column headers so
+# the LLM cannot reliably identify which column holds the current-period
+# values.  This detector scans the chunk text for repeating quarter patterns
+# and injects a column-position hint into the prompt.
+
+# Matches period-column headers like "2Q25", "Q1 2025", "1Q 2026", "Q2-26" etc.
+# Group 1 = the full label ("2Q25", "Q1 2025").
+_MULTI_COL_Q_RX = re.compile(
+    # "2Q25", "1Q26" (digit-Q-2digits)
+    r"\b[1-4]Q['′]?\d{2}\b"
+    # "2Q 2025", "1Q 2026" (digit-Q-space-4digits)
+    r"|\b[1-4]Q\s+\d{4}\b"
+    # "Q1 2025", "Q2-26", "Q1'26" (Q-digit-year)
+    r"|\bQ[1-4][\s\-–—'′]*(?:20)?\d{2}\b",
+    re.I,
+)
+
+# Also match short-form year rows under quarter headers, e.g.
+#   "2Q  3Q  4Q  1Q  2Q"
+#   "25  25  25  26  26"
+# These appear when the year row and the quarter-row are on separate lines.
+_MULTI_COL_YEAR_ROW_RX = re.compile(
+    r"^(?:\s*(?:\d{2,4}|''\d{2}|'\d{2})\s+){4,}"
+)
+
+
+def _detect_multi_column_hint(chunk_text: str) -> str:
+    """Return a column-position hint when *chunk_text* contains multiple
+    period columns (common in bank supplements).
+
+    Returns an empty string when the chunk has 2 or fewer period columns
+    (standard single-period table — no hint needed).
+    """
+    # Clean HTML entities and non-breaking spaces for matching
+    clean = chunk_text.replace("\xa0", " ").replace("&#160;", " ")
+    clean = re.sub(r"&#\d+;", " ", clean)
+    clean = re.sub(r"&nbsp;", " ", clean, flags=re.I)
+
+    # Find all distinct quarter labels
+    q_labels = set(_MULTI_COL_Q_RX.findall(clean))
+    # Normalise: "Q1 2025" → "Q125", "1Q25" → "Q125" (unified sortable format)
+    _normalised: set[str] = set()
+    for lbl in q_labels:
+        _norm = re.sub(r"[\s\-–—]+|['′]", "", lbl).upper()
+        # Unify "4Q25" → "Q425" so sort by (year, quarter) works on both variants
+        _norm = re.sub(r"^(\d)(Q)(\d{2})$", r"\2\1\3", _norm)
+        _normalised.add(_norm)
+
+    # Also check for repeated year rows under quarter headers
+    # (e.g. "25  25  25  26  26" on a separate line after the Q row)
+    year_row_matches = _MULTI_COL_YEAR_ROW_RX.findall(clean)
+
+    col_count = len(_normalised)
+
+    # If 3+ distinct quarter labels OR year rows with 5+ columns
+    if col_count >= 3 or len(year_row_matches) >= 1:
+        # Sort labels to identify the most recent quarter.
+        # Sorted labels look like Q125, Q225, ..., Q126, Q226, ...
+        def _q_sort_key(lbl: str) -> tuple[int, int]:
+            """Extract (year, quarter) from normalised label like Q125, Q226, or Q12025."""
+            m = re.match(r"Q(\d)(\d+)", lbl)
+            if m:
+                q = int(m.group(1))
+                y_str = m.group(2)
+                # Handle both 2-digit ("25" → 2025) and 4-digit ("2025" → 2025) years
+                if len(y_str) == 2:
+                    y = 2000 + int(y_str)
+                else:
+                    y = int(y_str)
+                return (y, q)
+            return (0, 0)
+
+        sorted_q = sorted(_normalised, key=_q_sort_key)
+        latest = sorted_q[-1] if sorted_q else ""
+
+        # Build a readable column map
+        cols_desc = " → ".join(sorted_q)
+        logging.getLogger(__name__).info(
+            "Multi-column table hint for %d period columns (latest=%s)",
+            col_count, latest,
+        )
+        return (
+            "\n"
+            f"⚠  MULTI-COLUMN TABLE DETECTED: this table shows {col_count} period columns "
+            f"({cols_desc}).\n"
+            f"The CURRENT period column is the LAST one: **{latest}**.\n"
+            "Column 1 = row labels.  Each subsequent column = one period's values "
+            f"in the order shown above.\n"
+            f"Extract values ONLY from the {latest} column.\n"
+            "Do NOT extract from any percentage-change column, YTD column, "
+            "or prior-period column.\n"
+        )
+
+    return ""
+
 
 logger = logging.getLogger(__name__)
 
@@ -229,11 +330,14 @@ def _request_timeout_for(provider: str | None) -> float:
     ``LLM_PROVIDER`` is used. Each cloud provider has its own timeout budget;
     everything else (local Ollama) uses the Ollama default.
     """
+    from earnings_agents.config import DEEPSEEK_REQUEST_TIMEOUT
     effective = (provider or LLM_PROVIDER).strip().lower()
     if effective == "groq":
         return GROQ_REQUEST_TIMEOUT
     if effective == "gemini":
         return GEMINI_REQUEST_TIMEOUT
+    if effective == "deepseek":
+        return DEEPSEEK_REQUEST_TIMEOUT
     return _OLLAMA_REQUEST_TIMEOUT
 
 
@@ -386,13 +490,16 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         )
     focus_hint = ("\n" + "\n".join(focus_hint_parts) + "\n") if focus_hint_parts else ""
 
+    from earnings_agents.config import CHUNK_SIZE as _CFG_CHUNK_SIZE
+    _effective_chunk_size = _CFG_CHUNK_SIZE if _CFG_CHUNK_SIZE > 0 else default_chunk_size(LLM_PROVIDER)
     chunks = _build_section_chunks(
         state.get("raw_sections"),
         state.get("target_concepts"),
+        chunk_size=_effective_chunk_size,
     )
     chunk_source = "section"
     if chunks is None:
-        chunks = _chunk_text(raw_text)
+        chunks = _chunk_text(raw_text, chunk_size=_effective_chunk_size)
         chunk_source = "char"
     total = len(chunks)
     # Section provenance per chunk (parallel to `chunks`). Section chunks carry
@@ -577,6 +684,96 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
     # shares_multiplier stays document-level: the "except shares in thousands"
     # clause is a document-wide declaration that lives in the primary statement
     # caption and need not repeat in every section.
+    # ── Prior-period reference values ────────────────────────────────────
+    # Inject known values from the most recent stored period as a reference
+    # for the LLM.  This helps the LLM identify the correct column in
+    # multi-column bank supplement tables — the current-period values should
+    # be similar in magnitude to the prior period's.
+    _prior_ref_str: str = ""
+    if state.get("company_cik") and state.get("target_concepts"):
+        try:
+            from earnings_agents.tools.normalize_data_client import _get_client as _gc, _NORMALIZE_DB as _nd
+            _db2 = _gc()[_nd]
+            _cik2 = state["company_cik"]
+            _period_type2 = state.get("detected_period_type", "quarterly")
+            _col2 = "concept_values_quarterly" if _period_type2 == "quarterly" else "concept_values_annual"
+            # Find the most recent stored period (excluding current, if already stored)
+            _all_periods = sorted(
+                _db2[_col2].distinct("reporting_period.end_date", {"company_cik": _cik2}),
+                reverse=True,
+            )
+            _sec_date2 = state.get("sec_report_date")
+            _skip_current = False
+            if _sec_date2:
+                from datetime import date as _dd
+                _cfd2 = _dd.fromisoformat(_sec_date2) if isinstance(_sec_date2, str) else _sec_date2
+                if _all_periods and _all_periods[0] == _cfd2:
+                    _skip_current = True
+            _prior_end = _all_periods[1 if _skip_current else 0] if _all_periods else None
+            if _prior_end:
+                # Get values for the prompt concepts
+                _prompt_ids = [c["_id"] for c in prompt_concepts if c.get("_id")]
+                _prior_vals = list(_db2[_col2].find({
+                    "company_cik": _cik2,
+                    "concept_id": {"$in": _prompt_ids},
+                    "reporting_period.end_date": _prior_end,
+                }))
+                if _prior_vals:
+                    # Build id→value map
+                    _id_to_val: dict[str, float] = {}
+                    for _pv in _prior_vals:
+                        _cid = str(_pv["concept_id"])
+                        _val = _pv.get("value")
+                        if isinstance(_val, (int, float)):
+                            if _cid not in _id_to_val or abs(_val) > abs(_id_to_val[_cid]):
+                                _id_to_val[_cid] = float(_val)
+                    # Build id→label map
+                    _id_to_label: dict[str, str] = {
+                        str(c["_id"]): c.get("label", "") for c in target_concepts if c.get("_id")
+                    }
+                    # Build reference lines for the most important concepts (revenue, NI, NII, etc.)
+                    _ref_lines: list[str] = []
+                    # Sort by absolute value descending — most impactful first
+                    _sorted_prior = sorted(
+                        _id_to_val.items(),
+                        key=lambda x: abs(x[1]),
+                        reverse=True,
+                    )[:30]  # cap at 30 to avoid bloating the prompt
+                    for _cid, _val in _sorted_prior:
+                        _lbl = _id_to_label.get(_cid, "")
+                        if _lbl:
+                            _ref_lines.append(f"    {_lbl:50s} {_val:>20,.0f}")
+                    if _ref_lines:
+                        _prior_ref_str = (
+                            "\n"
+                            f"REFERENCE PRIOR PERIOD ({_prior_end.date()}): "
+                            f"The values below are from the most recent stored period. "
+                            f"Use them to identify the correct column — current-period values "
+                            f"should be in the same magnitude and P&L order.\n"
+                            + "\n".join(_ref_lines)
+                            + "\n"
+                        )
+                        logger.info(
+                            "Prior-period reference: %d values loaded for %s from %s",
+                            len(_ref_lines), ticker, _prior_end.date(),
+                        )
+        except Exception as _exc:
+            import traceback as _tb
+            logger.warning(
+                "Prior-period reference values unavailable for %s: %s\n%s",
+                ticker, _exc, _tb.format_exc(),
+            )
+
+    # Append prior-period reference to focus_hint
+    if _prior_ref_str:
+        focus_hint += _prior_ref_str
+
+    # Detect multi-column table structures and inject column-position hints.
+    # Bank supplements routinely pack 5-9 columns side-by-side; the LLM often
+    # picks values from the wrong column when the HTML-to-text conversion
+    # mangles the column headers.
+    chunk_multi_col_hints: list[str] = [_detect_multi_column_hint(c) for c in chunks]
+
     chunk_dollar_multipliers: list[int] = []
     chunk_scale_hints: list[str] = []
     for _chunk in chunks:
@@ -593,6 +790,40 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         chunk_dollar_multipliers.append(_cm)
         chunk_scale_hints.append(_ch)
 
+    # ── Clean HTML entities from chunk text ──────────────────────────────
+    # Bank supplement tables pack column data with HTML entities (\u200b
+    # zero-width spaces, \xa0 non-breaking spaces, &#160;, &#8203; etc.) that
+    # mangle the text layout, making it nearly impossible for the LLM to
+    # identify which column a value belongs to.  Strip these before sending
+    # to the LLM so it sees clean, parseable text.
+    def _clean_chunk(text: str) -> str:
+        """Remove HTML entities and invisible characters from chunk text."""
+        # Replace non-breaking and zero-width spaces with regular space
+        cleaned = text.replace("\xa0", " ")
+        cleaned = cleaned.replace("\u200b", " ")
+        cleaned = cleaned.replace("\u200e", " ")
+        cleaned = cleaned.replace("\u200f", " ")
+        cleaned = cleaned.replace("\u2028", " ")
+        # Replace HTML numeric entities
+        cleaned = re.sub(r"&#\d+;", " ", cleaned)
+        cleaned = re.sub(r"&nbsp;", " ", cleaned, flags=re.I)
+        cleaned = re.sub(r"&amp;", "&", cleaned, flags=re.I)
+        cleaned = re.sub(r"&lt;", "<", cleaned, flags=re.I)
+        cleaned = re.sub(r"&gt;", ">", cleaned, flags=re.I)
+        # Remove table-cell pipe artifacts that LLMs cannot parse correctly
+        # (HTML tables converted to text leave orphaned | characters)
+        cleaned = re.sub(r"\|\s*\|\s*\|", " | ", cleaned)  # triple pipes → single pipe
+        cleaned = re.sub(r"\|\s*\|", " | ", cleaned)          # double pipes → single pipe
+        # Collapse multi-space runs (but preserve newlines)
+        cleaned = re.sub(r"[^\S\n]+", " ", cleaned)
+        cleaned = re.sub(r"^\s+", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"\s+$", "", cleaned, flags=re.MULTILINE)
+        # Remove entirely-empty lines (lines with only spaces and pipes)
+        cleaned = re.sub(r"^[\s\|]+$", "", cleaned, flags=re.MULTILINE)
+        return cleaned
+
+    cleaned_chunks = [_clean_chunk(c) for c in chunks]
+
     # Source-grounding block is opt-in (SOURCE_GROUNDING): it roughly doubles
     # the LLM output size, so it is omitted by default for speed.
     sources_hint = _SOURCES_HINT_BLOCK if SOURCE_GROUNDING else ""
@@ -602,20 +833,38 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
             ticker=ticker,
             chunk_num=i,
             total_chunks=total,
-            focus_hint=focus_hint,
+            focus_hint=focus_hint + chunk_multi_col_hints[i - 1],
             scale_hint=chunk_scale_hints[i - 1],
             period_hint=period_hint,
             concept_list=concept_list_str,
             sources_hint=sources_hint,
             text=chunk,
         )
-        for i, chunk in enumerate(chunks, start=1)
+        for i, chunk in enumerate(cleaned_chunks, start=1)
     ]
+
+    # Log a preview of cleaned chunks
+    for i, c in enumerate(cleaned_chunks, start=1):
+        _interest_lines = [l for l in c.split('\n') if 'interest' in l.lower()][:5]
+        logger.info(
+            "Chunk %d/%d: %d chars, %d interest-related line(s)",
+            i, len(cleaned_chunks), len(c), len(_interest_lines),
+        )
+        for l in _interest_lines:
+            logger.info("  Chunk %d interest line: %s", i, l[:200])
+        if not _interest_lines:
+            # Show first 200 chars of chunk to understand what's in it
+            _preview = c[:300].replace('\n', ' | ')
+            logger.info("  Chunk %d preview (no interest found): %s", i, _preview[:200])
 
     # Parallel execution when OLLAMA_NUM_PARALLEL > 1.
     # Requires Ollama server started with OLLAMA_NUM_PARALLEL set to the same value.
-    # Default (1) = sequential — identical behaviour to the previous version.
-    num_parallel = min(total, int(os.getenv("OLLAMA_NUM_PARALLEL", "1")))
+    # Default is provider-aware: cloud APIs default to 3 (parallel chunks), local
+    # Ollama defaults to 1 (serial) unless explicitly overridden via env var.
+    from earnings_agents.config import default_num_parallel as _default_num_parallel
+    _np_env = os.getenv("OLLAMA_NUM_PARALLEL")
+    _np_default = int(_np_env) if _np_env else _default_num_parallel(LLM_PROVIDER)
+    num_parallel = min(total, _np_default)
     ordered: list[dict[str, Any] | None] = [None] * total
 
     if num_parallel > 1:
@@ -769,17 +1018,16 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         #   bare key:    us-gaap:NoninterestIncome     (old prompt behaviour)
         #   bracket key: [us-gaap:NoninterestIncome]   (new mandatory format)
         # Both resolve to the same concept_id so either format works.
-        taxonomy_key_to_id: dict[str, str] = {
-            c["taxonomy_key"]: c["_id"]
-            for c in target_concepts
-            if c.get("taxonomy_key")
-        }
-        # Bracket-wrapped form — the primary format after the prompt change.
-        bracket_key_to_id: dict[str, str] = {
-            f"[{c['taxonomy_key']}]": c["_id"]
-            for c in target_concepts
-            if c.get("taxonomy_key")
-        }
+        # Falls back to the `concept` field when `taxonomy_key` is None
+        # (common for bank/financial companies where concept documents store the
+        # XBRL key in `concept` rather than `taxonomy_key`).
+        taxonomy_key_to_id: dict[str, str] = {}
+        bracket_key_to_id: dict[str, str] = {}
+        for c in target_concepts:
+            key = c.get("taxonomy_key") or c.get("concept") or ""
+            if key:
+                taxonomy_key_to_id[key] = c["_id"]
+                bracket_key_to_id[f"[{key}]"] = c["_id"]
         concept_metrics = {}
         concept_id_to_metric_key: dict[str, str] = {}  # reverse map for mapped_metric_keys
         for key, value in metrics.items():
@@ -825,86 +1073,81 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
         # possibly match an unmapped concept in tier 2.
         orphaned_keys = [k for k in all_numeric_keys if k not in used_keys]
 
-        if unmapped_concepts and orphaned_keys:
-            # Pre-filter: drop concepts that can never appear in earnings press
-            # releases so the LLM prompt stays small and the call can be skipped
-            # entirely when nothing matchable remains.
-            #
-            # (a) OCI / comprehensive-income items — full-statement-only
-            #     disclosures, universally absent from press releases.
-            _OCI_SKIP_RX = re.compile(
-                r"other\s+comprehensive\s+(?:income|loss)"
-                r"|comprehensive\s+(?:income|loss)"
-                r"|unrealized\s+(?:gain|loss)"
-                r"|foreign\s+currency\s+translation"
-                r"|accumulated\s+other\s+comprehensive",
-                re.IGNORECASE,
-            )
-            # (b) Dimensional segment concepts (taxonomy_key contains '|') —
-            #     require segment-level extraction; a flat extracted key can
-            #     never map to them.
-            tier2_candidates = [
-                c for c in unmapped_concepts
-                if not _OCI_SKIP_RX.search(c.get("label", ""))
-                and "|" not in (c.get("taxonomy_key") or "")
-            ]
+        # Pre-filter: drop concepts that can never appear in earnings press
+        # releases so the LLM prompt stays small and the call can be skipped
+        # entirely when nothing matchable remains.
+        #
+        # (a) OCI / comprehensive-income items — full-statement-only
+        #     disclosures, universally absent from press releases.
+        _OCI_SKIP_RX = re.compile(
+            r"other\s+comprehensive\s+(?:income|loss)"
+            r"|comprehensive\s+(?:income|loss)"
+            r"|unrealized\s+(?:gain|loss)"
+            r"|foreign\s+currency\s+translation"
+            r"|accumulated\s+other\s+comprehensive",
+            re.IGNORECASE,
+        )
+        # (b) Dimensional segment concepts (taxonomy_key contains '|') —
+        #     require segment-level extraction; a flat extracted key can
+        #     never map to them.
+        tier2_candidates = [
+            c for c in unmapped_concepts
+            if not _OCI_SKIP_RX.search(c.get("label", ""))
+            and "|" not in (c.get("taxonomy_key") or "")
+        ]
 
-            if tier2_candidates:
-                logger.info(
-                    "Targeted mode: %d concept(s) unmatched after label lookup for %s "
-                    "— running LLM semantic mapping (%d matchable, %d orphaned key(s))",
-                    len(unmapped_concepts), ticker, len(tier2_candidates), len(orphaned_keys),
-                )
-                report_call(
-                    f"  [tier2]  {len(unmapped_concepts)} unmapped concept(s)"
-                    f"  ({len(tier2_candidates)} matchable,"
-                    f" {len(orphaned_keys)}/{len(all_numeric_keys)} orphaned keys)"
-                    f"  → calling llm  ({_display_provider})"
-                )
-                map_timeout = _request_timeout_for(escalated_provider)
-                map_llm = build_llm(format_json=True, request_timeout=map_timeout, provider=escalated_provider)
-                llm_matches = _llm_map_concepts(
-                    orphaned_keys,       # only unmapped keys — already-used keys excluded
-                    tier2_candidates,
-                    map_llm,
-                    already_used_keys=used_keys,
-                )
-                for concept_id, matched_key in llm_matches.items():
-                    value = metrics.get(matched_key)
-                    if isinstance(value, (int, float)):
-                        concept_metrics[concept_id] = float(value)
-                        concept_id_to_metric_key[concept_id] = matched_key
-                        logger.debug(
-                            "LLM semantic mapping: %r → concept_id %s for %s",
-                            matched_key, concept_id, ticker,
-                        )
-                report_call(
-                    f"  [tier2]  ✓ mapped {len(llm_matches)}/{len(tier2_candidates)} concept(s)"
-                )
-            else:
-                logger.info(
-                    "Tier2 skipped for %s: all %d unmapped concept(s) are "
-                    "OCI/dimensional — not extractable from press releases",
-                    ticker, len(unmapped_concepts),
-                )
-                report_call(
-                    f"  [tier2]  skipped ({len(unmapped_concepts)} unmapped, "
-                    f"all OCI/dimensional — not extractable from press releases)"
-                )
-        elif unmapped_concepts and not orphaned_keys:
-            # All extracted keys were already consumed by tier0/tier1.
-            # The extraction LLM saw every concept label in its prompt and
-            # returned null — the filing genuinely doesn't contain those values.
-            # Tier 2 can find nothing new → skip it.
+        if tier2_candidates:
+            # Use ALL extracted keys for mapping (not just orphans). The
+            # extraction LLM may have returned keys that don't match the
+            # concept label exactly (e.g. "Deposits" instead of "Interest
+            # Expense, Deposits"), but the LLM understands which concept
+            # each key represents.  Previously this only ran on orphaned
+            # keys, which missed cases where a key was deterministically
+            # mapped to the wrong concept.
+            _map_keys = orphaned_keys or all_numeric_keys
             logger.info(
-                "Tier2 skipped for %s: 0 orphaned keys (%d/%d extracted keys already "
-                "mapped at tier0/tier1) — unmapped concepts are absent from filing",
-                ticker, len(used_keys), len(all_numeric_keys),
+                "Targeted mode: %d concept(s) unmatched after label lookup for %s "
+                "— running LLM semantic mapping (%d matchable, %d candidate keys)",
+                len(unmapped_concepts), ticker, len(tier2_candidates), len(_map_keys),
             )
             report_call(
-                f"  [tier2]  skipped (0 orphaned keys — all {len(all_numeric_keys)}"
-                f" extracted values already matched; {len(unmapped_concepts)}"
-                f" concepts absent from filing)"
+                f"  [tier2]  {len(unmapped_concepts)} unmapped concept(s)"
+                f"  ({len(tier2_candidates)} matchable,"
+                f" {len(_map_keys)} candidate keys)"
+                f"  → calling llm  ({_display_provider})"
+            )
+            map_timeout = _request_timeout_for(escalated_provider)
+            map_llm = build_llm(format_json=True, request_timeout=map_timeout, provider=escalated_provider)
+            llm_matches = _llm_map_concepts(
+                _map_keys,             # ALL numeric keys (not just orphans)
+                tier2_candidates,
+                map_llm,
+                # Don't pass already_used_keys — allow the LLM to remap
+                # keys that Tier 0/1 may have mapped to the wrong concept
+                # (e.g. "Deposits" → balance sheet "Deposits" when it
+                # should be "Interest Expense, Deposits").
+            )
+            for concept_id, matched_key in llm_matches.items():
+                value = metrics.get(matched_key)
+                if isinstance(value, (int, float)):
+                    concept_metrics[concept_id] = float(value)
+                    concept_id_to_metric_key[concept_id] = matched_key
+                    logger.debug(
+                        "LLM semantic mapping: %r → concept_id %s for %s",
+                        matched_key, concept_id, ticker,
+                    )
+            report_call(
+                f"  [tier2]  ✓ mapped {len(llm_matches)}/{len(tier2_candidates)} concept(s)"
+            )
+        else:
+            logger.info(
+                "Tier2 skipped for %s: all %d unmapped concept(s) are "
+                "OCI/dimensional — not extractable from press releases",
+                ticker, len(unmapped_concepts),
+            )
+            report_call(
+                f"  [tier2]  skipped ({len(unmapped_concepts)} unmapped, "
+                f"all OCI/dimensional — not extractable from press releases)"
             )
 
         # ── Tier 3: Derive any unmapped concept whose value can be computed ─────
@@ -965,6 +1208,185 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                     f"  [derive]  0 values computed"
                     f"  ({len(still_unmapped)} concept(s) still unmapped)"
                 )
+
+        # ── Generalized deterministic fallback for missing concepts ────────
+        # The LLM often misses line items in complex multi-column supplement
+        # tables (bank interest breakdowns, segment details, etc.).  This
+        # fallback scans the classified section text for ANY missing concept
+        # label and extracts its value deterministically.
+        #
+        # Strategy: for each missing IS concept (non-dimensional, non-OCI),
+        # search the section text for the concept label followed by a number
+        # pattern.  Handle both single-period (1 number) and multi-period
+        # (5 numbers = 5 quarterly columns) formats.
+        if concept_metrics is not None and target_concepts:
+            # Build section text once (tables, not narrative)
+            _raw_sections = state.get("raw_sections") or {}
+            _section_texts: list[str] = []
+            for _key in ("income_statement", "other"):
+                for _entry in _raw_sections.get(_key, []):
+                    if isinstance(_entry, str):
+                        _section_texts.append(_entry)
+            # Combine section text (IS + other tables) with the full raw_text
+            # (which now includes supplement "other" table data via supp_blocks)
+            # for the widest possible search scope
+            _raw = "\n".join(_section_texts) if _section_texts else ""
+            _raw_text = state.get("raw_text") or ""
+            if _raw_text:
+                _raw = _raw + "\n" + _raw_text if _raw else _raw_text
+
+            # Clean text once (keep newlines for line-start matching)
+            _clean = _raw.replace("\xa0", " ").replace("\u200b", " ")
+            _clean = re.sub(r"&#\d+;", " ", _clean)
+            _clean = re.sub(r"<[^>]+>", " ", _clean)
+            _clean = re.sub(r"[^\S\n]+", " ", _clean)
+            _clean_lower = _clean.lower()
+
+            # Find ALL missing non-dimensional concepts
+            _missing_any = [
+                c for c in target_concepts
+                if c["_id"] not in concept_metrics
+                and "[member]" not in c.get("label", "").lower()
+                and "|" not in (c.get("taxonomy_key") or "")
+                and "comprehensive income" not in c.get("label", "").lower()
+                and not c.get("abstract", False)
+                and len(c.get("label", "")) > 3  # skip short codes
+            ]
+            if not _missing_any:
+                logger.debug("Deterministic fallback: no missing concepts to scan for %s", ticker)
+            else:
+                _found_count = 0
+                for _concept in _missing_any:
+                    _label = _concept.get("label", "")
+                    _label_lower = _label.lower()
+
+                    # ── Context-aware label matching ──────────────────────────
+                    # Many concept labels combine parent context + child item
+                    # (e.g. "Interest Expense, Deposits" = parent "Interest expense"
+                    # + child "Deposits").  The filing shows these as hierarchical
+                    # rows, not a single concatenated label.  Try splitting by
+                    # comma and searching for the child under the parent section.
+                    _search_text = _clean_lower
+                    _search_label = _label_lower
+                    _context_prefix = ""
+                    _target_text = _clean
+
+                    if "," in _label:
+                        _parts = _label_lower.split(",", 1)
+                        _parent = _parts[0].strip()
+                        _child = _parts[1].strip()
+                        if (
+                            _parent in _clean_lower
+                            and _label_lower not in _clean_lower
+                        ):
+                            # Try exact child match first, then fall back to
+                            # matching the child's KEY WORDS (e.g. "Trading
+                            # Liabilities" → match "Trading account liabilities"
+                            # in the filing text).
+                            _child_words = set(w for w in _child.split() if len(w) > 3)
+                            _parent_pos = 0
+                            while True:
+                                _next_pos = _clean_lower.find(_parent, _parent_pos)
+                                if _next_pos < 0:
+                                    break
+                                _after_parent = _clean[_next_pos + len(_parent):_next_pos + 600]
+                                _after_clean = re.sub(r"[^\S\n]+", " ", _after_parent)
+                                _after_lower = _after_clean.lower()
+                                # Exact child match?
+                                _match_found = _child in _after_lower
+                                # If not, try partial word match
+                                if not _match_found and _child_words:
+                                    _after_words = set(_after_lower.split())
+                                    _matched_words = _child_words & _after_words
+                                    _match_found = len(_matched_words) >= len(_child_words) * 0.5
+                                if _match_found:
+                                    _context_prefix = _parent + " "
+                                    _search_text = _after_lower
+                                    _target_text = _after_clean
+                                    # For partial matches, find the actual
+                                    # text line that matched (filing label may
+                                    # differ from normalize_data label)
+                                    if _child not in _after_lower:
+                                        _lines_after = _after_clean.split('\n')
+                                        _best_line = ""
+                                        _best_score = 0
+                                        for _ln in _lines_after:
+                                            _ln_words = set(_ln.lower().split())
+                                            _score = len(_child_words & _ln_words)
+                                            if _score > _best_score:
+                                                _best_score = _score
+                                                _best_line = _ln
+                                        if _best_line:
+                                            _search_label = _best_line.strip().lower()
+                                            _target_text = _after_clean
+                                        else:
+                                            _search_label = _child
+                                    else:
+                                        _search_label = _child
+                                    break
+                                _parent_pos = _next_pos + 1
+
+                    if _search_label not in _search_text:
+                        continue
+
+                    # Build regex: child label followed by numbers
+                    _esc = re.escape(_search_label)
+                    # Pattern: multi-column table.  Match ALL numbers after the
+                    # label and take the LAST one (most recent period).  Works for
+                    # both 5-column (bank) and 7-column (BAC vintages) formats.
+                    _pat_multi = re.compile(
+                        r"(?:^|[\n])\s*" + _esc
+                        + r"[^\d]*?((?:\$?[\s\|]*[\d,]+[\s\|]*)+)",
+                        re.I,
+                    )
+                    _match_multi = _pat_multi.search(_target_text)
+                    if _match_multi:
+                        # Extract ALL numbers from the match, take the last one
+                        _all_nums = re.findall(r"[\d,]+", _match_multi.group(1))
+                        if _all_nums:
+                            _val_str = _all_nums[-1].replace(",", "")
+                            _cols = f"{len(_all_nums)}"
+                        else:
+                            _val_str = None
+                    else:
+                        _val_str = None
+
+                    if not _val_str:
+                        # Fall back to 1-column (single number after label)
+                        _pat1 = re.compile(
+                            _esc + r"[^\d]*?(?:\$?[\s\|]*([\d,]+(?:\.\d+)?))",
+                            re.I,
+                        )
+                        _match1 = _pat1.search(_target_text)
+                        _val_str = _match1.group(1).replace(",", "") if _match1 else None
+                        _cols = "1" if _match1 else None
+
+                    if _val_str:
+                        try:
+                            _val = float(_val_str)
+                            if 1e3 <= _val <= 1e14:
+                                if 1900 <= _val <= 2100 and _cols == "1":
+                                    continue
+                                concept_metrics[_concept["_id"]] = _val
+                                _found_count += 1
+                                logger.info(
+                                    "Deterministic fallback: '%s' = %s (%s-col%s)",
+                                    _label, f"{_val:,.0f}", _cols,
+                                    ", context" if _context_prefix else "",
+                                )
+                        except (ValueError, TypeError):
+                            pass
+
+                if _found_count:
+                    logger.info(
+                        "Deterministic fallback: extracted %d/%d missing concepts for %s",
+                        _found_count, len(_missing_any), ticker,
+                    )
+                elif len(_missing_any) > 10:
+                    logger.info(
+                        "Deterministic fallback: 0/%d found for %s (labels not in text)",
+                        len(_missing_any), ticker,
+                    )
 
         # ── Final summary table ──────────────────────────────────────────────
         id_to_label_summary: dict[str, str] = {

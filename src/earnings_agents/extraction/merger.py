@@ -243,12 +243,19 @@ def _parse_llm_response(
 
     # Extract __scale__ -- always pop it to keep the dict clean.
     scale_str = str(parsed.pop("__scale__", "as-is")).lower()
-    # If the prescan detected the document scale from the header (e.g. "(In thousands)"),
-    # trust that over the LLM's returned label to prevent hallucinated-scale corruption.
-    if prescan_dollar_multiplier > 1:
+    # Use the MOST CONSERVATIVE (smallest) multiplier between the LLM's report
+    # and the deterministic prescan.  Bank filings routinely mix scale captions
+    # — the consolidated IS says "(In millions)" while supplement tables say
+    # "($ in billions)".  Either source can pick the wrong scale for a chunk,
+    # so the smaller multiplier is always safer (under-scaling is far easier to
+    # detect and fix than over-scaling).
+    llm_multiplier = _SCALE_MULTIPLIERS.get(scale_str, 1)
+    if llm_multiplier > 1 and prescan_dollar_multiplier > 1:
+        multiplier = min(llm_multiplier, prescan_dollar_multiplier)
+    elif prescan_dollar_multiplier > 1:
         multiplier = prescan_dollar_multiplier
     else:
-        multiplier = _SCALE_MULTIPLIERS.get(scale_str, 1)
+        multiplier = llm_multiplier if llm_multiplier > 1 else 1
     # Scale-relative raw cap: a cell is "already full USD" only if multiplying
     # it would breach the ~$10T absolute ceiling. For thousands scale this cap
     # is 1000x higher than the millions case, so multi-billion annual figures

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from earnings_agents.config import CHUNK_OVERLAP as _CHUNK_OVERLAP, CHUNK_SIZE as _CHUNK_SIZE
+from earnings_agents.config import CHUNK_OVERLAP as _CHUNK_OVERLAP, CHUNK_SIZE as _CHUNK_SIZE, default_chunk_size
 
 # When a character boundary falls mid-line, snap at most this many chars
 # backward (for the chunk end) or forward (for the overlap start) to the
@@ -124,6 +124,8 @@ def _chunk_text(text: str, chunk_size: int = _CHUNK_SIZE, overlap: int = _CHUNK_
     similarly snapped forward to a newline so each chunk begins at a clean
     line boundary.
     """
+    if chunk_size <= 0:
+        chunk_size = 400000  # fallback for auto mode (CHUNK_SIZE=0) without explicit pass
     if len(text) <= chunk_size:
         return [text]
     chunks: list[str] = []
@@ -300,6 +302,7 @@ def _build_period_hint(
 def _build_section_chunks(
     raw_sections: dict | None,
     target_concepts: list[dict] | None = None,
+    chunk_size: int | None = None,
 ) -> list[str] | None:
     """Return chunks of classified GAAP tables, or None if unavailable.
 
@@ -352,4 +355,7 @@ def _build_section_chunks(
     if not parts:
         return None
     combined = "\n\n".join(parts)
-    return _chunk_text(combined, _CHUNK_SIZE, _CHUNK_OVERLAP)
+    effective_size = chunk_size if chunk_size is not None else _CHUNK_SIZE
+    if effective_size <= 0:
+        effective_size = 400000  # old default when auto is active but no provider context
+    return _chunk_text(combined, effective_size, _CHUNK_OVERLAP)

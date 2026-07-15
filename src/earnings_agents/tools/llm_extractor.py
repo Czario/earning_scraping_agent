@@ -89,8 +89,15 @@ def invoke_chunk_with_retry(
     if detail_callback is not None:
         set_detail_callback(detail_callback)
 
+    from earnings_agents.config import DEEPSEEK_REQUEST_TIMEOUT
     if llm is None:
-        timeout = GROQ_REQUEST_TIMEOUT if provider == "groq" else _OLLAMA_REQUEST_TIMEOUT
+        effective = (provider or _LLM_PROVIDER or "").strip().lower()
+        if effective == "groq":
+            timeout = GROQ_REQUEST_TIMEOUT
+        elif effective == "deepseek":
+            timeout = DEEPSEEK_REQUEST_TIMEOUT
+        else:
+            timeout = _OLLAMA_REQUEST_TIMEOUT
         llm = build_llm(format_json=True, request_timeout=timeout, provider=provider)
 
     for attempt in range(max_retries + 1):
@@ -114,8 +121,10 @@ def invoke_chunk_with_retry(
         )
         try:
             # Throttle concurrent local Ollama calls via semaphore.
-            # Skip for Groq (cloud API with its own rate limiting).
-            _ctx = _OLLAMA_SEMAPHORE if provider != "groq" else _nullcontext()
+            # Skip for cloud APIs (Groq, DeepSeek, Gemini) — they have their
+            # own rate limiting and benefit from parallel chunk processing.
+            _effective = (provider or _LLM_PROVIDER or "").strip().lower()
+            _ctx = _OLLAMA_SEMAPHORE if _effective in (None, "ollama") else _nullcontext()
             report_call(f"  [llm]  chunk {chunk_num}/{total_chunks}  attempt {attempt + 1}  → calling llm  ({provider or _LLM_PROVIDER or 'llm'})")
 
             # ── Progress heartbeat during long LLM invokes ────────────────────

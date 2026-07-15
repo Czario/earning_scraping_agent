@@ -16,6 +16,7 @@ This node *replaces* ``reflect_metrics`` in the graph.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from earnings_agents.analysis.critical_metrics import check_presence as presence_summary
@@ -162,6 +163,100 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
             state.get("raw_text") or "",
         )
     )
+
+    # ── Momentum check for Net Interest Income (banks) ────────────────────
+    # Banks present Net Interest Income as a primary revenue component.
+    # A >50% QoQ swing is almost always a column-mixup error (reading from
+    # a prior-period or YTD column).  This check queries the database for the
+    # prior period's value and flags implausible changes.
+    _net_interest_keys = [k for k in metrics if re.search(r'net\s+interest', k, re.I)]
+    if _net_interest_keys and state.get('company_cik'):
+        try:
+            from earnings_agents.tools.normalize_data_client import _get_client, _NORMALIZE_DB
+            _db = _get_client()[_NORMALIZE_DB]
+            _cik = state['company_cik']
+            _period_type = state.get('detected_period_type', 'quarterly')
+            _col_name = 'concept_values_quarterly' if _period_type == 'quarterly' else 'concept_values_annual'
+            # Find the target_concept_ids that map to these net interest keys
+            _target = state.get('target_concepts') or []
+            _ni_concept_ids = [
+                c['_id'] for c in _target
+                for k in _net_interest_keys
+                if re.search(c.get('label', ''), k, re.I)
+                or re.search(k, c.get('label', ''), re.I)
+            ]
+            if _ni_concept_ids:
+                # Find the most recent prior period's values
+                _periods = sorted(
+                    _db[_col_name].distinct('reporting_period.end_date', {'company_cik': _cik}),
+                    reverse=True,
+                )
+                if len(_periods) >= 2:
+                    _prior_period = _periods[0]  # The most recent saved period
+                    # Check if the current filing's period is already stored
+                    _current_filing_date = state.get('sec_report_date')
+                    if _current_filing_date:
+                        try:
+                            from datetime import date as _dd
+                            _cfd_date = _dd.fromisoformat(_current_filing_date) if isinstance(_current_filing_date, str) else _current_filing_date
+                            # If current period is already the most recent, use the next one back
+                            if _cfd_date and _periods[0] == _cfd_date:
+                                _prior_period = _periods[1] if len(_periods) > 1 else None
+                            else:
+                                _prior_period = _periods[0]
+                        except (ValueError, TypeError):
+                            pass
+
+                    if _prior_period:
+                        _prior_vals = list(_db[_col_name].find({
+                            'company_cik': _cik,
+                            'concept_id': {'$in': _ni_concept_ids},
+                            'reporting_period.end_date': _prior_period,
+                        }))
+                        if _prior_vals:
+                            _prior_nii = max(v.get('value', 0) or 0 for v in _prior_vals)
+                            for _nk in _net_interest_keys:
+                                _current_val = metrics.get(_nk)
+                                if isinstance(_current_val, (int, float)) and _current_val and _prior_nii:
+                                    _ratio = _current_val / _prior_nii
+                                    if _ratio < 0.5 or _ratio > 1.5:
+                                        findings.append(
+                                            Finding(
+                                                type='suspect_value',
+                                                severity='high',
+                                                message=(
+                                                    f"Net Interest Income QoQ swing: {_current_val:,.0f} "
+                                                    f"vs prior period {_prior_nii:,.0f} "
+                                                    f"({_ratio*100:.0f}%) — likely a column-mixup error. "
+                                                    f"Prior NII (period ending {_prior_period}) was "
+                                                    f"{_prior_nii:,.0f}."
+                                                ),
+                                                keys=(_nk,),
+                                                evidence={
+                                                    'current_value': _current_val,
+                                                    'prior_value': _prior_nii,
+                                                    'prior_period_end': str(_prior_period),
+                                                    'ratio': _ratio,
+                                                },
+                                                suggested_action=(
+                                                    f"Find the Net Interest Income row and read ONLY from the "
+                                                    f"current-quarter column. The prior-period value was "
+                                                    f"{_prior_nii:,.0f}, so the current value should be close "
+                                                    f"to that range."
+                                                ),
+                                            )
+                                        )
+                                        logger.warning(
+                                            'analyze_metrics %s: NII momentum check — current %s vs prior %s '
+                                            '(ratio %.2f) on %s',
+                                            ticker,
+                                            f'{_current_val:,.0f}',
+                                            f'{_prior_nii:,.0f}',
+                                            _ratio,
+                                            _nk,
+                                        )
+        except Exception as _exc:
+            logger.debug('analyze_metrics %s: NII momentum check failed — %s', ticker, _exc)
 
     # Corrector post-pass — kept explicitly separate from the observer loop so
     # it is easy to audit: only derive_corrected_total_opex mutates metrics.

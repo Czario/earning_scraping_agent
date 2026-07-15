@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from typing import Any
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 from earnings_agents.extraction.chunker import _prescan_document
 from earnings_agents.llm_factory import build_llm
@@ -207,6 +208,7 @@ def _get_table_context(table, max_chars: int = 400) -> str:
     parts: list[str] = []
     total = 0
 
+    # Check direct siblings first (tightly scoped heading between tables)
     for sib in table.previous_siblings:
         if total >= max_chars:
             break
@@ -214,6 +216,25 @@ def _get_table_context(table, max_chars: int = 400) -> str:
         if t:
             parts.append(t)
             total += len(t)
+
+    # If no context found from direct siblings, also check the PARENT's previous
+    # siblings — some supplement HTML structures nest the <table> inside a <div>
+    # with no siblings, while the heading is in a <p> sibling of the parent.
+    # Only include parent-sibling text that LOOKS like a table heading
+    # (short, capitalised, contains statement keywords) — NOT prose/disclaimers.
+    if not parts:
+        for sib in (table.parent.previous_siblings if table.parent else []):
+            t = sib.get_text(" ", strip=True) if hasattr(sib, "get_text") else str(sib).strip()
+            if t and len(t) < 200 and (  # short enough to be a heading
+                t[0].isupper()  # starts with uppercase
+                or any(w in t.lower() for w in ['statement', 'income', 'balance', 'cash', 'revenue'])
+            ) and not any(  # EXCLUDE non-GAAP disclaimers and footnotes
+                w in t.lower() for w in ['non-gaap', 'non gaap', 'note:', 'footnote', 'refers to', 'reclassif']
+            ):
+                parts.append(t)
+                total += len(t)
+                if total >= max_chars:
+                    break
 
     return "\n".join(reversed(parts))
 
@@ -316,6 +337,18 @@ def _classify_table(table_text: str, context_text: str) -> str:
     # (e.g. after a "(Dollars in millions)" caption row).
     if _SEGMENT_TABLE_RX.search(full_probe):
         return "segment"
+
+    # ── 5b. Full-body GAAP statement check ────────────────────────────────────
+    # Some supplement tables have their heading text in a <p> or <div> that
+    # is NOT a direct sibling of the <table> element, so _get_table_context
+    # misses it.  Check the full table body for sentence-level IS/BS/CF
+    # indicators as a fallback.
+    if _INCOME_STMT_TABLE_RX.search(full_probe):
+        return "income_statement"
+    if _CASH_FLOW_TABLE_RX.search(full_probe):
+        return "cash_flow"
+    if _BALANCE_SHEET_TABLE_RX.search(full_probe):
+        return "balance_sheet"
 
     # ── 6. Deterministic drop patterns ───────────────────────────────────────
     # Catch well-known junk categories without an LLM call.  Only patterns
@@ -551,6 +584,7 @@ def _fetch_and_classify_supplement(
 
         supp_html = _strip_sgml_wrapper(supp_html)
 
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
         supp_soup = BeautifulSoup(supp_html, "lxml")
         for tag in supp_soup(_NOISE_TAGS):
             tag.decompose()
@@ -717,6 +751,13 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                 has_gaap_tables = True
             if supp_prose.strip() and is_count:
                 supp_blocks.append(f"=== SUPPLEMENTAL EXHIBIT ({supp_idx + 2}) NARRATIVE ===\n{prefix}{supp_prose}")
+            # Include supplement "other" tables in raw_text for the deterministic
+            # fallback to search (contains Average Balances, fee breakdown, etc.)
+            if supp_sections.get("other"):
+                _other_text = "\n---\n".join(supp_sections["other"])
+                supp_blocks.append(
+                    f"=== SUPPLEMENTAL EXHIBIT ({supp_idx + 2}) OTHER TABLES ===\n{prefix}{_other_text}"
+                )
             supplemental_log.append(
                 f"  [supplement {supp_idx+2}]   {is_count} IS → extraction"
             )

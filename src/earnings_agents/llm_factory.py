@@ -186,6 +186,30 @@ class _GroqInvokeAdapter:
         return content if isinstance(content, str) else str(content)
 
 
+class _OpenAIInvokeAdapter:
+    """Simple pass-through adapter for OpenAI-compatible APIs (DeepSeek, etc.).
+
+    Unlike _GroqInvokeAdapter, this adapter does NOT apply rate limiting —
+    cloud providers handle their own rate limiting, and this adapter should
+    never block on a rate-limit semaphore designed for a different provider.
+    """
+
+    def __init__(self, chat_model: Any) -> None:
+        self._chat = chat_model
+
+    def invoke(self, prompt: str) -> str:
+        msg = self._chat.invoke(prompt)
+        content = getattr(msg, "content", msg)
+        if usage := getattr(msg, "response_metadata", {}).get("token_usage"):
+            logger.debug(
+                "openai tokens — prompt: %s  completion: %s  total: %s",
+                usage.get("prompt_tokens", "?"),
+                usage.get("completion_tokens", "?"),
+                usage.get("total_tokens", "?"),
+            )
+        return content if isinstance(content, str) else str(content)
+
+
 class _GeminiInvokeAdapter:
     """Gemini adapter built on the official ``google-genai`` SDK.
 
@@ -290,7 +314,7 @@ def build_llm(
         }
         if json_schema is not None or format_json:
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
-        llm = _GroqInvokeAdapter(ChatOpenAI(**kwargs))
+        llm = _OpenAIInvokeAdapter(ChatOpenAI(**kwargs))
         if LLM_CACHE_ENABLED:
             llm = _CachedLLM(llm, f"deepseek:{DEEPSEEK_MODEL}", LLM_CACHE_DIR)
         return llm

@@ -46,13 +46,49 @@ REDIS_QUEUE_NAME: str = os.getenv("REDIS_QUEUE_NAME", "sec:filings")
 HTTP_TIMEOUT: int = 30
 
 EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "400000"))
-CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "400000"))
+# Chunk size for splitting extraction text.  When 0 (default), a per-provider
+# default is selected at runtime via default_chunk_size().  Set to a positive
+# integer to override for all providers.
+CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "0"))
 CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "300"))
+
+
+def default_chunk_size(provider: str = "ollama") -> int:
+    """Return a provider-appropriate chunk size when CHUNK_SIZE is not set.
+
+    * ``groq`` — 80 000  (very fast inference; larger chunks mean fewer calls)
+    * ``deepseek`` — 25 000  (~6K tokens; small enough for fast parallel chunks)
+    * ``gemini`` — 25 000  (same profile as deepseek)
+    * ``ollama`` — 6 000    (small local models, limited context window)
+
+    Cloud providers benefit from smaller chunks because multiple chunks run in
+    parallel (set ``OLLAMA_NUM_PARALLEL`` > 1), giving lower wall-clock time
+    and per-chunk scale detection that handles mixed-scale filings correctly.
+    """
+    p = provider.strip().lower()
+    if p == "groq":
+        return 80000
+    if p in ("deepseek", "gemini"):
+        return 25000
+    return 6000  # ollama / fallback
 
 # Maximum concurrent Ollama requests across all parallel company workers.
 # Local Ollama is single-threaded, so >1 here only helps when using a
 # remote / multi-GPU Ollama instance. Default: 1 (serialize LLM calls).
 OLLAMA_CONCURRENCY: int = int(os.getenv("OLLAMA_CONCURRENCY", "1"))
+
+
+def default_num_parallel(provider: str = "ollama") -> int:
+    """Return a provider-appropriate chunk parallelism when not set.
+
+    Cloud providers handle their own rate limiting and benefit from concurrent
+    chunk processing.  Local Ollama is single-threaded so parallelism only helps
+    with a remote/multi-GPU instance.
+    """
+    p = provider.strip().lower()
+    if p in ("groq", "deepseek", "gemini"):
+        return 3
+    return 1  # ollama / fallback
 
 # When True (default), refuse to upsert a document whose accounting identity
 # checks failed (e.g. Gross margin ≠ Revenue − COGS). When False, the document
