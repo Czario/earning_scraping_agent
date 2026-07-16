@@ -1,4 +1,4 @@
-"""Tests for tickers.py CIK/ticker lookup."""
+"""Tests for company_registry.py CIK/ticker lookup (SEC API, disk-cached)."""
 from __future__ import annotations
 
 from unittest.mock import patch
@@ -7,20 +7,19 @@ import pytest
 
 from earnings_agents.company_registry import lookup_by_cik, lookup_by_ticker, normalize_cik
 
-_MOCK_DATA = {
+_MOCK_INDEX = {
     "ticker_to_cik": {"AAPL": "0000320193", "MSFT": "0000789019"},
     "cik_to_ticker": {"0000320193": "AAPL", "0000789019": "MSFT"},
     "cik_to_company_name": {
         "0000320193": "Apple Inc.",
         "0000789019": "MICROSOFT CORP",
     },
-    "last_updated": "2025-06-18T09:44:39",
 }
 
 
 @pytest.fixture(autouse=True)
-def mock_tickers_data():
-    with patch("earnings_agents.company_registry._load", return_value=_MOCK_DATA):
+def mock_sec_registry():
+    with patch("earnings_agents.company_registry._build_index", return_value=_MOCK_INDEX):
         yield
 
 

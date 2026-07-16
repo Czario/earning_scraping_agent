@@ -158,6 +158,82 @@ _SEGMENT_TABLE_RX = re.compile(
     re.I,
 )
 
+# Bank/financial-institution supplementary GAAP data tables: interest income
+# breakdowns, noninterest income/fee breakdowns, noninterest expense breakdowns,
+# and average-balance-with-rate tables.  These are GAAP income-statement
+# supplementary disclosures but often appear in tables that also carry balance
+# sheet totals ("Total interest-earning assets", "Total deposits") in an
+# average-balances section — which would otherwise trigger the balance_sheet
+# classifier and cause the table to be excluded from extraction entirely.
+#
+# These patterns are checked BEFORE the balance_sheet regex so interest
+# breakdown tables are never misclassified as balance sheet.  They match on the
+# FULL table text (context + body) because bank supplement headings are often
+# generic ("Table 3", "Supplemental Information") while the table body contains
+# the actual content signals.
+#
+# Guard: tables whose context contains explicit balance-sheet-only keywords
+# ("Balance Sheet", "Financial Position", "Statement of Financial Position")
+# are NOT captured — those are genuine balance sheet tables.  The patterns
+# below only fire when the context is ambiguous or looks like a financial-data
+# supplement heading.
+_BANK_FINANCIAL_DATA_RX = re.compile(
+    # Interest income breakdowns — "Interest Income" followed by sub-items
+    # like loans, securities, deposits, trading assets, fed funds, etc.
+    r"interest\s+(?:and\s+(?:dividend|fee)\s+)?income"
+    r"(?:[\s\S]{0,800}?(?:loans?[\s,]+(?:including|held)|securities|deposits[\s,]+with"
+    r"|trading\s+assets?|federal\s+funds|interest\s+bearing"
+    r"|available.for.sale|held.to.maturity))"
+    # Noninterest / fee income breakdowns — "Noninterest Income" or
+    # "Non-interest Income" followed by fee-type sub-items
+    r"|non[\s-]?interest\s+(?:income|revenue)"
+    r"(?:[\s\S]{0,800}?(?:fees?[\s,]+(?:from|on)|service\s+charges?"
+    r"|trust\s+(?:and\s+)?investment|brokerage|underwriting"
+    r"|asset\s+management|advisory|commission"
+    r"|foreign\s+exchange|trading\s+(?:revenue|income)"
+    r"|card\s+(?:and\s+)?(?:payment|fees?)|deposit\s+(?:service|account)"
+    r"|insurance|wealth\s+management"
+    r"|distribution|servicing|mortgage\s+banking"
+    r"|capital\s+markets|loan\s+sale))"
+    # Noninterest expense breakdowns — "Noninterest Expense" with sub-items
+    r"|non[\s-]?interest\s+expense"
+    r"(?:[\s\S]{0,800}?(?:salaries|compensation|occupancy|equipment"
+    r"|technology|professional|marketing|amortization"
+    r"|deposit\s+insurance|restructuring|merger))"
+    # Average balances with interest rates — common bank supplement table
+    r"|average\s+balances?[\s\S]{0,500}?(?:interest\s+(?:income|expense|rate|yield)"
+    r"|yield|rate[\s,]+paid)"
+    # Net interest income / margin analysis
+    r"|net\s+interest\s+(?:income|margin|revenue|spread)"
+    r"(?:[\s\S]{0,500}?(?:analysis|components?|breakdown|detail))"
+    # Fee revenue / fee income breakdown
+    r"|(?:fee|fiduciary|investment\s+management)\s+(?:revenue|income)"
+    r"(?:[\s\S]{0,500}?(?:breakdown|by\s+(?:type|category|source)|components?"
+    r"|base\s+fees?|performance\s+fees?|advisory\s+fees?"
+    r"|technology\s+services?\s+(?:revenue|fees?)"
+    r"|distribution\s+fees?|servicing\s+fees?|administration\s+fees?))"
+    # "Analysis of" interest / fee / noninterest items
+    r"|analysis\s+of\s+(?:net\s+)?interest\s+(?:income|expense|margin)"
+    r"|analysis\s+of\s+(?:non[\s-]?interest\s+(?:income|expense)|fee\s+(?:revenue|income))"
+    # Rate/volume analysis tables
+    r"|(?:rate|volume)\s+(?:and\s+)?(?:volume|rate)\s+analysis\b"
+    r"|changes?\s+in\s+net\s+interest\s+income[\s\S]{0,300}?(?:rate|volume)",
+    re.I,
+)
+
+# Bank-specific balance-sheet-only context patterns.  When a table's heading
+# (context) matches one of these, it is a genuine balance sheet table and the
+# bank-financial-data patterns above must NOT overrule it.  This prevents bank
+# financial supplement tables with mixed IS/BS data from being classified as
+# balance sheet while still correctly excluding standalone balance sheet tables.
+_BANK_BS_CONTEXT_RX = re.compile(
+    r"consolidated\s+balance\s+sheets?"
+    r"|balance\s+sheets?[\s\S]{0,40}(?:assets|liabilities|equity)"
+    r"|statement[s]?\s+of\s+(?:financial\s+(?:position|condition)|assets\s+and\s+liabilities)"
+    r"|financial\s+(?:position|condition)\b",
+    re.I,
+)
+
 # Detects whether a table entry already carries its own scale caption, so a
 # document/preceding scale is only injected when the table itself says nothing
 # — never overriding a table that declares its own scale. ``[^\S\n]`` matches
@@ -276,6 +352,27 @@ def _classify_table(table_text: str, context_text: str) -> str:
     if _SEGMENT_TABLE_RX.search(context_text) and not _NON_GAAP_TABLE_RX.search(context_text):
         return "segment"
 
+    # ── 1b. Bank financial-data table check (BEFORE balance_sheet) ────────────
+    # Bank/financial-institution supplement tables with interest income/expense
+    # breakdowns, fee revenue detail, or average-balance/rate data are GAAP
+    # income-statement supplementary disclosures.  They often contain balance
+    # sheet keywords ("total assets", "total deposits") in an average-balances
+    # section, which would otherwise trigger the balance_sheet classifier and
+    # exclude the table from extraction.  This check runs BEFORE the balance
+    # sheet regex so these tables are correctly classified.
+    #
+    # Guard: standalone balance sheet tables whose context explicitly identifies
+    # them as such ("Consolidated Balance Sheets", "Statement of Financial
+    # Position") are NOT overruled.  Only tables with ambiguous/generic context
+    # (or context that looks like a financial-data supplement heading) can be
+    # reclassified by the bank-data patterns.
+    full_probe_early = context_text + " " + table_text
+    if (
+        _BANK_FINANCIAL_DATA_RX.search(full_probe_early)
+        and not _BANK_BS_CONTEXT_RX.search(context_text)
+    ):
+        return "segment"
+
     # ── 2. Full-probe non-GAAP ────────────────────────────────────────────────
     full_probe = context_text + " " + table_text
     if _NON_GAAP_TABLE_RX.search(full_probe):
@@ -325,7 +422,20 @@ def _classify_table(table_text: str, context_text: str) -> str:
         return "income_statement"
     if _CASH_FLOW_TABLE_RX.search(short_probe):
         return "cash_flow"
+    # Balance sheet check — SKIP when the table also contains bank financial
+    # data signals (interest income/expense breakdowns, average balances with
+    # rates, fee revenue detail).  Bank supplement tables routinely mix IS data
+    # (interest income by loan type) with BS totals ("Total interest-earning
+    # assets") in an average-balances column; the bank-data patterns above
+    # (step 1b) catch most cases, but the short probe here may still match
+    # "total assets" in the opening rows before the interest detail appears.
+    # The guard prevents genuine BS-only tables from being excluded while
+    # allowing mixed IS/BS bank supplement tables through as "other".
     if _BALANCE_SHEET_TABLE_RX.search(short_probe):
+        # Double-check: does this table also contain bank income-statement data?
+        # If so, it's a mixed supplement table → classify as "other", not BS.
+        if _BANK_FINANCIAL_DATA_RX.search(full_probe):
+            return "other"
         return "balance_sheet"
 
     # ── 4. Short-probe segment fallback ──────────────────────────────────────
@@ -348,6 +458,10 @@ def _classify_table(table_text: str, context_text: str) -> str:
     if _CASH_FLOW_TABLE_RX.search(full_probe):
         return "cash_flow"
     if _BALANCE_SHEET_TABLE_RX.search(full_probe):
+        # Same guard as short-probe: mixed IS/BS bank supplement tables should
+        # not be classified as balance sheet.
+        if _BANK_FINANCIAL_DATA_RX.search(full_probe):
+            return "other"
         return "balance_sheet"
 
     # ── 6. Deterministic drop patterns ───────────────────────────────────────
@@ -735,11 +849,19 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
             # (IS-only merge).  Don't add them to the batched filter either
             # since their results are discarded — saves an LLM call.
             # (Pending from main doc *is* added above and still needs filtering.)
-            # Only merge income_statement tables from supplements.
-            # Balance sheet, cash flow, "other" (non-IS financial data like loan
-            # portfolios, capital ratios, deposit data), and non-GAAP tables are
-            # excluded — targeted extraction focuses on income-statement concepts,
-            # so only explicitly IS-classified tables contribute relevant data.
+            # Merge income_statement AND "other" tables from supplements.
+            # "other" tables classified as bank financial data (interest income
+            # breakdowns, fee revenue detail, noninterest expense detail — via
+            # _BANK_FINANCIAL_DATA_RX → "segment" → sections["other"]) contain
+            # GAAP income-statement supplementary disclosures that are essential
+            # for segment/dimensional concept extraction.  Balance sheet, cash
+            # flow, and non-GAAP tables are excluded.
+            #
+            # Safety filter: supplement "other" tables whose full body matches
+            # balance-sheet patterns (total assets/liabilities, loan/deposit
+            # totals without interest income context) are still excluded.  Only
+            # tables that carry IS-relevant data (interest income, fee revenue,
+            # noninterest expense breakdowns) are merged.
             is_count = len(supp_sections["income_statement"])
             bs_count = len(supp_sections["balance_sheet"])
             cf_count = len(supp_sections["cash_flow"])
@@ -749,10 +871,45 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
             for entry in supp_sections["income_statement"]:
                 sections["income_statement"].append(prefix + entry)
                 has_gaap_tables = True
-            if supp_prose.strip() and is_count:
+            # Merge supplement "other" tables for LLM extraction — these include
+            # bank financial data (interest income/expense breakdowns, fee revenue
+            # detail, noninterest expense detail) classified by the new
+            # _BANK_FINANCIAL_DATA_RX patterns.  Filter out tables that look like
+            # pure balance sheet (aggregate totals without interest/fee detail).
+            _sent_other = 0
+            for entry in supp_sections.get("other", []):
+                # Safety: skip entries whose full body matches balance-sheet-only
+                # patterns (aggregate totals of assets, liabilities, deposits,
+                # loans) without any income-statement data signal.
+                _has_is_data = bool(
+                    re.search(r"interest\s+(?:income|expense|rate|yield)", entry, re.I)
+                    or re.search(r"non[\s-]?interest\s+(?:income|expense)", entry, re.I)
+                    or re.search(r"(?:fee|fiduciary|commission|advisory|brokerage)\s+(?:revenue|income)", entry, re.I)
+                    or re.search(r"service\s+charges?\s+(?:on|from)", entry, re.I)
+                    or re.search(r"trust\s+(?:and\s+)?investment\s+(?:services?|fees?|management)", entry, re.I)
+                    or re.search(r"asset\s+management\s+(?:and\s+administration)?\s*(?:fees?|revenue)", entry, re.I)
+                    or re.search(r"(?:card|payment)\s+(?:and\s+)?(?:payment|card)?\s*(?:revenue|income|fees?)", entry, re.I)
+                    or re.search(r"analysis\s+of\s+(?:net\s+)?interest", entry, re.I)
+                    or re.search(r"average\s+balances?[\s\S]{0,400}?(?:interest|yield|rate)", entry, re.I)
+                    or re.search(r"rate[/\s]volume\s+analysis", entry, re.I)
+                    or re.search(r"distribution\s+(?:and\s+)?(?:servicing|fees?)", entry, re.I)
+                    or re.search(r"servicing\s+(?:and\s+)?(?:distribution|fees?)", entry, re.I)
+                    or re.search(r"mortgage\s+banking\s+(?:income|revenue)", entry, re.I)
+                    or re.search(r"capital\s+markets\s+(?:income|revenue|fees?)", entry, re.I)
+                    or re.search(r"loan\s+sale\s+(?:income|revenue|gains?)", entry, re.I)
+                    or re.search(r"base\s+fees?|performance\s+fees?|technology\s+services?\s+(?:revenue|fees?)", entry, re.I)
+                )
+                if _has_is_data:
+                    sections["other"].append(prefix + entry)
+                    _sent_other += 1
+                    has_gaap_tables = True
+                # Tables without IS data (pure BS totals) go only to raw_text
+                # for the deterministic fallback's text-search fallback.
+            if supp_prose.strip() and (is_count or _sent_other):
                 supp_blocks.append(f"=== SUPPLEMENTAL EXHIBIT ({supp_idx + 2}) NARRATIVE ===\n{prefix}{supp_prose}")
-            # Include supplement "other" tables in raw_text for the deterministic
-            # fallback to search (contains Average Balances, fee breakdown, etc.)
+            # Include ALL supplement "other" tables in raw_text for the
+            # deterministic fallback to search (includes both IS-relevant
+            # breakdowns sent to LLM above AND pure-BS tables as fallback).
             if supp_sections.get("other"):
                 _other_text = "\n---\n".join(supp_sections["other"])
                 supp_blocks.append(
@@ -787,7 +944,27 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                 f"  [filter]  kept {kept}/{len(all_pending)} 'other' table(s)"
                 f"  (dropped {len(all_pending) - kept})"
             )
-            if kept:
+            # ── Safety net: when the LLM drops ALL 'other' tables AND no GAAP
+            # tables were classified by regex, keep ALL of them.  Some issuers
+            # (especially banks) use HTML structures where financial data tables
+            # don't match any GAAP regex pattern AND the LLM can't recognize
+            # them from truncated previews.  Dropping everything would produce
+            # zero extracted metrics — keeping all is always better than nothing.
+            if kept == 0 and not has_gaap_tables:
+                logger.warning(
+                    "LLM filter dropped all %d 'other' table(s) and no GAAP "
+                    "tables were classified — safety net: keeping all",
+                    len(all_pending),
+                )
+                report_call(
+                    f"  [filter]  ⚠  safety net: keeping all {len(all_pending)}"
+                    f" 'other' table(s)  (LLM dropped all, no GAAP tables found)"
+                )
+                for entry, _, _ctx in all_pending:
+                    sections["other"].append(entry)
+                kept = len(all_pending)
+                has_gaap_tables = True
+            elif kept:
                 has_gaap_tables = True
 
         if has_gaap_tables:
@@ -845,13 +1022,21 @@ def extract_html_text_node(state: EarningsAgentState) -> EarningsAgentState:
                 "status": "text_extracted",
             }
         else:
-            # Fallback: no GAAP tables classified — convert all tables to
-            # markdown inline (original behaviour) so nothing is lost.
+            # Fallback: no GAAP tables classified — convert tables to markdown
+            # inline but EXCLUDE balance sheet tables.  The pipeline extracts
+            # income-statement concepts only; balance sheet data must never leak
+            # into extraction, even when table classification fails.
             soup2 = BeautifulSoup(html, "lxml")
             for tag in soup2(_NOISE_TAGS):
                 tag.decompose()
             for tbl in soup2.find_all("table"):
-                tbl.replace_with(_table_to_markdown(tbl) + "\n")
+                context = _get_table_context(tbl)
+                tbl_text = tbl.get_text(" ", strip=True)
+                ttype = _classify_table(tbl_text, context)
+                if ttype == "balance_sheet":
+                    tbl.decompose()  # remove BS tables entirely — never extract from them
+                else:
+                    tbl.replace_with(_table_to_markdown(tbl) + "\n")
             raw_text = soup2.get_text(separator="\n", strip=True)
             raw_text = _strip_boilerplate(raw_text)
             logger.info(

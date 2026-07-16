@@ -67,8 +67,12 @@ def classify_other_tables_batch(
 
     blocks: list[str] = []
     for i, (table_text, context_text) in enumerate(candidates):
-        ctx = context_text[-300:].strip() or "(none)"
-        blocks.append(f"Table {i}\nContext: {ctx}\nContent: {table_text[:600]}")
+        ctx = context_text[-400:].strip() or "(none)"
+        # Use up to 1500 chars of content so bank financial data tables
+        # (which are often wide with many columns) show enough data rows
+        # for the LLM to recognize them as income-statement data.
+        content_preview = table_text[:1500]
+        blocks.append(f"Table {i}\nContext: {ctx}\nContent: {content_preview}")
 
     prompt = _OTHER_FILTER_PROMPT.format(tables_block="\n\n".join(blocks))
     try:

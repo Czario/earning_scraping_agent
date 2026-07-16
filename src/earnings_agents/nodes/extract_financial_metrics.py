@@ -1367,6 +1367,68 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                             if 1e3 <= _val <= 1e14:
                                 if 1900 <= _val <= 2100 and _cols == "1":
                                     continue
+                                # ── Balance-sheet guard ──────────────────────
+                                # The pipeline extracts INCOME STATEMENT concepts
+                                # only.  The deterministic fallback must never
+                                # pick up a value from a balance sheet row that
+                                # happens to share a keyword with an IS concept
+                                # label (e.g. "Deposits" matching both "Interest
+                                # Expense, Deposits" (IS) and "Total Deposits"
+                                # (BS)).  Check the matched line's surrounding
+                                # context for clear balance-sheet signals.
+                                if _context_prefix:
+                                    # When context-aware matching was used
+                                    # (comma-split label like "Interest Expense,
+                                    # Deposits"), the search was scoped to text
+                                    # AFTER the parent concept — the context
+                                    # already guards against BS rows.
+                                    pass
+                                else:
+                                    # For simple label matches, verify the
+                                    # matched text isn't in a balance-sheet
+                                    # section.  Find the matched region and check
+                                    # nearby text for BS signals.
+                                    _match_pos = _search_text.find(_search_label)
+                                    if _match_pos >= 0:
+                                        # Look at 200 chars BEFORE the match for
+                                        # BS section headers.
+                                        _before = _target_text[max(0, _match_pos - 200):_match_pos]
+                                        _after = _target_text[_match_pos:_match_pos + 400]
+                                        _surrounding = _before + " " + _after
+                                        if (
+                                            re.search(r"=== GAAP BALANCE SHEET ===", _before)
+                                            or re.search(r"===.*BALANCE SHEET.*===", _before)
+                                            or re.search(r"consolidated\s+balance\s+sheets?", _before, re.I)
+                                            or re.search(r"statement[s]?\s+of\s+financial\s+(?:position|condition)", _before, re.I)
+                                        ):
+                                            logger.debug(
+                                                "Deterministic fallback: SKIPPING '%s' = %s — "
+                                                "matched in balance sheet section",
+                                                _label, f"{_val:,.0f}",
+                                            )
+                                            continue
+                                        # Also skip values whose surrounding text
+                                        # looks like a balance sheet total (not
+                                        # an IS breakdown item).
+                                        _bs_total_rx = re.compile(
+                                            r"\btotal\s+(?:assets?|liabilit|deposits?|loans?|equity|shareholders|stockholders)\b",
+                                            re.I,
+                                        )
+                                        if _bs_total_rx.search(_surrounding):
+                                            # Only skip if the label itself does
+                                            # NOT contain IS-specific keywords.
+                                            _is_keywords = re.search(
+                                                r"interest\s+(?:income|expense)|noninterest|fee\s+(?:revenue|income)"
+                                                r"|revenue|expense|income|charge",
+                                                _label, re.I,
+                                            )
+                                            if not _is_keywords:
+                                                logger.debug(
+                                                    "Deterministic fallback: SKIPPING '%s' = %s — "
+                                                    "surrounded by balance-sheet totals",
+                                                    _label, f"{_val:,.0f}",
+                                                )
+                                                continue
                                 concept_metrics[_concept["_id"]] = _val
                                 _found_count += 1
                                 logger.info(
