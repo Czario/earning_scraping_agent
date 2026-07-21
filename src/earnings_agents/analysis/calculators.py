@@ -364,6 +364,242 @@ def _is_valid(value: float | None, role: str) -> bool:
     return True
 
 
+# ── Parent/child hierarchy calculation ──────────────────────────────────────
+# Applied AFTER all extraction and derivation is complete.  Replaces extracted
+# parent values with calculated sums when ALL direct children have values.
+
+
+def _path_depth(path: str) -> int:
+    """Return the number of dot-separated segments in *path*."""
+    return path.count(".") + 1 if path else 0
+
+
+def _is_direct_child(child_path: str, parent_path: str) -> bool:
+    """Return True when *child_path* is exactly one level below *parent_path*."""
+    if not child_path.startswith(parent_path + "."):
+        return False
+    return _path_depth(child_path) == _path_depth(parent_path) + 1
+
+
+def _resolve_parent_child_hierarchy(
+    all_concepts: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build a mapping of parent concept_id → list of direct child concept dicts.
+
+    A concept is a *parent* when at least one other concept's ``path`` is
+    exactly one level below it (direct child).  Grandchildren (two levels
+    below) are not included — only immediate children.
+    """
+    # Index concepts by path for fast lookup
+    id_to_concept: dict[str, dict] = {c["_id"]: c for c in all_concepts}
+    parent_to_children: dict[str, list[dict[str, Any]]] = {}
+
+    for cid, concept in id_to_concept.items():
+        parent_path = concept.get("path") or ""
+        if not parent_path:
+            continue
+        for other_cid, other in id_to_concept.items():
+            if other_cid == cid:
+                continue
+            other_path = other.get("path") or ""
+            if _is_direct_child(other_path, parent_path):
+                parent_to_children.setdefault(cid, []).append(other)
+
+    return parent_to_children
+
+
+def _find_value_for_role(
+    concept_metrics: dict[str, float],
+    all_concepts: list[dict[str, Any]],
+    role: str,
+    role_overrides: dict[str, str] | None = None,
+) -> tuple[float | None, str | None]:
+    """Return ``(value, concept_id)`` for the first mapped concept with *role*."""
+    _overrides = role_overrides or {}
+    for c in all_concepts:
+        cid = c["_id"]
+        if cid not in concept_metrics:
+            continue
+        c_role = identify_role(c.get("label", ""), c.get("taxonomy_key", "")) or _overrides.get(cid)
+        if c_role == role:
+            return concept_metrics[cid], cid
+    return None, None
+
+
+def _find_parent_concept_id(
+    all_concepts: list[dict[str, Any]],
+    role: str,
+    parent_to_children: dict[str, list[dict[str, Any]]],
+    role_overrides: dict[str, str] | None = None,
+) -> str | None:
+    """Return the concept_id of the first concept with *role* that HAS children."""
+    _overrides = role_overrides or {}
+    for c in all_concepts:
+        cid = c["_id"]
+        if cid not in parent_to_children:
+            continue
+        c_role = identify_role(c.get("label", ""), c.get("taxonomy_key", "")) or _overrides.get(cid)
+        if c_role == role:
+            return cid
+    return None
+
+
+def apply_parent_child_calculations(
+    concept_metrics: dict[str, float],
+    all_concepts: list[dict[str, Any]],
+    role_overrides: dict[str, str] | None = None,
+) -> dict[str, float]:
+    """Apply parent/child calculation rules to *concept_metrics*.
+
+    Rules (applied in dependency order):
+
+    1. **Cost of Revenue** — if ALL direct children have values, replace the
+       parent value with ``sum(children)`` and remove children from the output.
+       Otherwise, keep the extracted parent value as-is.
+
+    2. **Gross Profit** — if an extracted value exists, keep it.  Otherwise
+       calculate ``Revenue − Cost of Revenue`` using the FINAL Cost of Revenue
+       from step 1.
+
+    3. **Operating Expenses** — if ALL direct children have values, replace
+       the parent with ``sum(children)``.  Otherwise, keep the extracted parent
+       value.  If no extracted parent value exists, calculate
+       ``Gross Profit − Operating Income`` when both are available.
+
+    4. **Operating Income** — always keep the extracted value as-is; never
+       recalculate.
+
+    Priority (for each parent):
+      1. Sum of all children (every child must have a value)
+      2. Extracted parent value
+      3. Calculation (OpEx = GP − OI only, never a partial children sum)
+
+    Only ONE final value is stored for each parent concept: either the
+    calculated sum of children or the extracted value, never both.
+    Children always remain in the output as individual line-item metrics.
+    """
+    if not concept_metrics or not all_concepts:
+        return concept_metrics
+
+    result = dict(concept_metrics)
+    _overrides = role_overrides or {}
+    parent_to_children = _resolve_parent_child_hierarchy(all_concepts)
+    if not parent_to_children:
+        return result
+
+    # ── Step 1: Cost of Revenue ────────────────────────────────────────────
+    _cor_parent_id = _find_parent_concept_id(
+        all_concepts, "cost_of_revenue", parent_to_children, _overrides,
+    )
+    _cor_children: list[dict[str, Any]] = (
+        parent_to_children.get(_cor_parent_id or "", []) if _cor_parent_id else []
+    )
+    _cor_all_children_present = False
+    _cor_calculated: float | None = None
+
+    if _cor_parent_id and _cor_children:
+        _child_vals: list[float] = []
+        _missing_children: list[str] = []
+        for child in _cor_children:
+            child_val = result.get(child["_id"])
+            if isinstance(child_val, (int, float)):
+                _child_vals.append(float(child_val))
+            else:
+                _missing_children.append(child.get("label", child["_id"]))
+
+        if not _missing_children and _child_vals:
+            # All children present → sum them, replace parent value.
+            # Children remain in the output as individual metrics.
+            _cor_calculated = sum(_child_vals)
+            result[_cor_parent_id] = _cor_calculated
+            _cor_all_children_present = True
+            logger.info(
+                "Cost of Revenue = sum(%d children) = %s",
+                len(_child_vals), f"{_cor_calculated:,.0f}",
+            )
+        else:
+            # Not all children present → keep extracted parent as-is
+            _parent_val = result.get(_cor_parent_id)
+            if isinstance(_parent_val, (int, float)):
+                _cor_calculated = float(_parent_val)
+                logger.info(
+                    "Cost of Revenue = extracted parent = %s (missing %d/%d child(ren))",
+                    f"{_cor_calculated:,.0f}", len(_missing_children), len(_cor_children),
+                )
+
+    # ── Step 2: Gross Profit ───────────────────────────────────────────────
+    _gp_val: float | None = None
+    _gp_parent_id = _find_parent_concept_id(
+        all_concepts, "gross_profit", parent_to_children, _overrides,
+    )
+    if _gp_parent_id:
+        _gp_extracted = result.get(_gp_parent_id)
+        if isinstance(_gp_extracted, (int, float)):
+            _gp_val = float(_gp_extracted)
+        elif _cor_calculated is not None:
+            # No extracted Gross Profit → calculate from Revenue − CoR
+            _rev_val, _ = _find_value_for_role(
+                result, all_concepts, "revenue", _overrides,
+            )
+            if _rev_val is not None:
+                _gp_val = _rev_val - _cor_calculated
+                result[_gp_parent_id] = _gp_val
+                logger.info(
+                    "Gross Profit = Revenue − Cost of Revenue = %s − %s = %s",
+                    f"{_rev_val:,.0f}", f"{_cor_calculated:,.0f}", f"{_gp_val:,.0f}",
+                )
+
+    # ── Step 3: Operating Expenses ──────────────────────────────────────────
+    _opex_parent_id = _find_parent_concept_id(
+        all_concepts, "total_opex", parent_to_children, _overrides,
+    )
+    _opex_children: list[dict[str, Any]] = (
+        parent_to_children.get(_opex_parent_id or "", []) if _opex_parent_id else []
+    )
+
+    if _opex_parent_id and _opex_children:
+        _child_vals_opex: list[float] = []
+        _missing_opex: list[str] = []
+        for child in _opex_children:
+            child_val = result.get(child["_id"])
+            if isinstance(child_val, (int, float)):
+                _child_vals_opex.append(float(child_val))
+            else:
+                _missing_opex.append(child.get("label", child["_id"]))
+
+        if not _missing_opex and _child_vals_opex:
+            # All children present → sum them, replace parent value.
+            # Children remain in the output as individual metrics.
+            _opex_calculated = sum(_child_vals_opex)
+            result[_opex_parent_id] = _opex_calculated
+            logger.info(
+                "Operating Expenses = sum(%d children) = %s",
+                len(_child_vals_opex), f"{_opex_calculated:,.0f}",
+            )
+        else:
+            _parent_opex = result.get(_opex_parent_id)
+            if isinstance(_parent_opex, (int, float)):
+                # Keep extracted parent value
+                logger.info(
+                    "Operating Expenses = extracted parent = %s (missing %d/%d child(ren))",
+                    f"{float(_parent_opex):,.0f}", len(_missing_opex), len(_opex_children),
+                )
+            elif _gp_val is not None:
+                # No extracted parent → calculate GP − OI
+                _oi_val, _ = _find_value_for_role(
+                    result, all_concepts, "operating_income", _overrides,
+                )
+                if _oi_val is not None:
+                    _opex_calculated = _gp_val - _oi_val
+                    result[_opex_parent_id] = _opex_calculated
+                    logger.info(
+                        "Operating Expenses = Gross Profit − Operating Income = %s − %s = %s",
+                        f"{_gp_val:,.0f}", f"{_oi_val:,.0f}", f"{_opex_calculated:,.0f}",
+                    )
+
+    return result
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def derive_missing_concept_metrics(

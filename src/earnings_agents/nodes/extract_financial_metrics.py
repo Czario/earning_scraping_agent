@@ -1149,67 +1149,41 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 f"  [tier2]  skipped ({len(unmapped_concepts)} unmapped, "
                 f"all OCI/dimensional — not extractable from press releases)"
             )
-
-        # ── Tier 3: Derive any unmapped concept whose value can be computed ─────
-        # Run derivation for ALL concepts that still lack a value — including
-        # system/calculated ones now folded into target_concepts.  The engine
-        # is a fast no-op when nothing is unmapped, so we always invoke it.
+        # ── Shared calculation setup ───────────────────────────────────────
+        # All three post-mapping steps (deterministic fallback,
+        # parent/child, Tier 3 derivation) share these structures.
         derived_concept_ids: set[str] = set()
         all_for_derivation = target_concepts or []
-        if all_for_derivation:
-            from earnings_agents.analysis.calculators import (
-                derive_missing_concept_metrics,
-                identify_role,
-                ALL_ROLES,
-            )
+        id_to_label_derive = {c["_id"]: c.get("label", c["_id"]) for c in all_for_derivation}
 
-            # LLM role identification for concepts whose labels are not matched
-            # by the regex patterns.  The LLM call was launched in parallel with
-            # extraction above — collect the result here (typically already done).
-            role_overrides: dict[str, str] = {}
-            if _roles_future is not None:
-                try:
-                    _label_to_role = _roles_future.result()
-                finally:
-                    if _roles_executor is not None:
-                        _roles_executor.shutdown(wait=False)
-                for c in _roles_need_llm:
-                    role = _label_to_role.get(c.get("label", ""))
-                    if role:
-                        role_overrides[c["_id"]] = role
-                        logger.info(
-                            "LLM role identification: '%s' → '%s' (concept_id %s) for %s",
-                            c.get("label", ""), role, c["_id"], ticker,
-                        )
-                if role_overrides:
-                    mapped_roles = [
-                        f"'{c.get('label', '')}' → {role_overrides[c['_id']]}"
-                        for c in _roles_need_llm if c["_id"] in role_overrides
-                    ]
-                    report_call(f"  [roles]  ✓ {', '.join(mapped_roles)}")
-                else:
-                    report_call(f"  [roles]  no roles identified")
-
-            before_derivation_ids = set(concept_metrics.keys())
-            concept_metrics = derive_missing_concept_metrics(
-                concept_metrics, all_for_derivation, role_overrides=role_overrides,
-            )
-            derived_concept_ids = set(concept_metrics.keys()) - before_derivation_ids
-            id_to_label_derive = {c["_id"]: c.get("label", c["_id"]) for c in all_for_derivation}
-            if derived_concept_ids:
-                derived_labels = [id_to_label_derive.get(cid, cid) for cid in derived_concept_ids]
-                report_call(
-                    f"  [derive]  ✓ {len(derived_concept_ids)} value(s) computed:"
-                    f"  {', '.join(derived_labels)}"
-                )
+        # Collect LLM-identified role overrides for concepts whose labels
+        # don't match regex patterns.  The LLM call was launched in parallel
+        # with extraction above — collect the result here.
+        role_overrides: dict[str, str] = {}
+        if _roles_future is not None:
+            try:
+                _label_to_role = _roles_future.result()
+            finally:
+                if _roles_executor is not None:
+                    _roles_executor.shutdown(wait=False)
+            for c in _roles_need_llm:
+                role = _label_to_role.get(c.get("label", ""))
+                if role:
+                    role_overrides[c["_id"]] = role
+                    logger.info(
+                        "LLM role identification: '%s' → '%s' (concept_id %s) for %s",
+                        c.get("label", ""), role, c["_id"], ticker,
+                    )
+            if role_overrides:
+                mapped_roles = [
+                    f"'{c.get('label', '')}' → {role_overrides[c['_id']]}"
+                    for c in _roles_need_llm if c["_id"] in role_overrides
+                ]
+                report_call(f"  [roles]  ✓ {', '.join(mapped_roles)}")
             else:
-                still_unmapped = [c for c in all_for_derivation if c["_id"] not in concept_metrics]
-                report_call(
-                    f"  [derive]  0 values computed"
-                    f"  ({len(still_unmapped)} concept(s) still unmapped)"
-                )
+                report_call(f"  [roles]  no roles identified")
 
-        # ── Generalized deterministic fallback for missing concepts ────────
+        # ── Step A: Generalized deterministic fallback for missing concepts ─
         # The LLM often misses line items in complex multi-column supplement
         # tables (bank interest breakdowns, segment details, etc.).  This
         # fallback scans the classified section text for ANY missing concept
@@ -1449,6 +1423,59 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                         "Deterministic fallback: 0/%d found for %s (labels not in text)",
                         len(_missing_any), ticker,
                     )
+
+        # ── Step B: Parent/child hierarchy calculations ───────────────────
+        # Resolves Cost of Revenue and Operating Expenses from their direct
+        # children in the concept path hierarchy.  Runs BEFORE Tier 3
+        # derivation so GP, OI, NI, and EPS use the resolved parent values.
+        # Falls back to GP − OI when OpEx is missing entirely.
+        if concept_metrics is not None and target_concepts:
+            from earnings_agents.analysis.calculators import (
+                apply_parent_child_calculations,
+            )
+            _before_pc_ids = set(concept_metrics.keys())
+            concept_metrics = apply_parent_child_calculations(
+                concept_metrics,
+                all_for_derivation,
+                role_overrides=role_overrides,
+            )
+            _pc_added_ids = set(concept_metrics.keys()) - _before_pc_ids
+            if _pc_added_ids:
+                derived_concept_ids |= _pc_added_ids
+                _pc_labels = [
+                    id_to_label_derive.get(cid, cid) for cid in _pc_added_ids
+                ]
+                report_call(
+                    f"  [calc]  ✓ {len(_pc_added_ids)} parent/child value(s)"
+                    f" calculated: {', '.join(_pc_labels)}"
+                )
+
+        # ── Step C: Tier 3 derivation ─────────────────────────────────────
+        # Derives remaining unmapped concepts (OI, NI, EPS, margins) from
+        # the parent/child-resolved values.  Runs LAST so all dependent
+        # derivations use the final stable CoR, GP, and OpEx.
+        if all_for_derivation:
+            from earnings_agents.analysis.calculators import (
+                derive_missing_concept_metrics,
+            )
+            before_derivation_ids = set(concept_metrics.keys())
+            concept_metrics = derive_missing_concept_metrics(
+                concept_metrics, all_for_derivation, role_overrides=role_overrides,
+            )
+            _new_derived = set(concept_metrics.keys()) - before_derivation_ids
+            derived_concept_ids |= _new_derived
+            if _new_derived:
+                derived_labels = [id_to_label_derive.get(cid, cid) for cid in _new_derived]
+                report_call(
+                    f"  [derive]  ✓ {len(_new_derived)} value(s) computed:"
+                    f"  {', '.join(derived_labels)}"
+                )
+            else:
+                still_unmapped = [c for c in all_for_derivation if c["_id"] not in concept_metrics]
+                report_call(
+                    f"  [derive]  0 values computed"
+                    f"  ({len(still_unmapped)} concept(s) still unmapped)"
+                )
 
         # ── Final summary table ──────────────────────────────────────────────
         id_to_label_summary: dict[str, str] = {
