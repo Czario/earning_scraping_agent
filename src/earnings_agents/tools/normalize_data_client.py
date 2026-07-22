@@ -623,6 +623,61 @@ def fiscal_period_exists(
     return db[collection_name].count_documents(filt, limit=1) > 0
 
 
+def count_fiscal_period_values(
+    cik: str,
+    fiscal_year: int,
+    quarter: int | None = None,
+) -> int:
+    """Return the number of concept values stored for *cik* + *fiscal_year* (+ *quarter*).
+
+    When *quarter* is None the count is against ``concept_values_annual``
+    (annual / full-year filings); otherwise ``concept_values_quarterly``.
+    """
+    db = _get_client()[_NORMALIZE_DB]
+    collection_name = (
+        "concept_values_annual" if quarter is None else "concept_values_quarterly"
+    )
+    filt: dict[str, Any] = {
+        "company_cik": cik,
+        "reporting_period.fiscal_year": fiscal_year,
+    }
+    if quarter is not None:
+        filt["reporting_period.quarter"] = quarter
+    return db[collection_name].count_documents(filt)
+
+
+def delete_fiscal_period(
+    cik: str,
+    fiscal_year: int,
+    quarter: int | None = None,
+) -> int:
+    """Delete all concept values for *cik* + *fiscal_year* (+ *quarter*).
+
+    When *quarter* is None the delete is against ``concept_values_annual``
+    (annual / full-year filings); otherwise ``concept_values_quarterly``.
+
+    Returns the number of documents deleted.
+    """
+    db = _get_client()[_NORMALIZE_DB]
+    collection_name = (
+        "concept_values_annual" if quarter is None else "concept_values_quarterly"
+    )
+    filt: dict[str, Any] = {
+        "company_cik": cik,
+        "reporting_period.fiscal_year": fiscal_year,
+    }
+    if quarter is not None:
+        filt["reporting_period.quarter"] = quarter
+    result = db[collection_name].delete_many(filt)
+    if result.deleted_count:
+        period_label = f"FY{fiscal_year} Q{quarter}" if quarter is not None else f"FY{fiscal_year} (annual)"
+        logger.info(
+            "delete_fiscal_period: removed %d document(s) from %s for CIK %s %s",
+            result.deleted_count, collection_name, cik, period_label,
+        )
+    return result.deleted_count
+
+
 def get_recently_valued_concept_ids(
     cik: str,
     period_type: str = "quarterly",

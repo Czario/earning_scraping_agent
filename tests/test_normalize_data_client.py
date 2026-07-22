@@ -644,8 +644,30 @@ def _mock_submissions_resp(*, forms, report_dates=None, filing_dates=None, items
     return resp
 
 
-def test_skip_guard_skips_when_fiscal_period_exists():
-    """Returns a state dict (skip) when the same FY+Q already exists in the DB."""
+def test_skip_guard_deletes_and_proceeds_when_fiscal_period_exists():
+    """When period exists and dry_run=False, deletes existing data and returns deletion info."""
+    company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
+    submissions = _mock_submissions_resp(
+        forms=["8-K", "10-Q"],
+        report_dates=["", "2025-09-30"],
+        filing_dates=["2025-10-15", "2025-10-15"],
+        items=["2.02,9.01", ""],
+    )
+    with (
+        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
+        patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=True),
+        patch("earnings_agents.tools.normalize_data_client.delete_fiscal_period", return_value=5),
+        patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
+    ):
+        result = _resolve_8k_skip_guard("AAPL", "000123")
+    assert result is not None
+    assert result["action"] == "deleted"
+    assert result["deleted_count"] == 5
+    assert result["period_label"] == "FY2025 Q3"
+
+
+def test_skip_guard_skips_in_dry_run_when_fiscal_period_exists():
+    """When period exists and dry_run=True, returns skip state dict (no delete)."""
     company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
     submissions = _mock_submissions_resp(
         forms=["8-K", "10-Q"],
@@ -658,7 +680,7 @@ def test_skip_guard_skips_when_fiscal_period_exists():
         patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=True),
         patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
     ):
-        result = _resolve_8k_skip_guard("AAPL", "000123")
+        result = _resolve_8k_skip_guard("AAPL", "000123", dry_run=True)
     assert result is not None
     assert result["status"] == "already_stored"
 

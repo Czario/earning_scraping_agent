@@ -124,14 +124,18 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         logger.info("8-K skipped for %s — no existing normalize_data period data", label)
         return True
 
-    # ── 3. Guard: skip if this fiscal period is already stored ────────────────
-    # Uses fiscal_year_end_month + SEC submissions API to determine
-    # (fiscal_year, quarter) and checks concept_values_quarterly / _annual.
-    if ticker and cik and _resolve_8k_skip_guard(ticker, cik) is not None:
-        pub.publish("skip", f"✓ already up to date — period already in normalize_data")
-        pub.close()
-        logger.info("8-K skipped for %s — period already stored in normalize_data", label)
-        return True
+    # ── 3. Replace guard: delete existing data if this period is already ─────
+    # stored, then re-extract fresh.  _resolve_8k_skip_guard deletes any
+    # existing concept values for the same fiscal period and returns a dict
+    # with action="deleted" and counts, or None when nothing was deleted.
+    if ticker and cik:
+        deleted_info = _resolve_8k_skip_guard(ticker, cik)
+        if deleted_info and deleted_info.get("action") == "deleted":
+            pub.publish(
+                "progress",
+                f"deleted {deleted_info['deleted_count']} existing value(s) "
+                f"for {deleted_info['period_label']} — re-extracting",
+            )
 
     # ── 4. Run the pipeline ───────────────────────────────────────────────────
     # State mirrors CLI's _build_initial_state SEC path exactly.

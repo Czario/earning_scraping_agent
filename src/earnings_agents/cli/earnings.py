@@ -240,6 +240,7 @@ def _print_latest_data_status(companies: list[dict], printer=print) -> None:
     try:
         from earnings_agents.tools.normalize_data_client import (
             get_company_by_ticker,
+            count_fiscal_period_values,
             get_latest_period,
         )
     except Exception as exc:  # noqa: BLE001
@@ -300,6 +301,13 @@ def _print_latest_data_status(companies: list[dict], printer=print) -> None:
             else:
                 next_str = f"FY{fy} Q{(q or 0) + 1} 8-K"
 
+        # How many concept values exist for the latest stored period?
+        q_arg = q if pt == "quarterly" else None
+        try:
+            n_existing = count_fiscal_period_values(cik, fy, q_arg)
+        except Exception:  # noqa: BLE001
+            n_existing = None
+
         # Cross-check SEC EDGAR: is the next needed 8-K already filed?
         sec_status = get_next_8k_status(cik, end_dt)
         if sec_status["available"]:
@@ -307,7 +315,11 @@ def _print_latest_data_status(companies: list[dict], printer=print) -> None:
         elif sec_status.get("latest_edgar_report_date"):
             # EDGAR has a recent 8-K but it didn't clear the next-period threshold —
             # it's the already-stored period's filing. No new 8-K has landed yet.
-            sec_note = "[✓ already stored — re-run will skip, no new 8-K on SEC yet]"
+            count_str = f"{n_existing} value(s) — " if n_existing is not None else ""
+            sec_note = (
+                f"[✓ {count_str}"
+                f"will delete & replace, no new 8-K on SEC yet]"
+            )
         else:
             sec_note = "[SEC ⏳ not yet]"
 
@@ -416,7 +428,7 @@ def _has_existing_period_data(ticker: str) -> bool:
         return False
 
 
-def _build_initial_state(info: dict, printer=print) -> dict:
+def _build_initial_state(info: dict, printer=print, dry_run: bool = False) -> dict:
     """Build the LangGraph initial state for one company.
 
     Queries SEC EDGAR for the latest 8-K Exhibit 99.1 URL and injects it
@@ -453,8 +465,8 @@ def _build_initial_state(info: dict, printer=print) -> dict:
     # ── Skip guard: check if the 8-K's fiscal period is already stored ──────
     # Uses fiscal_year_end_month + SEC submissions API to determine
     # (fiscal_year, quarter) and checks concept_values_quarterly / _annual.
-    skip_state = _resolve_8k_skip_guard(ticker, cik, printer=printer)
-    if skip_state is not None:
+    skip_state = _resolve_8k_skip_guard(ticker, cik, printer=printer, dry_run=dry_run)
+    if skip_state is not None and skip_state.get("action") == "skip":
         return skip_state
 
     printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
@@ -537,7 +549,7 @@ def _dry_run_company(
     printer(f"  DRY-RUN : {label}")
     printer(f"  CIK     : {info['cik']}")
 
-    state = _build_initial_state(info, printer=printer)
+    state = _build_initial_state(info, printer=printer, dry_run=True)
 
     llm_ok, llm_detail = _check_llm()
     mongo_ok, mongo_detail = _check_mongodb()
@@ -611,6 +623,7 @@ def _resolve_8k_skip_guard(
     ticker: str,
     cik: str,
     printer=print,
+    dry_run: bool = False,
 ) -> dict | None:
     """Check whether the latest 8-K's fiscal period is already stored in the DB.
 
@@ -620,17 +633,23 @@ def _resolve_8k_skip_guard(
       3. Uses ``_infer_8k_fiscal_period`` to determine ``(fiscal_year, quarter)``.
       4. Checks ``concept_values_quarterly`` / ``concept_values_annual``.
 
-    Returns a state dict with ``status="already_stored"`` when the period
-    already exists, or ``None`` when the pipeline should proceed.
+    When *dry_run* is True and the period already exists, returns a state dict
+    with ``status="already_stored"`` (read-only — no data is modified).
 
-    Also returns ``None`` on any error (fail-safe: never skips on ambiguity).
+    When *dry_run* is False and the period exists, the existing data is
+    **deleted** and the function returns ``None`` so the pipeline proceeds to
+    re-extract and re-insert fresh data.
+
+    Returns ``None`` on any error (fail-safe: never skips on ambiguity).
     """
     if not ticker or not cik:
         return None
     try:
         from earnings_agents.tools.normalize_data_client import (
+            delete_fiscal_period,
             fiscal_period_exists,
             get_company_by_ticker,
+            get_latest_period,
         )
         from earnings_agents.tools.edgar_client import (
             _EDGAR_SUBMISSIONS,
@@ -676,18 +695,35 @@ def _resolve_8k_skip_guard(
                 break
 
         # 3. Determine (fiscal_year, quarter) the 8-K reports on.
+        fp = None
         if filing_date_str:
             fp = _infer_8k_fiscal_period(recent, filing_date_str, fy_end_month)
-            if fp is not None:
-                fy, q, pt = fp
-                q_arg = q if pt == "quarterly" else None
-                if fiscal_period_exists(cik, fy, q_arg):
+
+        # 4. Fallback: if SEC data can't determine the period, use the latest
+        #    stored period from the DB directly (covers the case where no
+        #    reference 10-Q/10-K exists yet in SEC submissions).
+        if fp is None:
+            latest = get_latest_period(cik)
+            if latest is not None:
+                fp = (
+                    latest["fiscal_year"],
+                    latest.get("quarter"),
+                    latest.get("period_type", "quarterly"),
+                )
+
+        if fp is not None:
+            fy, q, pt = fp
+            q_arg = q if pt == "quarterly" else None
+            if fiscal_period_exists(cik, fy, q_arg):
+                period_label = (
+                    f"FY{fy} Q{q}" if pt == "quarterly" else f"FY{fy} (annual)"
+                )
+                if dry_run:
                     printer(
-                        f"  [UP TO DATE] period FY{fy}"
-                        + (f" Q{q}" if pt == "quarterly" else " (annual)")
-                        + f" already stored — skipping"
+                        f"  [UP TO DATE] period {period_label} already stored — skipping"
                     )
                     return {
+                        "action": "skip",
                         "status": "already_stored",
                         "ticker": ticker,
                         "company_name": company.get("name", ticker),
@@ -701,6 +737,18 @@ def _resolve_8k_skip_guard(
                         "needs_reextract": False,
                         "previous_high_finding_keys": None,
                     }
+                n_deleted = delete_fiscal_period(cik, fy, q_arg)
+                printer(
+                    f"  [DELETE]  period {period_label} — "
+                    f"removed {n_deleted} existing value(s), re-extracting"
+                )
+                return {
+                    "action": "deleted",
+                    "deleted_count": n_deleted,
+                    "period_label": period_label,
+                    "ticker": ticker,
+                    "company_name": company.get("name", ticker),
+                }
 
         return None
     except Exception:  # noqa: BLE001 — fail safe: never skip on ambiguity
